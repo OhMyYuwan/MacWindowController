@@ -1,0 +1,87 @@
+project:
+  name: WinCtlManager
+  description: >
+    ACP-managed macOS window layout controller with CLI and visual editor.
+    Core priorities: basic window operations, stacking, desktop save/restore,
+    and interactive layout editing.
+
+entry_files:
+  - path: tools/window-manager/Package.swift
+    description: Swift package manifest for CLI and AppKit editor runtime.
+  - path: tools/window-manager/Sources/WindowManager/main.swift
+    description: CLI entrypoint and command routing.
+  - path: tools/window-manager/Sources/WindowManager/Commands/CLI.swift
+    description: Command parsing and operation dispatch.
+
+modules:
+  - id: wm-models
+    path: tools/window-manager/Sources/WindowManager/Models
+    description: Shared data models for windows, stacks, and desktop layouts.
+  - id: wm-cli
+    path: tools/window-manager/Sources/WindowManager/Commands/CLI.swift
+    description: CLI command routing and argument validation.
+  - id: wm-core-window
+    path: tools/window-manager/Sources/WindowManager/Core/WindowController.swift
+    description: Accessibility and CoreGraphics-based window query/control.
+  - id: wm-core-layout
+    path: tools/window-manager/Sources/WindowManager/Core/LayoutEngine.swift
+    description: Tile frame calculation and geometry utilities.
+  - id: wm-core-stack
+    path: tools/window-manager/Sources/WindowManager/Core/StackManager.swift
+    description: Stack create/switch/list persistence and window visibility flow.
+  - id: wm-core-desktop
+    path: tools/window-manager/Sources/WindowManager/Core/DesktopLayoutStore.swift
+    description: Desktop layout persistence, import/export, and loading.
+  - id: wm-ui-editor
+    path: tools/window-manager/Sources/WindowManager/UI
+    description: Visual layout editor window and draggable canvas blocks.
+  - id: wm-tests
+    path: tools/window-manager/Tests/WindowManagerTests
+    description: Baseline deterministic tests for layout math and parsing.
+
+capability_routes:
+  basic_window_ops:
+    entry_modules:
+      - wm-core-window
+      - wm-core-layout
+      - wm-models
+      - wm-ui-editor
+    first_contact:
+      - tools/window-manager/Sources/WindowManager/Core/WindowController.swift
+      - tools/window-manager/Sources/WindowManager/Core/LayoutEngine.swift
+      - tools/window-manager/Sources/WindowManager/Models/TilePosition.swift
+  window_stacking:
+    entry_modules:
+      - wm-core-stack
+      - wm-core-window
+      - wm-models
+    first_contact:
+      - tools/window-manager/Sources/WindowManager/Core/StackManager.swift
+      - tools/window-manager/Sources/WindowManager/Models/WindowStack.swift
+  desktop_layouts:
+    entry_modules:
+      - wm-core-desktop
+      - wm-core-stack
+      - wm-core-window
+      - wm-models
+    first_contact:
+      - tools/window-manager/Sources/WindowManager/Core/DesktopLayoutStore.swift
+      - tools/window-manager/Sources/WindowManager/Models/DesktopLayout.swift
+  visual_editor:
+    entry_modules:
+      - wm-ui-editor
+      - wm-models
+      - wm-core-desktop
+    first_contact:
+      - tools/window-manager/Sources/WindowManager/UI/LayoutEditorWindow.swift
+      - tools/window-manager/Sources/WindowManager/UI/LayoutCanvas.swift
+      - tools/window-manager/Sources/WindowManager/UI/RoundedRectView.swift
+  cli_surface:
+    entry_modules:
+      - wm-cli
+      - wm-core-window
+      - wm-core-stack
+      - wm-core-desktop
+    first_contact:
+      - tools/window-manager/Sources/WindowManager/main.swift
+      - tools/window-manager/Sources/WindowManager/Commands/CLI.swift

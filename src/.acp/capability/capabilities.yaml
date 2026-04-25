@@ -1,0 +1,73 @@
+capabilities:
+  - id: basic_window_ops
+    summary: List, move, resize, and tile app windows through Accessibility APIs.
+    slices:
+      - id: window_query
+        owns:
+          - tools/window-manager/Sources/WindowManager/Core/WindowController.swift
+          - tools/window-manager/Sources/WindowManager/Models/WindowInfo.swift
+      - id: tile_geometry
+        owns:
+          - tools/window-manager/Sources/WindowManager/Core/LayoutEngine.swift
+          - tools/window-manager/Sources/WindowManager/Models/TilePosition.swift
+    route_here_when:
+      - user asks to list windows
+      - user asks to move, resize, or tile windows
+
+  - id: window_stacking
+    summary: Manage tab-like stack groups where only one window is foreground.
+    slices:
+      - id: stack_lifecycle
+        owns:
+          - tools/window-manager/Sources/WindowManager/Core/StackManager.swift
+          - tools/window-manager/Sources/WindowManager/Models/WindowStack.swift
+    route_here_when:
+      - user asks to create/switch/list window stacks
+    bridge_when:
+      - applying desktop layouts containing stack records
+
+  - id: desktop_layouts
+    summary: Persist desktop snapshots, import/export layouts, and restore layouts.
+    slices:
+      - id: layout_modeling
+        owns:
+          - tools/window-manager/Sources/WindowManager/Models/DesktopLayout.swift
+      - id: layout_persistence
+        owns:
+          - tools/window-manager/Sources/WindowManager/Core/DesktopLayoutStore.swift
+      - id: layout_execution
+        owns:
+          - tools/window-manager/Sources/WindowManager/Core/DesktopLayoutCoordinator.swift
+    route_here_when:
+      - user asks to save/list/apply/delete desktop layouts
+      - user asks to import/export desktop layout JSON
+    bridge_when:
+      - request touches both stack state and raw window placement
+
+  - id: visual_editor
+    summary: AppKit-based visual editor for drag/resize layout previews.
+    slices:
+      - id: editor_shell
+        owns:
+          - tools/window-manager/Sources/WindowManager/UI/LayoutEditorWindow.swift
+      - id: editor_canvas
+        owns:
+          - tools/window-manager/Sources/WindowManager/UI/LayoutCanvas.swift
+          - tools/window-manager/Sources/WindowManager/UI/RoundedRectView.swift
+    route_here_when:
+      - user asks to visualize and edit saved desktop layouts
+    bridge_when:
+      - editor save operation writes DesktopLayout persistence
+
+  - id: cli_surface
+    summary: CLI command contract for all operations and JSON output.
+    slices:
+      - id: command_router
+        owns:
+          - tools/window-manager/Sources/WindowManager/main.swift
+          - tools/window-manager/Sources/WindowManager/Commands/CLI.swift
+    route_here_when:
+      - user asks to use shell commands for any capability
+    bridge_when:
+      - command behavior changes impact multiple capabilities
+

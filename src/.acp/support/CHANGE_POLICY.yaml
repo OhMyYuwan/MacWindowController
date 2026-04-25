@@ -1,0 +1,32 @@
+policy_version: "1.0"
+project: WinCtlManager
+
+auto_allow:
+  - src/.acp/**
+  - tools/window-manager/Sources/WindowManager/**
+  - tools/window-manager/Tests/WindowManagerTests/**
+  - tools/window-manager/Package.swift
+  - README.md
+  - README_EN.md
+
+require_confirmation:
+  - remove_file
+  - rename_public_command
+  - change_layout_storage_path
+  - introduce_external_network_dependency
+  - change_cli_flag_contract
+
+high_risk:
+  - modify_accessibility_permission_flow
+  - force_kill_or_hide_windows_without_stack_context
+  - fullscreen_space_transition_behavior
+
+forbidden:
+  - acp-protocol/**
+  - destructive_git_commands
+
+notes:
+  - Keep command interfaces backward compatible when possible.
+  - Any cross-capability change must reference bridge rationale in the Plan.
+  - For risky operations, add a fallback path in the Plan before execution.
+

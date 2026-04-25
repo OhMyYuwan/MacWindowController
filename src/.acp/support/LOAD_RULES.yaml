@@ -1,0 +1,49 @@
+default:
+  intake_order:
+    - src/.acp/support/AGENT.md
+    - src/.acp/support/PROJECT_MAP.yaml
+    - src/.acp/support/LOAD_RULES.yaml
+    - src/.acp/support/CHANGE_POLICY.yaml
+    - src/.acp/capability/capabilities.yaml
+  source_scan_policy: targeted_only
+
+forbidden_paths:
+  - acp-protocol/**
+  - .git/**
+  - .DS_Store
+
+capability_load_rules:
+  basic_window_ops:
+    first_contact:
+      - tools/window-manager/Sources/WindowManager/Core/WindowController.swift
+      - tools/window-manager/Sources/WindowManager/Core/LayoutEngine.swift
+    then_optional:
+      - tools/window-manager/Sources/WindowManager/Core/ScreenManager.swift
+      - tools/window-manager/Sources/WindowManager/Models/TilePosition.swift
+
+  window_stacking:
+    first_contact:
+      - tools/window-manager/Sources/WindowManager/Core/StackManager.swift
+      - tools/window-manager/Sources/WindowManager/Models/WindowStack.swift
+    then_optional:
+      - tools/window-manager/Sources/WindowManager/Core/WindowController.swift
+
+  desktop_layouts:
+    first_contact:
+      - tools/window-manager/Sources/WindowManager/Core/DesktopLayoutStore.swift
+      - tools/window-manager/Sources/WindowManager/Models/DesktopLayout.swift
+    then_optional:
+      - tools/window-manager/Sources/WindowManager/Core/DesktopLayoutCoordinator.swift
+
+  visual_editor:
+    first_contact:
+      - tools/window-manager/Sources/WindowManager/UI/LayoutEditorWindow.swift
+      - tools/window-manager/Sources/WindowManager/UI/LayoutCanvas.swift
+    then_optional:
+      - tools/window-manager/Sources/WindowManager/UI/RoundedRectView.swift
+
+  cli_surface:
+    first_contact:
+      - tools/window-manager/Sources/WindowManager/main.swift
+      - tools/window-manager/Sources/WindowManager/Commands/CLI.swift
+
