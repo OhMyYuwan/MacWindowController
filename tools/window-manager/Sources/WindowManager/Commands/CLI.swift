@@ -28,6 +28,11 @@ final class WindowManagerCLI {
     private let windowController = WindowController()
     private let screenManager = ScreenManager()
     private lazy var stackManager = StackManager(windowController: windowController, screenManager: screenManager)
+    private lazy var zoneManager = DesktopZoneManager(
+        windowController: windowController,
+        screenManager: screenManager,
+        stackManager: stackManager
+    )
     private let layoutStore = DesktopLayoutStore()
     private lazy var layoutCoordinator = DesktopLayoutCoordinator(
         windowController: windowController,
@@ -75,6 +80,8 @@ final class WindowManagerCLI {
             try runListStacks(parser: parser)
         case "delete-stack":
             try runDeleteStack(parser: parser)
+        case "auto-scan":
+            try runAutoScan(parser: parser)
         case "save-desktop", "save-layout":
             try runSaveDesktop(parser: parser)
         case "edit-current":
@@ -282,12 +289,12 @@ final class WindowManagerCLI {
             throw CLIError.invalidArgument("No frontmost window found")
         }
         let frame = LayoutEngine().frame(for: .left, in: screenManager.mainVisibleFrame())
-        _ = try stackManager.putWindowInStack(name: "left-bucket", frame: frame, window: identity)
+        _ = try stackManager.putWindowInStack(name: "left", frame: frame, window: identity)
         if parser.hasFlag("--json") {
             try printJSON(OperationResult(operation: "bucket-left-frontmost", bundleId: identity.bundleId, status: "ok"))
             return
         }
-        print("Added frontmost \(identity.bundleId) into left-bucket.")
+        print("Added frontmost \(identity.bundleId) into left stack.")
     }
 
     private func runCreateStack(parser: ArgumentParser) throws {
@@ -344,6 +351,48 @@ final class WindowManagerCLI {
         let name = try parser.requiredValue(for: "--name")
         try stackManager.deleteStack(name: name)
         print("Deleted stack '\(name)'.")
+    }
+
+    private func runAutoScan(parser: ArgumentParser) throws {
+        let modeRaw = parser.value(for: "--mode") ?? "left-column"
+        let mode: DesktopMergeMode
+        switch modeRaw {
+        case "grid": mode = .grid
+        case "left-column", "left": mode = .leftColumn
+        case "right-column", "right": mode = .rightColumn
+        case "top-row", "top": mode = .topRow
+        case "bottom-row", "bottom": mode = .bottomRow
+        default: mode = .leftColumn
+        }
+
+        let result = zoneManager.scan(mergeMode: mode)
+
+        if parser.hasFlag("--dry-run") {
+            for zone in result.zones {
+                let stackLabel = zone.isStack ? " [STACK]" : ""
+                print("Zone '\(zone.name)': \(zone.windows.count) windows\(stackLabel)")
+                for w in zone.windows {
+                    print("  \(w.appName) #\(w.windowNumber) \(w.title)")
+                }
+            }
+            return
+        }
+
+        try zoneManager.applyScanResult(result)
+
+        if parser.hasFlag("--json") {
+            let summary = result.zones.map { z in
+                ["name": z.name, "windowCount": "\(z.windows.count)", "isStack": "\(z.isStack)"]
+            }
+            try printJSON(summary)
+            return
+        }
+
+        for zone in result.zones {
+            let stackLabel = zone.isStack ? " -> stack" : ""
+            print("Zone '\(zone.name)': \(zone.windows.count) windows\(stackLabel)")
+        }
+        print("Auto-scan complete.")
     }
 
     private func runSaveDesktop(parser: ArgumentParser) throws {

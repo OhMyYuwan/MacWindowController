@@ -26,7 +26,7 @@ enum StackManagerError: LocalizedError {
 }
 
 final class StackManager {
-    private let stackTabBarHeight: CGFloat = 32
+    static let desktopTabBarHeight: CGFloat = 38
     private let windowController: WindowController
     private let screenManager: ScreenManager
     private let layoutEngine: LayoutEngine
@@ -59,7 +59,7 @@ final class StackManager {
 
     @discardableResult
     func createStack(name: String, position: TilePosition, windows bundleIds: [String], displayIndex: Int? = nil) throws -> WindowStack {
-        let frame = layoutEngine.frame(for: position, in: screenManager.visibleFrame(displayIndex: displayIndex))
+        let frame = layoutEngine.frame(for: position, in: screenManager.visibleFrameInScreenCoordinates(displayIndex: displayIndex))
         return try createStack(name: name, frame: frame, windows: bundleIds, activeIndex: 0)
     }
 
@@ -88,13 +88,11 @@ final class StackManager {
                 ?? WindowIdentity(bundleId: bundleId, title: "", windowNumber: nil)
             identities.append(identity)
             try setWindowFrame(identity: identity, fallbackWindowIndex: index, frame: contentFrame)
-            try setWindowMinimized(identity: identity, fallbackWindowIndex: index, minimized: true)
         }
 
         let safeActive = min(max(activeIndex, 0), identities.count - 1)
         let activeOccurrence = occurrenceIndex(for: safeActive, in: identities)
-        try setWindowFrame(identity: identities[safeActive], fallbackWindowIndex: activeOccurrence, frame: contentFrame)
-        try setWindowMinimized(identity: identities[safeActive], fallbackWindowIndex: activeOccurrence, minimized: false)
+        try raiseWindow(identity: identities[safeActive], fallbackWindowIndex: activeOccurrence)
 
         let stack = WindowStack(
             name: normalizedName,
@@ -122,8 +120,37 @@ final class StackManager {
             throw StackManagerError.invalidName
         }
 
+        // 跨堆栈去重：从其他堆栈中移除该窗口
+        if let windowNumber = window.windowNumber {
+            for (stackName, var stack) in stacks where stackName != normalizedName {
+                if let idx = stack.windows.firstIndex(where: { $0.windowNumber == windowNumber }) {
+                    stack.windows.remove(at: idx)
+                    if stack.windows.isEmpty {
+                        stacks.removeValue(forKey: stackName)
+                    } else {
+                        stack.activeIndex = min(stack.activeIndex, stack.windows.count - 1)
+                        stacks[stackName] = stack
+                    }
+                }
+            }
+        }
+
         if let existing = stacks[normalizedName] {
             var windows = existing.windows
+
+            // 同堆栈去重：优先使用 windowNumber
+            if let newNumber = window.windowNumber {
+                if let existingIndex = windows.firstIndex(where: { $0.windowNumber == newNumber }) {
+                    windows[existingIndex] = window
+                    return try rebuildStack(
+                        name: normalizedName,
+                        frame: frame,
+                        windows: windows,
+                        activeIndex: existingIndex
+                    )
+                }
+            }
+
             windows.append(window)
             return try rebuildStack(
                 name: normalizedName,
@@ -155,13 +182,13 @@ final class StackManager {
         }
 
         let contentFrame = stackContentFrame(from: stack.frame.cgRect)
-        let previousOccurrence = occurrenceIndex(for: previousIndex, in: stack.windows)
         let nextOccurrence = occurrenceIndex(for: index, in: stack.windows)
 
-        try setWindowMinimized(identity: stack.windows[previousIndex], fallbackWindowIndex: previousOccurrence, minimized: true)
+        // 确保目标窗口在正确的位置和大小
         try setWindowFrame(identity: stack.windows[index], fallbackWindowIndex: nextOccurrence, frame: contentFrame)
-        try setWindowMinimized(identity: stack.windows[index], fallbackWindowIndex: nextOccurrence, minimized: false)
-        try windowController.activateApp(bundleId: stack.windows[index].bundleId)
+
+        // 直接置顶目标窗口，不最小化其他窗口
+        try raiseWindow(identity: stack.windows[index], fallbackWindowIndex: nextOccurrence)
 
         stack.activeIndex = index
         stacks[name] = stack
@@ -169,26 +196,14 @@ final class StackManager {
     }
 
     func deleteStack(name: String) throws {
-        guard let stack = stacks[name] else {
+        guard stacks[name] != nil else {
             throw StackManagerError.stackMissing(name)
         }
-
-        for (idx, identity) in stack.windows.enumerated() {
-            let occurrence = occurrenceIndex(for: idx, in: stack.windows)
-            try? setWindowMinimized(identity: identity, fallbackWindowIndex: occurrence, minimized: false)
-        }
-
         stacks.removeValue(forKey: name)
         try save()
     }
 
     func clearAllStacks() throws {
-        for stack in stacks.values {
-            for (idx, identity) in stack.windows.enumerated() {
-                let occurrence = occurrenceIndex(for: idx, in: stack.windows)
-                try? setWindowMinimized(identity: identity, fallbackWindowIndex: occurrence, minimized: false)
-            }
-        }
         stacks.removeAll()
         try save()
     }
@@ -246,14 +261,11 @@ final class StackManager {
             let index = bundleOccurrences[identity.bundleId, default: 0]
             bundleOccurrences[identity.bundleId] = index + 1
             try setWindowFrame(identity: identity, fallbackWindowIndex: index, frame: contentFrame)
-            try setWindowMinimized(identity: identity, fallbackWindowIndex: index, minimized: true)
         }
 
         let safeActive = min(max(activeIndex, 0), windows.count - 1)
         let activeOccurrence = occurrenceIndex(for: safeActive, in: windows)
-        try setWindowFrame(identity: windows[safeActive], fallbackWindowIndex: activeOccurrence, frame: contentFrame)
-        try setWindowMinimized(identity: windows[safeActive], fallbackWindowIndex: activeOccurrence, minimized: false)
-        try windowController.activateApp(bundleId: windows[safeActive].bundleId)
+        try raiseWindow(identity: windows[safeActive], fallbackWindowIndex: activeOccurrence)
 
         let updated = WindowStack(
             name: name,
@@ -275,6 +287,14 @@ final class StackManager {
         }
     }
 
+    private func raiseWindow(identity: WindowIdentity, fallbackWindowIndex: Int) throws {
+        if let windowNumber = identity.windowNumber {
+            try windowController.raiseWindow(bundleId: identity.bundleId, windowNumber: windowNumber)
+        } else {
+            try windowController.raiseWindow(bundleId: identity.bundleId, windowIndex: fallbackWindowIndex)
+        }
+    }
+
     private func setWindowMinimized(identity: WindowIdentity, fallbackWindowIndex: Int, minimized: Bool) throws {
         if let windowNumber = identity.windowNumber {
             try windowController.setWindowMinimized(bundleId: identity.bundleId, windowNumber: windowNumber, minimized: minimized)
@@ -284,12 +304,15 @@ final class StackManager {
     }
 
     private func stackContentFrame(from stackFrame: CGRect) -> CGRect {
-        let minHeight = max(80.0, stackFrame.height - stackTabBarHeight)
+        // AX API 坐标系：y=0 在屏幕顶部，y 向下增长
+        // 标签栏在堆栈区域顶部，窗口内容在标签栏下方
+        // 所以窗口 y 起点需要向下偏移标签栏高度
+        let contentHeight = max(80.0, stackFrame.height - Self.desktopTabBarHeight)
         return CGRect(
             x: stackFrame.minX,
-            y: stackFrame.minY,
+            y: stackFrame.minY + Self.desktopTabBarHeight,
             width: stackFrame.width,
-            height: minHeight
+            height: contentHeight
         )
     }
 

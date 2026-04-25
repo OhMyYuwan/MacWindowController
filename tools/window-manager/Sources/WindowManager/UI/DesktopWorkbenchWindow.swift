@@ -54,17 +54,23 @@ enum DesktopWorkbenchLauncher {
 
 @MainActor
 private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NSWindowDelegate {
-    private let leftBucketName = "left-bucket"
+    private let leftBucketName = "left"
 
     private let windowController: WindowController
     private let stackManager: StackManager
     private let layoutCoordinator: DesktopLayoutCoordinator
     private let layoutStore: DesktopLayoutStore
     private let screenManager: ScreenManager
+    private lazy var zoneManager = DesktopZoneManager(
+        windowController: windowController,
+        screenManager: screenManager,
+        stackManager: stackManager
+    )
 
     private var focusedLayoutName: String?
     private var mergeMode: DesktopMergeMode = .leftColumn
     private var leftBucketEnabled = true
+    private var autoScanEnabled = false
     private var selectedLayoutName: String?
     private var lastExternalWindowIdentity: WindowIdentity?
 
@@ -77,8 +83,8 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     private var statusLabel: NSTextField?
     private var noteScrollView: NSScrollView?
     private var noteStackView: NSStackView?
-    private var desktopBucketPanel: NSPanel?
-    private var desktopBucketTabsStack: NSStackView?
+    private var stackPanels: [String: NSPanel] = [:]
+    private var stackPanelTabStacks: [String: NSStackView] = [:]
     private var refreshTimer: Timer?
     private var keyboardMonitor: Any?
 
@@ -134,6 +140,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         let bucketToggle = NSButton(checkboxWithTitle: "左半屏使用桶堆叠", target: self, action: #selector(toggleLeftBucket))
         bucketToggle.state = .on
         shortcutsRow.addArrangedSubview(bucketToggle)
+        shortcutsRow.addArrangedSubview(makeButton("立即扫描", action: #selector(runAutoScan)))
 
         let launcherRow = NSStackView()
         launcherRow.orientation = .horizontal
@@ -219,7 +226,6 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         root.addArrangedSubview(noteScroll)
 
         window.makeKeyAndOrderFront(nil)
-        setupDesktopBucketPanel()
 
         installKeyboardShortcuts()
         startRefreshTimer()
@@ -234,7 +240,8 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             NSEvent.removeMonitor(keyboardMonitor)
         }
         refreshTimer?.invalidate()
-        desktopBucketPanel?.close()
+        for panel in stackPanels.values { panel.close() }
+        stackPanels.removeAll()
         NSApplication.shared.terminate(nil)
     }
 
@@ -285,7 +292,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             mergeMode: mergeMode,
             leftBucketEnabled: leftBucketEnabled
         )
-        refreshDesktopBucketPanel(leftBucket: leftBucket)
+        refreshAllStackPanels()
         reloadLayoutCards()
     }
 
@@ -352,18 +359,43 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         }
 
         do {
-            let frame = screenManager.mainVisibleFrame()
-            if position == .left && leftBucketEnabled {
-                let leftFrame = LayoutEngine().frame(for: .left, in: frame)
-                _ = try stackManager.putWindowInStack(name: leftBucketName, frame: leftFrame, window: target)
-                setStatus("已将 \(target.bundleId) 收纳到左侧桶", error: false)
-            } else {
-                try tileWindow(identity: target, position: position, in: frame)
-                setStatus("已将 \(target.bundleId) 平铺到 \(position.rawValue)", error: false)
-            }
+            let frame = screenManager.mainVisibleFrameInScreenCoordinates()
+
+            // 根据 position 确定堆栈名称
+            let stackName = stackNameForPosition(position)
+            let positionFrame = LayoutEngine().frame(for: position, in: frame)
+
+            // 所有位置都使用堆栈管理
+            _ = try stackManager.putWindowInStack(name: stackName, frame: positionFrame, window: target)
+            setStatus("已将 \(target.bundleId) 收纳到 \(stackName)", error: false)
+
             refreshWorkbench()
         } catch {
             setStatus(error.localizedDescription, error: true)
+        }
+    }
+
+    // 根据 TilePosition 返回堆栈名称
+    private func stackNameForPosition(_ position: TilePosition) -> String {
+        switch position {
+        case .left:
+            return "left"
+        case .right:
+            return "right"
+        case .top:
+            return "top"
+        case .bottom:
+            return "bottom"
+        case .topLeft:
+            return "top-left"
+        case .topRight:
+            return "top-right"
+        case .bottomLeft:
+            return "bottom-left"
+        case .bottomRight:
+            return "bottom-right"
+        case .fullscreen:
+            return "fullscreen"
         }
     }
 
@@ -374,8 +406,8 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             return
         }
         do {
-            let leftFrame = LayoutEngine().frame(for: .left, in: screenManager.mainVisibleFrame())
-            _ = try stackManager.putWindowInStack(name: leftBucketName, frame: leftFrame, window: target)
+            let leftFrame = LayoutEngine().frame(for: .left, in: screenManager.mainVisibleFrameInScreenCoordinates())
+            _ = try stackManager.putWindowInStack(name: "left", frame: leftFrame, window: target)
             leftBucketEnabled = true
             mergeMode = .leftColumn
             mergeControl?.selectedSegment = mergeMode.rawValue
@@ -495,14 +527,86 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         }
     }
 
-    private func setupDesktopBucketPanel() {
+    @objc
+    private func runAutoScan() {
+        do {
+            try zoneManager.autoAssign(mergeMode: mergeMode)
+            setStatus("自动扫描完成", error: false)
+            refreshWorkbench()
+        } catch {
+            setStatus(error.localizedDescription, error: true)
+        }
+    }
+
+    private func refreshAllStackPanels() {
+        let allStacks = stackManager.listStacks()
+        let activeNames = Set(allStacks.map(\.name))
+
+        for name in stackPanels.keys where !activeNames.contains(name) {
+            stackPanels[name]?.close()
+            stackPanels.removeValue(forKey: name)
+            stackPanelTabStacks.removeValue(forKey: name)
+        }
+
+        let screenH = NSScreen.main?.frame.height ?? 0
+        for stack in allStacks {
+            updateStackPanel(stack: stack, screenHeight: screenH)
+        }
+    }
+
+    private func updateStackPanel(stack: WindowStack, screenHeight: CGFloat) {
+        let axFrame = stack.frame.cgRect
+        let panelFrame = NSRect(
+            x: axFrame.minX + 8,
+            y: screenHeight - axFrame.minY - 32,
+            width: max(220, axFrame.width - 16),
+            height: 32
+        )
+
+        let panel: NSPanel
+        let tabsStack: NSStackView
+
+        if let existing = stackPanels[stack.name], let existingTabs = stackPanelTabStacks[stack.name] {
+            panel = existing
+            tabsStack = existingTabs
+        } else {
+            (panel, tabsStack) = makeStackPanel()
+            stackPanels[stack.name] = panel
+            stackPanelTabStacks[stack.name] = tabsStack
+        }
+
+        panel.setFrame(panelFrame, display: true)
+
+        tabsStack.arrangedSubviews.forEach {
+            tabsStack.removeArrangedSubview($0)
+            $0.removeFromSuperview()
+        }
+
+        if stack.windows.isEmpty {
+            panel.orderOut(nil)
+            return
+        }
+
+        for (index, identity) in stack.windows.prefix(8).enumerated() {
+            let label = "\(index + 1). \(identity.title.isEmpty ? identity.bundleId : identity.title)"
+            let btn = StackTabButton(title: label, target: self, action: #selector(selectStackTab(_:)))
+            btn.stackName = stack.name
+            btn.tabIndex = index
+            btn.bezelStyle = .rounded
+            btn.controlSize = .small
+            btn.font = NSFont.systemFont(ofSize: 11, weight: index == stack.activeIndex ? .semibold : .regular)
+            tabsStack.addArrangedSubview(btn)
+        }
+        panel.orderFrontRegardless()
+    }
+
+    private func makeStackPanel() -> (NSPanel, NSStackView) {
         let panel = NSPanel(
-            contentRect: NSRect(x: 100, y: 100, width: 600, height: 40),
+            contentRect: .zero,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
-        panel.title = "Left Bucket Tabs"
         panel.level = .statusBar
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
@@ -512,7 +616,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.hasShadow = true
 
-        let effect = NSVisualEffectView(frame: panel.contentView?.bounds ?? .zero)
+        let effect = NSVisualEffectView()
         effect.material = .hudWindow
         effect.blendingMode = .withinWindow
         effect.state = .active
@@ -536,62 +640,18 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             tabs.bottomAnchor.constraint(equalTo: effect.bottomAnchor)
         ])
 
-        desktopBucketTabsStack = tabs
-        desktopBucketPanel = panel
-    }
-
-    private func refreshDesktopBucketPanel(leftBucket: WindowStack?) {
-        guard let panel = desktopBucketPanel else { return }
-        if !leftBucketEnabled {
-            panel.orderOut(nil)
-            return
-        }
-
-        let leftFrame = LayoutEngine().frame(for: .left, in: screenManager.mainVisibleFrame())
-        let panelFrame = NSRect(
-            x: leftFrame.minX + 8,
-            y: leftFrame.maxY - 38,
-            width: max(220, leftFrame.width - 16),
-            height: 32
-        )
-        panel.setFrame(panelFrame, display: true)
-
-        guard let tabsStack = desktopBucketTabsStack else { return }
-        tabsStack.arrangedSubviews.forEach { v in
-            tabsStack.removeArrangedSubview(v)
-            v.removeFromSuperview()
-        }
-
-        let windows = leftBucket?.windows ?? []
-        let activeIndex = leftBucket?.activeIndex ?? 0
-        if windows.isEmpty {
-            let hint = NSTextField(labelWithString: "左侧桶为空")
-            hint.textColor = .secondaryLabelColor
-            hint.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-            tabsStack.addArrangedSubview(hint)
-            panel.orderFrontRegardless()
-            return
-        }
-
-        for (index, identity) in windows.enumerated().prefix(8) {
-            let labelBase = identity.title.isEmpty ? identity.bundleId : identity.title
-            let label = "\(index + 1). \(labelBase)"
-            let button = NSButton(title: label, target: self, action: #selector(selectDesktopBucketTab(_:)))
-            button.tag = index
-            button.bezelStyle = .rounded
-            button.controlSize = .small
-            button.font = NSFont.systemFont(ofSize: 11, weight: index == activeIndex ? .semibold : .regular)
-            if #available(macOS 11.0, *) {
-                button.hasDestructiveAction = false
-            }
-            tabsStack.addArrangedSubview(button)
-        }
-        panel.orderFrontRegardless()
+        return (panel, tabs)
     }
 
     @objc
-    private func selectDesktopBucketTab(_ sender: NSButton) {
-        switchLeftBucket(to: sender.tag)
+    private func selectStackTab(_ sender: StackTabButton) {
+        do {
+            try stackManager.switchStack(name: sender.stackName, index: sender.tabIndex)
+            setStatus("\(sender.stackName) 切换到标签 \(sender.tabIndex + 1)", error: false)
+            refreshWorkbench()
+        } catch {
+            setStatus(error.localizedDescription, error: true)
+        }
     }
 
     private func openChromeWindows(count: Int) throws {
@@ -1000,4 +1060,9 @@ private final class DesktopContainerView: NSView {
             ]
         }
     }
+}
+
+private final class StackTabButton: NSButton {
+    var stackName: String = ""
+    var tabIndex: Int = 0
 }

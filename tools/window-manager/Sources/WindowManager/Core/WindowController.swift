@@ -117,6 +117,26 @@ final class WindowController {
         try setSize(window: targetWindow, size: frame.size)
     }
 
+    func raiseWindow(bundleId: String, windowIndex: Int = 0) throws {
+        let targetWindow = try resolveAXWindow(bundleId: bundleId, windowIndex: windowIndex)
+        let result = AXUIElementPerformAction(targetWindow, kAXRaiseAction as CFString)
+        guard result == .success else {
+            throw WindowControllerError.axFailure("raise window", result)
+        }
+        let app = try runningApplication(bundleId: bundleId)
+        _ = app.activate(options: [.activateIgnoringOtherApps])
+    }
+
+    func raiseWindow(bundleId: String, windowNumber: Int) throws {
+        let targetWindow = try resolveAXWindow(bundleId: bundleId, windowNumber: windowNumber)
+        let result = AXUIElementPerformAction(targetWindow, kAXRaiseAction as CFString)
+        guard result == .success else {
+            throw WindowControllerError.axFailure("raise window", result)
+        }
+        let app = try runningApplication(bundleId: bundleId)
+        _ = app.activate(options: [.activateIgnoringOtherApps])
+    }
+
     func setWindowMinimized(bundleId: String, windowIndex: Int = 0, minimized: Bool) throws {
         let targetWindow = try resolveAXWindow(bundleId: bundleId, windowIndex: windowIndex)
         let boolValue: CFBoolean = minimized ? kCFBooleanTrue : kCFBooleanFalse
@@ -175,6 +195,11 @@ final class WindowController {
 
     func windowCount(bundleId: String) throws -> Int {
         try axWindows(bundleId: bundleId).count
+    }
+
+    func windowInfo(bundleId: String, windowNumber: Int) -> WindowInfo? {
+        listWindows(onScreenOnly: false)
+            .first { $0.bundleId == bundleId && $0.windowNumber == windowNumber }
     }
 
     func frontmostBundleId() -> String? {
