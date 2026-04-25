@@ -8,14 +8,22 @@ enum DesktopMergeMode: Int, CaseIterable {
     case rightColumn
     case topRow
     case bottomRow
+    case leftRight
+    case topBottom
+    case threeColumns
+    case threeRows
 
     var title: String {
         switch self {
         case .grid: return "四分"
-        case .leftColumn: return "左合并"
-        case .rightColumn: return "右合并"
-        case .topRow: return "上合并"
-        case .bottomRow: return "下合并"
+        case .leftColumn: return "左大右二"
+        case .rightColumn: return "左二右大"
+        case .topRow: return "上大下二"
+        case .bottomRow: return "上二下大"
+        case .leftRight: return "左右分屏"
+        case .topBottom: return "上下分屏"
+        case .threeColumns: return "三列"
+        case .threeRows: return "三行"
         }
     }
 }
@@ -87,6 +95,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     private var stackPanelTabStacks: [String: NSStackView] = [:]
     private var refreshTimer: Timer?
     private var keyboardMonitor: Any?
+    private var appActivationObserver: NSObjectProtocol?
 
     init(
         windowController: WindowController,
@@ -180,6 +189,11 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         desktopView.onBucketTabSelected = { [weak self] index in
             self?.switchLeftBucket(to: index)
         }
+        desktopView.onSplitChanged = { [weak self] x, y in
+            guard let self else { return }
+            self.zoneManager.splitX = x
+            self.zoneManager.splitY = y
+        }
         self.desktopView = desktopView
 
         let statusLabel = NSTextField(labelWithString: "就绪")
@@ -229,6 +243,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
 
         installKeyboardShortcuts()
         startRefreshTimer()
+        startPanelZOrderMonitoring()
         refreshWorkbench()
         if let focusedLayoutName {
             selectedLayoutName = focusedLayoutName
@@ -238,6 +253,9 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     func windowWillClose(_ notification: Notification) {
         if let keyboardMonitor {
             NSEvent.removeMonitor(keyboardMonitor)
+        }
+        if let appActivationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(appActivationObserver)
         }
         refreshTimer?.invalidate()
         for panel in stackPanels.values { panel.close() }
@@ -251,6 +269,34 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             guard let self else { return }
             Task { @MainActor in
                 self.refreshWorkbench()
+            }
+        }
+    }
+
+    private func startPanelZOrderMonitoring() {
+        appActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.updateAllPanelZOrder()
+            }
+        }
+    }
+
+    private func updateAllPanelZOrder() {
+        let frontmostBundleId = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        let allStacks = stackManager.listStacks()
+
+        for stack in allStacks {
+            guard let panel = stackPanels[stack.name], !stack.windows.isEmpty else { continue }
+            let safeIndex = stack.activeIndex < stack.windows.count ? stack.activeIndex : 0
+            let activeWindow = stack.windows[safeIndex]
+            if let bundleId = frontmostBundleId, activeWindow.bundleId == bundleId {
+                panel.orderFront(nil)
+            } else {
+                panel.orderBack(nil)
             }
         }
     }
@@ -597,7 +643,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             btn.font = NSFont.systemFont(ofSize: 11, weight: index == stack.activeIndex ? .semibold : .regular)
             tabsStack.addArrangedSubview(btn)
         }
-        panel.orderFrontRegardless()
+        // Z-order is managed exclusively by updateAllPanelZOrder; don't touch it here.
     }
 
     private func makeStackPanel() -> (NSPanel, NSStackView) {
@@ -607,13 +653,13 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             backing: .buffered,
             defer: false
         )
-        panel.level = .statusBar
-        panel.isFloatingPanel = true
+        panel.level = .normal
+        panel.isFloatingPanel = false
         panel.hidesOnDeactivate = false
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.ignoresMouseEvents = false
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         panel.hasShadow = true
 
         let effect = NSVisualEffectView()
@@ -818,10 +864,20 @@ private final class DesktopContainerView: NSView {
         case br
     }
 
+    private enum DragAxis { case horizontal, vertical, both }
+
     private let displayFrame: CGRect
     private var sections: [Section] = []
     private var tabHitAreas: [TabHitArea] = []
     var onBucketTabSelected: ((Int) -> Void)?
+    var onSplitChanged: ((CGFloat, CGFloat) -> Void)?
+
+    // Split ratios (0~1), default 0.5
+    var splitX: CGFloat = 0.5
+    var splitY: CGFloat = 0.5
+
+    private var draggingAxis: DragAxis?
+    private let dividerHitWidth: CGFloat = 8
 
     init(displayFrame: CGRect) {
         self.displayFrame = displayFrame
@@ -875,15 +931,107 @@ private final class DesktopContainerView: NSView {
         for section in sections {
             tabHitAreas.append(contentsOf: drawSection(section))
         }
+
+        // Draw divider lines
+        let inset = bounds.insetBy(dx: 10, dy: 10)
+        let xDivider = inset.minX + inset.width * splitX
+        let yDivider = inset.minY + inset.height * splitY
+
+        NSColor.systemGray.withAlphaComponent(0.3).setStroke()
+        let vLine = NSBezierPath()
+        vLine.move(to: NSPoint(x: xDivider, y: inset.minY))
+        vLine.line(to: NSPoint(x: xDivider, y: inset.maxY))
+        vLine.lineWidth = 2
+        vLine.stroke()
+
+        let hLine = NSBezierPath()
+        hLine.move(to: NSPoint(x: inset.minX, y: yDivider))
+        hLine.line(to: NSPoint(x: inset.maxX, y: yDivider))
+        hLine.lineWidth = 2
+        hLine.stroke()
     }
 
     override func mouseDown(with event: NSEvent) {
         let location = convert(event.locationInWindow, from: nil)
+
+        // Check tab hits first
         if let hitArea = tabHitAreas.first(where: { $0.rect.contains(location) }) {
             onBucketTabSelected?(hitArea.index)
             return
         }
-        super.mouseDown(with: event)
+
+        // Check divider hits
+        let inset = bounds.insetBy(dx: 10, dy: 10)
+        let xDivider = inset.minX + inset.width * splitX
+        let yDivider = inset.minY + inset.height * splitY
+
+        let hitX = abs(location.x - xDivider) < dividerHitWidth
+        let hitY = abs(location.y - yDivider) < dividerHitWidth
+
+        if hitX && hitY {
+            draggingAxis = .both
+        } else if hitX {
+            draggingAxis = .horizontal
+        } else if hitY {
+            draggingAxis = .vertical
+        } else {
+            super.mouseDown(with: event)
+            return
+        }
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let axis = draggingAxis else {
+            super.mouseDragged(with: event)
+            return
+        }
+
+        let location = convert(event.locationInWindow, from: nil)
+        let inset = bounds.insetBy(dx: 10, dy: 10)
+
+        if axis == .horizontal || axis == .both {
+            let newX = (location.x - inset.minX) / inset.width
+            splitX = max(0.2, min(0.8, newX))
+        }
+
+        if axis == .vertical || axis == .both {
+            let newY = (location.y - inset.minY) / inset.height
+            splitY = max(0.2, min(0.8, newY))
+        }
+
+        needsDisplay = true
+        onSplitChanged?(splitX, splitY)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        draggingAxis = nil
+        super.mouseUp(with: event)
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+
+        let inset = bounds.insetBy(dx: 10, dy: 10)
+        let xDivider = inset.minX + inset.width * splitX
+        let yDivider = inset.minY + inset.height * splitY
+
+        // Horizontal divider cursor
+        let hRect = NSRect(
+            x: xDivider - dividerHitWidth / 2,
+            y: inset.minY,
+            width: dividerHitWidth,
+            height: inset.height
+        )
+        addCursorRect(hRect, cursor: .resizeLeftRight)
+
+        // Vertical divider cursor
+        let vRect = NSRect(
+            x: inset.minX,
+            y: yDivider - dividerHitWidth / 2,
+            width: inset.width,
+            height: dividerHitWidth
+        )
+        addCursorRect(vRect, cursor: .resizeUpDown)
     }
 
     private func drawSection(_ section: Section) -> [TabHitArea] {
@@ -1014,13 +1162,19 @@ private final class DesktopContainerView: NSView {
     private func buildSections(for mode: DesktopMergeMode) -> [(title: String, frame: CGRect, quadrants: [Quadrant], isLeftArea: Bool)] {
         let inset = bounds.insetBy(dx: 10, dy: 10)
         let spacing: CGFloat = 10
-        let halfW = (inset.width - spacing) / 2
-        let halfH = (inset.height - spacing) / 2
 
-        let tl = CGRect(x: inset.minX, y: inset.midY + spacing / 2, width: halfW, height: halfH)
-        let tr = CGRect(x: inset.midX + spacing / 2, y: inset.midY + spacing / 2, width: halfW, height: halfH)
-        let bl = CGRect(x: inset.minX, y: inset.minY, width: halfW, height: halfH)
-        let br = CGRect(x: inset.midX + spacing / 2, y: inset.minY, width: halfW, height: halfH)
+        let xSplit = inset.minX + inset.width * splitX
+        let ySplit = inset.minY + inset.height * splitY
+
+        let leftW = xSplit - inset.minX - spacing / 2
+        let rightW = inset.maxX - xSplit - spacing / 2
+        let bottomH = ySplit - inset.minY - spacing / 2
+        let topH = inset.maxY - ySplit - spacing / 2
+
+        let tl = CGRect(x: inset.minX, y: ySplit + spacing / 2, width: leftW, height: topH)
+        let tr = CGRect(x: xSplit + spacing / 2, y: ySplit + spacing / 2, width: rightW, height: topH)
+        let bl = CGRect(x: inset.minX, y: inset.minY, width: leftW, height: bottomH)
+        let br = CGRect(x: xSplit + spacing / 2, y: inset.minY, width: rightW, height: bottomH)
 
         switch mode {
         case .grid:
@@ -1031,32 +1185,66 @@ private final class DesktopContainerView: NSView {
                 ("右下", br, [.br], false)
             ]
         case .leftColumn:
-            let left = CGRect(x: inset.minX, y: inset.minY, width: halfW, height: inset.height)
+            let left = CGRect(x: inset.minX, y: inset.minY, width: leftW, height: inset.height)
             return [
                 ("左侧大块", left, [.tl, .bl], true),
                 ("右上", tr, [.tr], false),
                 ("右下", br, [.br], false)
             ]
         case .rightColumn:
-            let right = CGRect(x: inset.midX + spacing / 2, y: inset.minY, width: halfW, height: inset.height)
+            let right = CGRect(x: xSplit + spacing / 2, y: inset.minY, width: rightW, height: inset.height)
             return [
                 ("左上", tl, [.tl], true),
                 ("左下", bl, [.bl], true),
                 ("右侧大块", right, [.tr, .br], false)
             ]
         case .topRow:
-            let top = CGRect(x: inset.minX, y: inset.midY + spacing / 2, width: inset.width, height: halfH)
+            let top = CGRect(x: inset.minX, y: ySplit + spacing / 2, width: inset.width, height: topH)
             return [
                 ("上方大块", top, [.tl, .tr], true),
                 ("左下", bl, [.bl], true),
                 ("右下", br, [.br], false)
             ]
         case .bottomRow:
-            let bottom = CGRect(x: inset.minX, y: inset.minY, width: inset.width, height: halfH)
+            let bottom = CGRect(x: inset.minX, y: inset.minY, width: inset.width, height: bottomH)
             return [
                 ("左上", tl, [.tl], true),
                 ("右上", tr, [.tr], false),
                 ("下方大块", bottom, [.bl, .br], true)
+            ]
+        case .leftRight:
+            let left = CGRect(x: inset.minX, y: inset.minY, width: leftW, height: inset.height)
+            let right = CGRect(x: xSplit + spacing / 2, y: inset.minY, width: rightW, height: inset.height)
+            return [
+                ("左侧", left, [.tl, .bl], true),
+                ("右侧", right, [.tr, .br], false)
+            ]
+        case .topBottom:
+            let top = CGRect(x: inset.minX, y: ySplit + spacing / 2, width: inset.width, height: topH)
+            let bottom = CGRect(x: inset.minX, y: inset.minY, width: inset.width, height: bottomH)
+            return [
+                ("上方", top, [.tl, .tr], true),
+                ("下方", bottom, [.bl, .br], false)
+            ]
+        case .threeColumns:
+            let thirdW = (inset.width - spacing * 2) / 3
+            let c1 = CGRect(x: inset.minX, y: inset.minY, width: thirdW, height: inset.height)
+            let c2 = CGRect(x: inset.minX + thirdW + spacing, y: inset.minY, width: thirdW, height: inset.height)
+            let c3 = CGRect(x: inset.minX + (thirdW + spacing) * 2, y: inset.minY, width: thirdW, height: inset.height)
+            return [
+                ("左列", c1, [.tl, .bl], true),
+                ("中列", c2, [.tl, .bl, .tr, .br], false),
+                ("右列", c3, [.tr, .br], false)
+            ]
+        case .threeRows:
+            let thirdH = (inset.height - spacing * 2) / 3
+            let r1 = CGRect(x: inset.minX, y: inset.minY + (thirdH + spacing) * 2, width: inset.width, height: thirdH)
+            let r2 = CGRect(x: inset.minX, y: inset.minY + thirdH + spacing, width: inset.width, height: thirdH)
+            let r3 = CGRect(x: inset.minX, y: inset.minY, width: inset.width, height: thirdH)
+            return [
+                ("上行", r1, [.tl, .tr], true),
+                ("中行", r2, [.tl, .tr, .bl, .br], false),
+                ("下行", r3, [.bl, .br], false)
             ]
         }
     }

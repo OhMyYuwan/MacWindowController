@@ -22,6 +22,10 @@ final class DesktopZoneManager {
     private let layoutEngine: LayoutEngine
     private var config: DesktopConfig
 
+    /// Custom split ratios (0~1). nil = use 0.5 (equal split)
+    var splitX: CGFloat = 0.5
+    var splitY: CGFloat = 0.5
+
     init(
         windowController: WindowController,
         screenManager: ScreenManager,
@@ -85,22 +89,31 @@ final class DesktopZoneManager {
         }
     }
 
-    /// One-shot: scan + apply
+    /// One-shot: scan + apply, clearing any stacks that conflict with the new zones
     func autoAssign(mergeMode: DesktopMergeMode) throws {
         let result = scan(mergeMode: mergeMode)
+        let newZoneNames = Set(result.zones.map(\.name))
+        for stack in stackManager.listStacks() where !newZoneNames.contains(stack.name) {
+            try? stackManager.deleteStack(name: stack.name)
+        }
         try applyScanResult(result)
     }
 
     // MARK: - Zone Definitions
 
     private func defineZones(for mode: DesktopMergeMode, in screenFrame: CGRect) -> [DesktopZone] {
-        let halfW = screenFrame.width / 2
-        let halfH = screenFrame.height / 2
+        let xSplit = screenFrame.minX + screenFrame.width * splitX
+        let ySplit = screenFrame.minY + screenFrame.height * splitY
 
-        let tl = CGRect(x: screenFrame.minX, y: screenFrame.minY, width: halfW, height: halfH)
-        let tr = CGRect(x: screenFrame.midX, y: screenFrame.minY, width: halfW, height: halfH)
-        let bl = CGRect(x: screenFrame.minX, y: screenFrame.midY, width: halfW, height: halfH)
-        let br = CGRect(x: screenFrame.midX, y: screenFrame.midY, width: halfW, height: halfH)
+        let leftW = xSplit - screenFrame.minX
+        let rightW = screenFrame.maxX - xSplit
+        let topH = ySplit - screenFrame.minY
+        let bottomH = screenFrame.maxY - ySplit
+
+        let tl = CGRect(x: screenFrame.minX, y: screenFrame.minY, width: leftW, height: topH)
+        let tr = CGRect(x: xSplit, y: screenFrame.minY, width: rightW, height: topH)
+        let bl = CGRect(x: screenFrame.minX, y: ySplit, width: leftW, height: bottomH)
+        let br = CGRect(x: xSplit, y: ySplit, width: rightW, height: bottomH)
 
         switch mode {
         case .grid:
@@ -111,32 +124,66 @@ final class DesktopZoneManager {
                 DesktopZone(name: "bottom-right", frame: br),
             ]
         case .leftColumn:
-            let left = CGRect(x: screenFrame.minX, y: screenFrame.minY, width: halfW, height: screenFrame.height)
+            let left = CGRect(x: screenFrame.minX, y: screenFrame.minY, width: leftW, height: screenFrame.height)
             return [
                 DesktopZone(name: "left", frame: left),
                 DesktopZone(name: "top-right", frame: tr),
                 DesktopZone(name: "bottom-right", frame: br),
             ]
         case .rightColumn:
-            let right = CGRect(x: screenFrame.midX, y: screenFrame.minY, width: halfW, height: screenFrame.height)
+            let right = CGRect(x: xSplit, y: screenFrame.minY, width: rightW, height: screenFrame.height)
             return [
                 DesktopZone(name: "top-left", frame: tl),
                 DesktopZone(name: "bottom-left", frame: bl),
                 DesktopZone(name: "right", frame: right),
             ]
         case .topRow:
-            let top = CGRect(x: screenFrame.minX, y: screenFrame.minY, width: screenFrame.width, height: halfH)
+            let top = CGRect(x: screenFrame.minX, y: screenFrame.minY, width: screenFrame.width, height: topH)
             return [
                 DesktopZone(name: "top", frame: top),
                 DesktopZone(name: "bottom-left", frame: bl),
                 DesktopZone(name: "bottom-right", frame: br),
             ]
         case .bottomRow:
-            let bottom = CGRect(x: screenFrame.minX, y: screenFrame.midY, width: screenFrame.width, height: halfH)
+            let bottom = CGRect(x: screenFrame.minX, y: ySplit, width: screenFrame.width, height: bottomH)
             return [
                 DesktopZone(name: "top-left", frame: tl),
                 DesktopZone(name: "top-right", frame: tr),
                 DesktopZone(name: "bottom", frame: bottom),
+            ]
+        case .leftRight:
+            let left = CGRect(x: screenFrame.minX, y: screenFrame.minY, width: leftW, height: screenFrame.height)
+            let right = CGRect(x: xSplit, y: screenFrame.minY, width: rightW, height: screenFrame.height)
+            return [
+                DesktopZone(name: "left", frame: left),
+                DesktopZone(name: "right", frame: right),
+            ]
+        case .topBottom:
+            let top = CGRect(x: screenFrame.minX, y: screenFrame.minY, width: screenFrame.width, height: topH)
+            let bottom = CGRect(x: screenFrame.minX, y: ySplit, width: screenFrame.width, height: bottomH)
+            return [
+                DesktopZone(name: "top", frame: top),
+                DesktopZone(name: "bottom", frame: bottom),
+            ]
+        case .threeColumns:
+            let thirdW = screenFrame.width / 3
+            let c1 = CGRect(x: screenFrame.minX, y: screenFrame.minY, width: thirdW, height: screenFrame.height)
+            let c2 = CGRect(x: screenFrame.minX + thirdW, y: screenFrame.minY, width: thirdW, height: screenFrame.height)
+            let c3 = CGRect(x: screenFrame.minX + thirdW * 2, y: screenFrame.minY, width: thirdW, height: screenFrame.height)
+            return [
+                DesktopZone(name: "col-left", frame: c1),
+                DesktopZone(name: "col-center", frame: c2),
+                DesktopZone(name: "col-right", frame: c3),
+            ]
+        case .threeRows:
+            let thirdH = screenFrame.height / 3
+            let r1 = CGRect(x: screenFrame.minX, y: screenFrame.minY, width: screenFrame.width, height: thirdH)
+            let r2 = CGRect(x: screenFrame.minX, y: screenFrame.minY + thirdH, width: screenFrame.width, height: thirdH)
+            let r3 = CGRect(x: screenFrame.minX, y: screenFrame.minY + thirdH * 2, width: screenFrame.width, height: thirdH)
+            return [
+                DesktopZone(name: "row-top", frame: r1),
+                DesktopZone(name: "row-center", frame: r2),
+                DesktopZone(name: "row-bottom", frame: r3),
             ]
         }
     }

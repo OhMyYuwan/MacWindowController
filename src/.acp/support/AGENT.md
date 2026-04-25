@@ -10,7 +10,7 @@ quick_entry:
     - cli_surface
   active_request_id: null
   status: active development
-  next_step: open REQ-0004 for multi-display and integration execution
+  next_step: awaiting new requirements
 ```
 
 # WinCtlManager Agent Guide
@@ -51,7 +51,7 @@ desktop snapshot persistence, and a visual desktop layout editor.
 
 ## Active Direction
 
-- Last completed request: `REQ-0003`
-- Last completed plan: `PLN-0003`
-- Last completed change: `CHG-0003`
-- Immediate objective: continue Phase 2 feature delivery on YuwanZ branch.
+- Last completed request: `REQ-0005`
+- Last completed plan: `PLN-0005`
+- Last completed change: `CHG-0005`
+- Immediate objective: awaiting new requirements on YuwanZ branch.
