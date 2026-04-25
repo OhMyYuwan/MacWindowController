@@ -25,3 +25,7 @@ src/.acp/kernel/
 
 # Planning documents (never upload)
 docs/
+
+# Runtime local state
+.window-manager/
+tools/window-manager/.window-manager/

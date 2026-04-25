@@ -26,10 +26,12 @@ enum StackManagerError: LocalizedError {
 }
 
 final class StackManager {
+    private let stackTabBarHeight: CGFloat = 32
     private let windowController: WindowController
     private let screenManager: ScreenManager
     private let layoutEngine: LayoutEngine
     private let fileManager: FileManager
+    private let supportDirectoryURL: URL
     private var stacks: [String: WindowStack]
 
     init(
@@ -42,12 +44,17 @@ final class StackManager {
         self.screenManager = screenManager
         self.layoutEngine = layoutEngine
         self.fileManager = fileManager
+        self.supportDirectoryURL = StackManager.resolveSupportDirectory(fileManager: fileManager)
         self.stacks = [:]
         load()
     }
 
     func listStacks() -> [WindowStack] {
         stacks.values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    func stack(named name: String) -> WindowStack? {
+        stacks[name]
     }
 
     @discardableResult
@@ -71,31 +78,23 @@ final class StackManager {
 
         var bundleOccurrences: [String: Int] = [:]
         var identities: [WindowIdentity] = []
+        let contentFrame = stackContentFrame(from: frame)
 
         for bundleId in bundleIds {
             let index = bundleOccurrences[bundleId, default: 0]
             bundleOccurrences[bundleId] = index + 1
 
-            try windowController.setWindowFrame(bundleId: bundleId, windowIndex: index, frame: frame)
-            try windowController.setWindowMinimized(bundleId: bundleId, windowIndex: index, minimized: true)
-
-            let title = (try? windowController.windowTitle(bundleId: bundleId, windowIndex: index)) ?? ""
-            identities.append(
-                WindowIdentity(
-                    bundleId: bundleId,
-                    title: title,
-                    windowNumber: nil
-                )
-            )
+            let identity = (try? windowController.windowIdentity(bundleId: bundleId, windowIndex: index))
+                ?? WindowIdentity(bundleId: bundleId, title: "", windowNumber: nil)
+            identities.append(identity)
+            try setWindowFrame(identity: identity, fallbackWindowIndex: index, frame: contentFrame)
+            try setWindowMinimized(identity: identity, fallbackWindowIndex: index, minimized: true)
         }
 
         let safeActive = min(max(activeIndex, 0), identities.count - 1)
         let activeOccurrence = occurrenceIndex(for: safeActive, in: identities)
-        try windowController.setWindowMinimized(
-            bundleId: identities[safeActive].bundleId,
-            windowIndex: activeOccurrence,
-            minimized: false
-        )
+        try setWindowFrame(identity: identities[safeActive], fallbackWindowIndex: activeOccurrence, frame: contentFrame)
+        try setWindowMinimized(identity: identities[safeActive], fallbackWindowIndex: activeOccurrence, minimized: false)
 
         let stack = WindowStack(
             name: normalizedName,
@@ -107,6 +106,39 @@ final class StackManager {
         stacks[normalizedName] = stack
         try save()
         return stack
+    }
+
+    @discardableResult
+    func putWindowInStack(name: String, frame: CGRect, bundleId: String) throws -> WindowStack {
+        let identity = (try? windowController.windowIdentity(bundleId: bundleId, windowIndex: 0))
+            ?? WindowIdentity(bundleId: bundleId, title: "", windowNumber: nil)
+        return try putWindowInStack(name: name, frame: frame, window: identity)
+    }
+
+    @discardableResult
+    func putWindowInStack(name: String, frame: CGRect, window: WindowIdentity) throws -> WindowStack {
+        let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedName.isEmpty else {
+            throw StackManagerError.invalidName
+        }
+
+        if let existing = stacks[normalizedName] {
+            var windows = existing.windows
+            windows.append(window)
+            return try rebuildStack(
+                name: normalizedName,
+                frame: frame,
+                windows: windows,
+                activeIndex: windows.count - 1
+            )
+        }
+
+        return try rebuildStack(
+            name: normalizedName,
+            frame: frame,
+            windows: [window],
+            activeIndex: 0
+        )
     }
 
     func switchStack(name: String, index: Int) throws {
@@ -122,19 +154,13 @@ final class StackManager {
             return
         }
 
+        let contentFrame = stackContentFrame(from: stack.frame.cgRect)
         let previousOccurrence = occurrenceIndex(for: previousIndex, in: stack.windows)
         let nextOccurrence = occurrenceIndex(for: index, in: stack.windows)
 
-        try windowController.setWindowMinimized(
-            bundleId: stack.windows[previousIndex].bundleId,
-            windowIndex: previousOccurrence,
-            minimized: true
-        )
-        try windowController.setWindowMinimized(
-            bundleId: stack.windows[index].bundleId,
-            windowIndex: nextOccurrence,
-            minimized: false
-        )
+        try setWindowMinimized(identity: stack.windows[previousIndex], fallbackWindowIndex: previousOccurrence, minimized: true)
+        try setWindowFrame(identity: stack.windows[index], fallbackWindowIndex: nextOccurrence, frame: contentFrame)
+        try setWindowMinimized(identity: stack.windows[index], fallbackWindowIndex: nextOccurrence, minimized: false)
         try windowController.activateApp(bundleId: stack.windows[index].bundleId)
 
         stack.activeIndex = index
@@ -149,11 +175,7 @@ final class StackManager {
 
         for (idx, identity) in stack.windows.enumerated() {
             let occurrence = occurrenceIndex(for: idx, in: stack.windows)
-            try? windowController.setWindowMinimized(
-                bundleId: identity.bundleId,
-                windowIndex: occurrence,
-                minimized: false
-            )
+            try? setWindowMinimized(identity: identity, fallbackWindowIndex: occurrence, minimized: false)
         }
 
         stacks.removeValue(forKey: name)
@@ -164,11 +186,7 @@ final class StackManager {
         for stack in stacks.values {
             for (idx, identity) in stack.windows.enumerated() {
                 let occurrence = occurrenceIndex(for: idx, in: stack.windows)
-                try? windowController.setWindowMinimized(
-                    bundleId: identity.bundleId,
-                    windowIndex: occurrence,
-                    minimized: false
-                )
+                try? setWindowMinimized(identity: identity, fallbackWindowIndex: occurrence, minimized: false)
             }
         }
         stacks.removeAll()
@@ -184,7 +202,12 @@ final class StackManager {
             let mappedWindows = stack.windows.map { identity -> LayoutWindow in
                 let idx = occurrences[identity.bundleId, default: 0]
                 occurrences[identity.bundleId] = idx + 1
-                let liveWindow = grouped[identity.bundleId]?[safe: idx]
+                let liveWindow: WindowInfo? = {
+                    if let number = identity.windowNumber {
+                        return liveWindows.first(where: { $0.windowNumber == number })
+                    }
+                    return grouped[identity.bundleId]?[safe: idx]
+                }()
                 let iconPath = NSWorkspace.shared.urlForApplication(withBundleIdentifier: identity.bundleId)?.path
                 return LayoutWindow(
                     bundleId: identity.bundleId,
@@ -209,6 +232,65 @@ final class StackManager {
         guard targetIndex > 0 else { return 0 }
         let targetBundle = windows[targetIndex].bundleId
         return windows[..<targetIndex].filter { $0.bundleId == targetBundle }.count
+    }
+
+    private func rebuildStack(name: String, frame: CGRect, windows: [WindowIdentity], activeIndex: Int) throws -> WindowStack {
+        guard !windows.isEmpty else {
+            throw StackManagerError.emptyStackWindows
+        }
+
+        let contentFrame = stackContentFrame(from: frame)
+        var bundleOccurrences: [String: Int] = [:]
+
+        for identity in windows {
+            let index = bundleOccurrences[identity.bundleId, default: 0]
+            bundleOccurrences[identity.bundleId] = index + 1
+            try setWindowFrame(identity: identity, fallbackWindowIndex: index, frame: contentFrame)
+            try setWindowMinimized(identity: identity, fallbackWindowIndex: index, minimized: true)
+        }
+
+        let safeActive = min(max(activeIndex, 0), windows.count - 1)
+        let activeOccurrence = occurrenceIndex(for: safeActive, in: windows)
+        try setWindowFrame(identity: windows[safeActive], fallbackWindowIndex: activeOccurrence, frame: contentFrame)
+        try setWindowMinimized(identity: windows[safeActive], fallbackWindowIndex: activeOccurrence, minimized: false)
+        try windowController.activateApp(bundleId: windows[safeActive].bundleId)
+
+        let updated = WindowStack(
+            name: name,
+            frame: RectData(frame),
+            windows: windows,
+            activeIndex: safeActive,
+            createdAt: Date()
+        )
+        stacks[name] = updated
+        try save()
+        return updated
+    }
+
+    private func setWindowFrame(identity: WindowIdentity, fallbackWindowIndex: Int, frame: CGRect) throws {
+        if let windowNumber = identity.windowNumber {
+            try windowController.setWindowFrame(bundleId: identity.bundleId, windowNumber: windowNumber, frame: frame)
+        } else {
+            try windowController.setWindowFrame(bundleId: identity.bundleId, windowIndex: fallbackWindowIndex, frame: frame)
+        }
+    }
+
+    private func setWindowMinimized(identity: WindowIdentity, fallbackWindowIndex: Int, minimized: Bool) throws {
+        if let windowNumber = identity.windowNumber {
+            try windowController.setWindowMinimized(bundleId: identity.bundleId, windowNumber: windowNumber, minimized: minimized)
+        } else {
+            try windowController.setWindowMinimized(bundleId: identity.bundleId, windowIndex: fallbackWindowIndex, minimized: minimized)
+        }
+    }
+
+    private func stackContentFrame(from stackFrame: CGRect) -> CGRect {
+        let minHeight = max(80.0, stackFrame.height - stackTabBarHeight)
+        return CGRect(
+            x: stackFrame.minX,
+            y: stackFrame.minY,
+            width: stackFrame.width,
+            height: minHeight
+        )
     }
 
     private func load() {
@@ -241,14 +323,31 @@ final class StackManager {
         )
     }
 
-    private var supportDirectoryURL: URL {
-        let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support", isDirectory: true)
-        return base.appendingPathComponent("WinCtlManager", isDirectory: true)
-    }
-
     private var stacksURL: URL {
         supportDirectoryURL.appendingPathComponent("stacks.json", isDirectory: false)
+    }
+
+    private static func resolveSupportDirectory(fileManager: FileManager) -> URL {
+        if let custom = ProcessInfo.processInfo.environment["WINDOW_MANAGER_LAYOUTS_DIR"] {
+            return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath, isDirectory: true)
+        }
+
+        let tempFallback = URL(fileURLWithPath: "/tmp/winctlmanager-layouts", isDirectory: true)
+        if canCreateDirectory(at: tempFallback, fileManager: fileManager) {
+            return tempFallback
+        }
+
+        return URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+            .appendingPathComponent(".winctlmanager", isDirectory: true)
+    }
+
+    private static func canCreateDirectory(at url: URL, fileManager: FileManager) -> Bool {
+        do {
+            try fileManager.createDirectory(at: url, withIntermediateDirectories: true)
+            return true
+        } catch {
+            return false
+        }
     }
 }
 

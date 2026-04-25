@@ -5,7 +5,7 @@ final class RoundedRectView: NSView {
     let itemID: String
     private let icon: NSImage?
     private let titleLines: [String]
-    private var dragStartPoint: NSPoint = .zero
+    private var dragStartPointInSuperview: NSPoint = .zero
     private var dragStartFrame: NSRect = .zero
     private var isResizing = false
     private(set) var isSelected = false {
@@ -66,15 +66,17 @@ final class RoundedRectView: NSView {
     override func mouseDown(with event: NSEvent) {
         isSelected = true
         onSelect?(itemID)
-        dragStartPoint = convert(event.locationInWindow, from: nil)
+        dragStartPointInSuperview = superview?.convert(event.locationInWindow, from: nil) ?? .zero
         dragStartFrame = frame
-        isResizing = resizeHandleRect.contains(dragStartPoint)
+        let localPoint = convert(event.locationInWindow, from: nil)
+        isResizing = resizeHandleRect.contains(localPoint)
     }
 
     override func mouseDragged(with event: NSEvent) {
-        let point = convert(event.locationInWindow, from: nil)
-        let deltaX = point.x - dragStartPoint.x
-        let deltaY = point.y - dragStartPoint.y
+        guard let superview else { return }
+        let point = superview.convert(event.locationInWindow, from: nil)
+        let deltaX = point.x - dragStartPointInSuperview.x
+        let deltaY = point.y - dragStartPointInSuperview.y
 
         var newFrame = dragStartFrame
         if isResizing {
@@ -86,6 +88,8 @@ final class RoundedRectView: NSView {
         }
 
         frame = newFrame
+        dragStartPointInSuperview = point
+        dragStartFrame = newFrame
         onFrameChanged?(itemID, newFrame)
     }
 

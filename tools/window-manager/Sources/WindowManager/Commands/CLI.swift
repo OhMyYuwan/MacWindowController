@@ -5,6 +5,7 @@ enum CLIError: LocalizedError {
     case missingRequiredArgument(String)
     case invalidArgument(String)
     case unsupportedCommand(String)
+    case commandFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -16,6 +17,8 @@ enum CLIError: LocalizedError {
             return "Invalid argument: \(message)"
         case .unsupportedCommand(let command):
             return "Unsupported command: \(command)"
+        case .commandFailed(let message):
+            return message
         }
     }
 }
@@ -34,7 +37,7 @@ final class WindowManagerCLI {
 
     func run(arguments: [String]) throws {
         guard arguments.count > 1 else {
-            printHelp()
+            runOpenWorkbench(focusedLayoutName: nil)
             return
         }
 
@@ -44,6 +47,10 @@ final class WindowManagerCLI {
         switch command {
         case "help", "--help", "-h":
             printHelp()
+        case "launch-app", "open-app":
+            try runLaunchApp(parser: parser)
+        case "launch-chrome-windows", "open-chrome-windows":
+            try runLaunchChromeWindows(parser: parser)
         case "list":
             try runList(parser: parser, wrapJSONResponse: false)
         case "list-windows":
@@ -54,6 +61,12 @@ final class WindowManagerCLI {
             try runResize(parser: parser)
         case "tile", "tile-window":
             try runTile(parser: parser)
+        case "place-window":
+            try runPlaceWindow(parser: parser)
+        case "tile-frontmost":
+            try runTileFrontmost(parser: parser)
+        case "bucket-left-frontmost":
+            try runBucketLeftFrontmost(parser: parser)
         case "create-stack":
             try runCreateStack(parser: parser)
         case "switch-stack":
@@ -64,6 +77,8 @@ final class WindowManagerCLI {
             try runDeleteStack(parser: parser)
         case "save-desktop", "save-layout":
             try runSaveDesktop(parser: parser)
+        case "edit-current":
+            try runEditCurrent(parser: parser)
         case "list-desktops", "list-layouts":
             try runListDesktops(parser: parser)
         case "apply-desktop", "restore-layout":
@@ -76,6 +91,8 @@ final class WindowManagerCLI {
             try runImportDesktop(parser: parser)
         case "edit-desktop":
             try runEditDesktop(parser: parser)
+        case "open-workbench":
+            runOpenWorkbench(focusedLayoutName: parser.value(for: "--layout"))
         default:
             throw CLIError.unsupportedCommand(command)
         }
@@ -101,6 +118,40 @@ final class WindowManagerCLI {
             let title = window.title.isEmpty ? "<untitled>" : window.title
             print("[\(window.bundleId)] #\(window.windowNumber) \(title) \(window.frame.width)x\(window.frame.height) @ (\(window.frame.x), \(window.frame.y))")
         }
+    }
+
+    private func runLaunchApp(parser: ArgumentParser) throws {
+        let bundleId = try parser.requiredValue(for: "--bundle-id")
+        let activate = !parser.hasFlag("--background")
+        try windowController.launchApp(bundleId: bundleId, activate: activate)
+        if parser.hasFlag("--json") {
+            try printJSON(OperationResult(operation: "launch-app", bundleId: bundleId, status: "ok"))
+            return
+        }
+        print("Launched \(bundleId).")
+    }
+
+    private func runLaunchChromeWindows(parser: ArgumentParser) throws {
+        let count = parser.intValue(for: "--count") ?? 1
+        guard count > 0 else {
+            throw CLIError.invalidArgument("--count must be > 0")
+        }
+
+        try windowController.launchApp(bundleId: "com.google.Chrome", activate: true)
+        try openChromeWindows(count: count)
+
+        if parser.hasFlag("--json") {
+            try printJSON(
+                LaunchWindowsResult(
+                    operation: "launch-chrome-windows",
+                    bundleId: "com.google.Chrome",
+                    count: count,
+                    status: "ok"
+                )
+            )
+            return
+        }
+        print("Opened \(count) Chrome window(s).")
     }
 
     private func runMove(parser: ArgumentParser) throws {
@@ -153,6 +204,90 @@ final class WindowManagerCLI {
             return
         }
         print("Tiled \(bundleId) to \(position.rawValue).")
+    }
+
+    private func runPlaceWindow(parser: ArgumentParser) throws {
+        let bundleId = try parser.requiredValue(for: "--bundle-id")
+        let zoneRaw = try parser.requiredValue(for: "--zone")
+        guard let position = TilePosition.parse(zoneRaw) else {
+            throw CLIError.invalidArgument("--zone must be one of left/right/left-up/left-down/right-up/right-down or TilePosition values")
+        }
+
+        let windowIndex: Int
+        if let explicit = parser.intValue(for: "--window-index") {
+            windowIndex = explicit
+        } else if let windowNumber = parser.intValue(for: "--window-number") {
+            guard let matched = try windowController.findWindowIndex(bundleId: bundleId, windowNumber: windowNumber) else {
+                throw CLIError.invalidArgument("No window matched window-number: \(windowNumber)")
+            }
+            windowIndex = matched
+        } else if let titleQuery = parser.value(for: "--window-title-contains") {
+            guard let matched = try windowController.findWindowIndex(bundleId: bundleId, titleContains: titleQuery) else {
+                throw CLIError.invalidArgument("No window matched title query: \(titleQuery)")
+            }
+            windowIndex = matched
+        } else {
+            windowIndex = 0
+        }
+
+        let displayIndex = parser.intValue(for: "--display-index")
+        let frame = screenManager.visibleFrame(displayIndex: displayIndex)
+        try windowController.tileWindow(
+            bundleId: bundleId,
+            position: position,
+            in: frame,
+            windowIndex: windowIndex
+        )
+
+        if parser.hasFlag("--json") {
+            try printJSON(
+                WindowPlacementResult(
+                    operation: "place-window",
+                    bundleId: bundleId,
+                    position: position.rawValue,
+                    windowIndex: windowIndex,
+                    status: "ok"
+                )
+            )
+            return
+        }
+        print("Placed \(bundleId) window[\(windowIndex)] in \(position.rawValue).")
+    }
+
+    private func runTileFrontmost(parser: ArgumentParser) throws {
+        let positionRaw = try parser.requiredValue(for: "--position")
+        guard let position = TilePosition.parse(positionRaw) else {
+            throw CLIError.invalidArgument("--position must be one of \(TilePosition.allCases.map(\.rawValue).joined(separator: ", "))")
+        }
+
+        guard let identity = windowController.frontmostWindowIdentity() else {
+            throw CLIError.invalidArgument("No frontmost window found")
+        }
+        let frame = screenManager.mainVisibleFrame()
+        let targetFrame = LayoutEngine().frame(for: position, in: frame)
+        if let windowNumber = identity.windowNumber {
+            try windowController.setWindowFrame(bundleId: identity.bundleId, windowNumber: windowNumber, frame: targetFrame)
+        } else {
+            try windowController.tileWindow(bundleId: identity.bundleId, position: position, in: frame, windowIndex: 0)
+        }
+        if parser.hasFlag("--json") {
+            try printJSON(OperationResult(operation: "tile-frontmost", bundleId: identity.bundleId, status: "ok"))
+            return
+        }
+        print("Tiled frontmost \(identity.bundleId) to \(position.rawValue).")
+    }
+
+    private func runBucketLeftFrontmost(parser: ArgumentParser) throws {
+        guard let identity = windowController.frontmostWindowIdentity() else {
+            throw CLIError.invalidArgument("No frontmost window found")
+        }
+        let frame = LayoutEngine().frame(for: .left, in: screenManager.mainVisibleFrame())
+        _ = try stackManager.putWindowInStack(name: "left-bucket", frame: frame, window: identity)
+        if parser.hasFlag("--json") {
+            try printJSON(OperationResult(operation: "bucket-left-frontmost", bundleId: identity.bundleId, status: "ok"))
+            return
+        }
+        print("Added frontmost \(identity.bundleId) into left-bucket.")
     }
 
     private func runCreateStack(parser: ArgumentParser) throws {
@@ -240,12 +375,20 @@ final class WindowManagerCLI {
     private func runApplyDesktop(parser: ArgumentParser) throws {
         let name = try parser.requiredValue(for: "--name")
         try layoutCoordinator.applyDesktop(name: name)
+        if parser.hasFlag("--json") {
+            try printJSON(OperationResult(operation: "apply-desktop", bundleId: name, status: "ok"))
+            return
+        }
         print("Applied desktop layout '\(name)'.")
     }
 
     private func runDeleteDesktop(parser: ArgumentParser) throws {
         let name = try parser.requiredValue(for: "--name")
         try layoutCoordinator.deleteDesktop(name: name)
+        if parser.hasFlag("--json") {
+            try printJSON(OperationResult(operation: "delete-desktop", bundleId: name, status: "ok"))
+            return
+        }
         print("Deleted desktop layout '\(name)'.")
     }
 
@@ -254,6 +397,10 @@ final class WindowManagerCLI {
         let output = try parser.requiredValue(for: "--output")
         let outputURL = URL(fileURLWithPath: (output as NSString).expandingTildeInPath)
         try layoutCoordinator.exportDesktop(name: name, to: outputURL)
+        if parser.hasFlag("--json") {
+            try printJSON(OperationResult(operation: "export-desktop", bundleId: name, status: "ok"))
+            return
+        }
         print("Exported desktop '\(name)' to \(outputURL.path).")
     }
 
@@ -270,16 +417,49 @@ final class WindowManagerCLI {
 
     private func runEditDesktop(parser: ArgumentParser) throws {
         let name = try parser.requiredValue(for: "--name")
-        let layout = try layoutCoordinator.loadDesktop(name: name)
-        let frame = screenManager.mainVisibleFrame()
+        let description = parser.value(for: "--description") ?? ""
+        let createIfMissing = parser.hasFlag("--create-if-missing")
+
+        let layout: DesktopLayout
+        do {
+            layout = try layoutCoordinator.loadDesktop(name: name)
+        } catch {
+            guard createIfMissing else { throw error }
+            layout = try layoutCoordinator.saveCurrentDesktop(name: name, description: description)
+        }
+        runOpenWorkbench(focusedLayoutName: layout.name)
+    }
+
+    private func runEditCurrent(parser: ArgumentParser) throws {
+        let name = try parser.requiredValue(for: "--name")
+        let description = parser.value(for: "--description") ?? ""
+        _ = try layoutCoordinator.saveCurrentDesktop(name: name, description: description)
+        runOpenWorkbench(focusedLayoutName: name)
+    }
+
+    private func runOpenWorkbench(focusedLayoutName: String?) {
         if Thread.isMainThread {
             MainActor.assumeIsolated {
-                LayoutEditorLauncher.open(layout: layout, store: layoutStore, displayFrame: frame)
+                DesktopWorkbenchLauncher.open(
+                    windowController: windowController,
+                    stackManager: stackManager,
+                    layoutCoordinator: layoutCoordinator,
+                    layoutStore: layoutStore,
+                    screenManager: screenManager,
+                    focusedLayoutName: focusedLayoutName
+                )
             }
         } else {
             DispatchQueue.main.sync {
                 MainActor.assumeIsolated {
-                    LayoutEditorLauncher.open(layout: layout, store: layoutStore, displayFrame: frame)
+                    DesktopWorkbenchLauncher.open(
+                        windowController: windowController,
+                        stackManager: stackManager,
+                        layoutCoordinator: layoutCoordinator,
+                        layoutStore: layoutStore,
+                        screenManager: screenManager,
+                        focusedLayoutName: focusedLayoutName
+                    )
                 }
             }
         }
@@ -289,6 +469,8 @@ final class WindowManagerCLI {
         print(
             """
             window-manager commands:
+              launch-app --bundle-id <id> [--background] [--json]
+              launch-chrome-windows [--count N] [--json]
               list [--json] [--all]
               list-windows [--json] [--all]
               move --bundle-id <id> --x <N> --y <N> [--window-index N] [--json]
@@ -297,6 +479,9 @@ final class WindowManagerCLI {
               resize-window --bundle-id <id> --width <N> --height <N> [--window-index N] [--json]
               tile --bundle-id <id> --position <left|right|top|bottom|fullscreen|top-left|top-right|bottom-left|bottom-right> [--display-index N] [--window-index N]
               tile-window --bundle-id <id> --position <left|right|top|bottom|fullscreen|top-left|top-right|bottom-left|bottom-right> [--display-index N] [--window-index N]
+              place-window --bundle-id <id> --zone <left|left-up|left-down|right|right-up|right-down> [--window-index N | --window-number N | --window-title-contains <text>] [--display-index N] [--json]
+              tile-frontmost --position <position> [--json]
+              bucket-left-frontmost [--json]
               create-stack --name <name> --position <position> --windows <bundle1,bundle2,...> [--display-index N] [--json]
               switch-stack --name <name> --index <N>
               list-stacks [--json]
@@ -304,17 +489,46 @@ final class WindowManagerCLI {
 
               save-desktop --name <name> [--description <text>] [--json]
               save-layout --name <name> [--description <text>] [--json]
+              edit-current --name <name> [--description <text>]
               list-desktops [--json]
               list-layouts [--json]
-              apply-desktop --name <name>
+              apply-desktop --name <name> [--json]
               restore-layout --name <name>
-              delete-desktop --name <name>
+              delete-desktop --name <name> [--json]
               delete-layout --name <name>
-              export-desktop --name <name> --output <path>
+              export-desktop --name <name> --output <path> [--json]
               import-desktop --file <path> [--json]
-              edit-desktop --name <name>
+              edit-desktop --name <name> [--create-if-missing] [--description <text>]
+              open-workbench [--layout <name>]
             """
         )
+    }
+
+    private func openChromeWindows(count: Int) throws {
+        let script = """
+        tell application id "com.google.Chrome"
+            activate
+            repeat \(count) times
+                make new window
+            end repeat
+        end tell
+        """
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script]
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            let data = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            let message = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "osascript failed"
+            throw CLIError.commandFailed("Failed to open Chrome windows: \(message)")
+        }
     }
 
     private func printJSON<T: Encodable>(_ value: T) throws {
@@ -335,6 +549,21 @@ private struct WindowListResponse: Encodable {
 private struct OperationResult: Encodable {
     var operation: String
     var bundleId: String
+    var status: String
+}
+
+private struct WindowPlacementResult: Encodable {
+    var operation: String
+    var bundleId: String
+    var position: String
+    var windowIndex: Int
+    var status: String
+}
+
+private struct LaunchWindowsResult: Encodable {
+    var operation: String
+    var bundleId: String
+    var count: Int
     var status: String
 }
 
