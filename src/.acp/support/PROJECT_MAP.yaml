@@ -6,6 +6,8 @@ project:
     and interactive layout editing.
 
 entry_files:
+  - path: src/.acp/support/TERMINOLOGY.md
+    description: Canonical domain glossary for display/desktop/zone/stacking semantics.
   - path: tools/window-manager/Package.swift
     description: Swift package manifest for CLI and AppKit editor runtime.
   - path: tools/window-manager/Sources/WindowManager/main.swift

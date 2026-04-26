@@ -104,12 +104,18 @@ final class DesktopLayoutCoordinator {
             return
         }
 
-        _ = NSWorkspace.shared.launchApplication(
-            withBundleIdentifier: bundleId,
-            options: [.withoutActivation],
-            additionalEventParamDescriptor: nil,
-            launchIdentifier: nil
-        )
+        guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) else {
+            return
+        }
+
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = false
+        config.hides = false
+        NSWorkspace.shared.openApplication(at: appURL, configuration: config) { _, error in
+            if let error {
+                NSLog("desktop-layout: launch failed for %@: %@", bundleId, error.localizedDescription)
+            }
+        }
 
         // Give new applications a moment to create windows.
         usleep(300_000)

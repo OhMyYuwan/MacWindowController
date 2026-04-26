@@ -208,6 +208,97 @@ final class StackManager {
         try save()
     }
 
+    /// Resize/reframe an existing stack to a new zone frame while keeping its members.
+    func resizeStack(name: String, frame: CGRect) throws {
+        guard var stack = stacks[name] else {
+            throw StackManagerError.stackMissing(name)
+        }
+
+        let contentFrame = stackContentFrame(from: frame)
+        var bundleOccurrences: [String: Int] = [:]
+        for identity in stack.windows {
+            let index = bundleOccurrences[identity.bundleId, default: 0]
+            bundleOccurrences[identity.bundleId] = index + 1
+            try setWindowFrame(identity: identity, fallbackWindowIndex: index, frame: contentFrame)
+        }
+
+        stack.frame = RectData(frame)
+        stacks[name] = stack
+        try save()
+    }
+
+    /// Reconcile persisted stack windows with currently visible on-screen windows.
+    /// This removes minimized/non-existing windows from stacks and updates titles/windowNumbers.
+    @discardableResult
+    func reconcileStacks(with visibleWindows: [WindowInfo]) -> Bool {
+        let windowsByNumber = Dictionary(uniqueKeysWithValues: visibleWindows.map { ($0.windowNumber, $0) })
+        var usedNumbers = Set<Int>()
+        var changed = false
+        var nextStacks: [String: WindowStack] = [:]
+
+        for stack in listStacks() {
+            var merged: [WindowIdentity] = []
+
+            for identity in stack.windows {
+                if let number = identity.windowNumber,
+                   let live = windowsByNumber[number],
+                   !usedNumbers.contains(number),
+                   live.bundleId == identity.bundleId {
+                    merged.append(
+                        WindowIdentity(
+                            bundleId: live.bundleId,
+                            title: live.title,
+                            windowNumber: live.windowNumber
+                        )
+                    )
+                    usedNumbers.insert(number)
+                    continue
+                }
+
+                if let candidate = visibleWindows.first(where: { candidate in
+                    guard candidate.bundleId == identity.bundleId else { return false }
+                    guard !usedNumbers.contains(candidate.windowNumber) else { return false }
+                    if identity.title.isEmpty { return true }
+                    return candidate.title == identity.title
+                }) {
+                    merged.append(
+                        WindowIdentity(
+                            bundleId: candidate.bundleId,
+                            title: candidate.title,
+                            windowNumber: candidate.windowNumber
+                        )
+                    )
+                    usedNumbers.insert(candidate.windowNumber)
+                    continue
+                }
+            }
+
+            if merged.isEmpty {
+                changed = true
+                continue
+            }
+
+            let safeActive = min(stack.activeIndex, max(0, merged.count - 1))
+            let updated = WindowStack(
+                name: stack.name,
+                frame: stack.frame,
+                windows: merged,
+                activeIndex: safeActive,
+                createdAt: stack.createdAt
+            )
+            if updated.windows != stack.windows || updated.activeIndex != stack.activeIndex {
+                changed = true
+            }
+            nextStacks[stack.name] = updated
+        }
+
+        if changed {
+            stacks = nextStacks
+            try? save()
+        }
+        return changed
+    }
+
     func snapshotLayoutStacks() -> [LayoutStack] {
         let liveWindows = windowController.listWindows(onScreenOnly: false)
         let grouped = Dictionary(grouping: liveWindows) { $0.bundleId }

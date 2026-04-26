@@ -1,0 +1,17 @@
+id: REQ-0018
+title: "Fix DesktopContainerView draw crash on invalid rounded rect geometry"
+target_type: capability
+target_id: visual_editor
+target_slice: editor_canvas
+operation: repair
+summary: |
+  Resolve runtime EXC_BREAKPOINT caused by NSBezierPath rounded-rect drawing in
+  DesktopContainerView when section/tab geometry becomes invalid during layout
+  split rendering or dragging.
+created_at: "2026-04-25T17:12:10Z"
+priority: high
+notes: |
+  User reported Thread 1 EXC_BREAKPOINT; crash log points to
+  DesktopContainerView.drawTabs -> NSBezierPath(roundedRect:).
+completed_at: "2026-04-25T17:14:05Z"
+status: done

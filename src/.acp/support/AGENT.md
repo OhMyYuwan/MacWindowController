@@ -37,6 +37,16 @@ WinCtlManager is a native macOS window layout controller inspired by Tangrid.app
 The project priorities are: basic window operations, stack-based window groups,
 desktop snapshot persistence, and a visual desktop layout editor.
 
+## Core Terminology
+
+- Canonical glossary location: `src/.acp/support/TERMINOLOGY.md`
+- Required baseline:
+  - `display` = physical monitor
+  - `desktop` = macOS space on a display
+  - `zone` = partition block inside one desktop
+  - `stacking_mode` = `unordered` or `tabbed`
+  - in `tabbed` mode, every zone must split into `tab_bar + content_area`
+
 ## Working Rules
 
 - Always follow `Request -> Plan -> Change` before source mutation.
@@ -51,7 +61,7 @@ desktop snapshot persistence, and a visual desktop layout editor.
 
 ## Active Direction
 
-- Last completed request: `REQ-0005`
-- Last completed plan: `PLN-0005`
-- Last completed change: `CHG-0005`
-- Immediate objective: awaiting new requirements on YuwanZ branch.
+- Last completed request: `REQ-0018`
+- Last completed plan: `PLN-0017`
+- Last completed change: `CHG-0017`
+- Immediate objective: validate workbench runtime stability on real drag/edit sessions and continue UI quality tuning on YuwanZ branch.

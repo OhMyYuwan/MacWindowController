@@ -75,6 +75,19 @@ final class DesktopZoneManager {
         return DesktopZoneScanResult(zones: zones, screenFrame: screenFrame)
     }
 
+    /// Current zone geometry for the selected merge mode.
+    func zoneDefinitions(mergeMode: DesktopMergeMode) -> [DesktopZone] {
+        let screenFrame = screenManager.mainVisibleFrameInScreenCoordinates()
+        return defineZones(for: mergeMode, in: screenFrame)
+    }
+
+    /// Find closest/current zone for a point in AX/screen coordinates.
+    func zoneFor(point: CGPoint, mergeMode: DesktopMergeMode) -> DesktopZone? {
+        let zones = zoneDefinitions(mergeMode: mergeMode)
+        guard let idx = closestZoneIndex(for: point, in: zones) else { return nil }
+        return zones[idx]
+    }
+
     /// Apply scan result: create stacks for zones that exceed threshold,
     /// resize single windows to fill their zone
     func applyScanResult(_ result: DesktopZoneScanResult) throws {

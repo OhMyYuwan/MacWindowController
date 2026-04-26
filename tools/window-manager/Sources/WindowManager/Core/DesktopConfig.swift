@@ -1,6 +1,14 @@
 import Foundation
 
 struct DesktopConfig: Codable {
+    struct Shortcut: Codable {
+        var keyCode: UInt16 = 37 // L
+        var command: Bool = true
+        var option: Bool = true
+        var shift: Bool = false
+        var control: Bool = false
+    }
+
     /// 超过此数量的窗口重叠时自动创建堆栈组
     var stackThreshold: Int = 3
 
@@ -9,6 +17,9 @@ struct DesktopConfig: Codable {
 
     /// 自动扫描间隔（秒）
     var autoScanInterval: TimeInterval = 1.5
+
+    /// 长按显示九宫格布局 HUD 的快捷键
+    var layoutHUDShortcut: Shortcut = .init()
 
     static let `default` = DesktopConfig()
 
