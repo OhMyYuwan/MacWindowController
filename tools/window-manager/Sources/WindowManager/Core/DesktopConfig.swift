@@ -9,6 +9,20 @@ struct DesktopConfig: Codable {
         var control: Bool = false
     }
 
+    enum WorkbenchAppearance: String, Codable, CaseIterable {
+        case system
+        case titaniumLight
+        case titaniumDark
+
+        var title: String {
+            switch self {
+            case .system: return "跟随系统"
+            case .titaniumLight: return "浅色钛"
+            case .titaniumDark: return "深色钛"
+            }
+        }
+    }
+
     /// 超过此数量的窗口重叠时自动创建堆栈组
     var stackThreshold: Int = 3
 
@@ -21,7 +35,50 @@ struct DesktopConfig: Codable {
     /// 长按显示九宫格布局 HUD 的快捷键
     var layoutHUDShortcut: Shortcut = .init()
 
+    /// Workbench visual appearance.
+    var workbenchAppearance: WorkbenchAppearance = .system
+
+    /// User-recorded shortcuts keyed by Workbench shortcut action id.
+    var shortcutBindings: [String: Shortcut] = [:]
+
+    /// Actions where the user explicitly accepted an occupied shortcut.
+    var shortcutConflictOverrides: [String: Bool] = [:]
+
     static let `default` = DesktopConfig()
+
+    init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case stackThreshold
+        case autoScanEnabled
+        case autoScanInterval
+        case layoutHUDShortcut
+        case workbenchAppearance
+        case shortcutBindings
+        case shortcutConflictOverrides
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        stackThreshold = try values.decodeIfPresent(Int.self, forKey: .stackThreshold) ?? 3
+        autoScanEnabled = try values.decodeIfPresent(Bool.self, forKey: .autoScanEnabled) ?? false
+        autoScanInterval = try values.decodeIfPresent(TimeInterval.self, forKey: .autoScanInterval) ?? 1.5
+        layoutHUDShortcut = try values.decodeIfPresent(Shortcut.self, forKey: .layoutHUDShortcut) ?? .init()
+        workbenchAppearance = try values.decodeIfPresent(WorkbenchAppearance.self, forKey: .workbenchAppearance) ?? .system
+        shortcutBindings = try values.decodeIfPresent([String: Shortcut].self, forKey: .shortcutBindings) ?? [:]
+        shortcutConflictOverrides = try values.decodeIfPresent([String: Bool].self, forKey: .shortcutConflictOverrides) ?? [:]
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(stackThreshold, forKey: .stackThreshold)
+        try values.encode(autoScanEnabled, forKey: .autoScanEnabled)
+        try values.encode(autoScanInterval, forKey: .autoScanInterval)
+        try values.encode(layoutHUDShortcut, forKey: .layoutHUDShortcut)
+        try values.encode(workbenchAppearance, forKey: .workbenchAppearance)
+        try values.encode(shortcutBindings, forKey: .shortcutBindings)
+        try values.encode(shortcutConflictOverrides, forKey: .shortcutConflictOverrides)
+    }
 
     private static var configURL: URL {
         let homeDir = FileManager.default.homeDirectoryForCurrentUser

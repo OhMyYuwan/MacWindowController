@@ -66,5 +66,45 @@ final class ScreenManager {
         let screenHeight = screen.frame.height
         return convertToScreenCoordinates(nsWindowFrame, screenHeight: screenHeight)
     }
-}
 
+    func displaySnapshots() -> [LayoutDisplaySnapshot] {
+        NSScreen.screens.enumerated().map { index, screen in
+            let screenHeight = screen.frame.height
+            let idNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
+            let id = idNumber?.uint32Value ?? UInt32(index)
+            return LayoutDisplaySnapshot(
+                id: id,
+                index: index,
+                name: screen.localizedName,
+                frame: RectData(convertToScreenCoordinates(screen.frame, screenHeight: screenHeight)),
+                visibleFrame: RectData(convertToScreenCoordinates(screen.visibleFrame, screenHeight: screenHeight))
+            )
+        }
+    }
+
+    func displaySnapshot(id: UInt32?) -> LayoutDisplaySnapshot? {
+        let displays = displaySnapshots()
+        if let id, let exact = displays.first(where: { $0.id == id }) {
+            return exact
+        }
+        return displays.first
+    }
+
+    func preferredDisplaySnapshot(for windows: [WindowInfo]) -> LayoutDisplaySnapshot? {
+        let displays = displaySnapshots()
+        guard !displays.isEmpty else { return nil }
+        guard !windows.isEmpty else { return displays.first }
+
+        var scores: [UInt32: CGFloat] = [:]
+        for window in windows {
+            let center = CGPoint(x: window.frame.cgRect.midX, y: window.frame.cgRect.midY)
+            if let display = displays.first(where: { $0.visibleFrame.cgRect.contains(center) }) {
+                scores[display.id, default: 0] += max(1, window.frame.cgRect.width * window.frame.cgRect.height)
+            }
+        }
+        guard let bestId = scores.max(by: { $0.value < $1.value })?.key else {
+            return displays.first
+        }
+        return displays.first(where: { $0.id == bestId }) ?? displays.first
+    }
+}

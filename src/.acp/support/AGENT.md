@@ -8,9 +8,9 @@ quick_entry:
     - desktop_layouts
     - visual_editor
     - cli_surface
-  active_request_id: REQ-0020
-  status: active development
-  next_step: polish forced-zone UX, implement macOS Space restore, expand test coverage
+  active_request_id: null
+  status: ready
+  next_step: manually verify saved layout wake/delete card actions in the workbench
 ```
 
 # WinCtlManager Agent Guide
@@ -67,14 +67,14 @@ desktop snapshot persistence, and a visual desktop layout editor.
 ## Kernel Numbering Notes
 
 - Historical numbering is intentionally preserved.
-- `REQ` numbering is continuous (`REQ-0001` .. `REQ-0020`).
-- `PLN` numbering is continuous (`PLN-0001` .. `PLN-0019`) but no longer matches `REQ` one-to-one after older history drift.
+- `REQ` numbering is continuous (`REQ-0001` .. `REQ-0036`).
+- `PLN` numbering is continuous (`PLN-0001` .. `PLN-0035`) but no longer matches `REQ` one-to-one after older history drift.
 - `CHG-0008` is historically missing; do not renumber later changes to fill it.
 - Current safe-sync policy: preserve existing filenames/ids, fix status inconsistencies, and rely on explicit cross references (`request:` / `plan:` / `Related Request:`) as the source of truth.
 
 ## Active Direction
 
-- Last completed request: `REQ-0020`
-- Last completed plan: `PLN-0019`
-- Last completed change: `CHG-0019`
-- Immediate objective: polish forced-zone UX (handle feel, zone-transfer glow, enforcement timing), implement macOS Space restore for saved layouts, expand test coverage on YuwanZ branch.
+- Last completed request: `REQ-0039`
+- Last completed plan: `PLN-0038`
+- Last completed change: `CHG-0038`
+- Immediate objective: manually verify saved layout wake/delete card actions in the workbench.

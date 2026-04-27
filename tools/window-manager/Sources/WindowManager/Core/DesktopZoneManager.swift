@@ -15,6 +15,11 @@ struct DesktopZoneScanResult {
     let screenFrame: CGRect
 }
 
+enum ZoneApplyBehavior {
+    case normalApply
+    case interactiveResize
+}
+
 @MainActor
 final class DesktopZoneManager {
     private let windowController: WindowController
@@ -280,9 +285,14 @@ final class DesktopZoneManager {
     }
 
     /// Determine current zone membership for visible windows.
-    func currentZoneAssignments(windows: [WindowInfo], mergeMode: DesktopMergeMode) -> [Int: String] {
+    func currentZoneAssignments(
+        windows: [WindowInfo],
+        mergeMode: DesktopMergeMode,
+        excludingWindowNumbers excludedWindowNumbers: Set<Int> = []
+    ) -> [Int: String] {
         var assignments: [Int: String] = [:]
         for window in windows {
+            guard !excludedWindowNumbers.contains(window.windowNumber) else { continue }
             let center = CGPoint(x: window.frame.cgRect.midX, y: window.frame.cgRect.midY)
             if let zone = zoneFor(point: center, mergeMode: mergeMode) {
                 assignments[window.windowNumber] = zone.name
@@ -292,16 +302,28 @@ final class DesktopZoneManager {
     }
 
     /// Apply forced zone behavior based on current assignments and threshold.
-    func applyForcedZones(windows: [WindowInfo], mergeMode: DesktopMergeMode) throws {
+    func applyForcedZones(
+        windows: [WindowInfo],
+        mergeMode: DesktopMergeMode,
+        excludingWindowNumbers excludedWindowNumbers: Set<Int> = [],
+        behavior: ZoneApplyBehavior = .normalApply
+    ) throws {
         let zoneDefs = zoneDefinitions(mergeMode: mergeMode)
-        let assignments = currentZoneAssignments(windows: windows, mergeMode: mergeMode)
-        let windowsByZone = Dictionary(grouping: windows) { assignments[$0.windowNumber] ?? "unassigned" }
+        let eligibleWindows = windows.filter { !excludedWindowNumbers.contains($0.windowNumber) }
+        let assignments = currentZoneAssignments(
+            windows: eligibleWindows,
+            mergeMode: mergeMode,
+            excludingWindowNumbers: excludedWindowNumbers
+        )
+        let windowsByZone = Dictionary(grouping: eligibleWindows) { assignments[$0.windowNumber] ?? "unassigned" }
 
         // Remove stacks for zones that are no longer above threshold
-        for stack in stackManager.listStacks() {
-            let zoneWindows = windowsByZone[stack.name] ?? []
-            if zoneWindows.count <= stackThreshold {
-                try? stackManager.deleteStack(name: stack.name)
+        if behavior == .normalApply {
+            for stack in stackManager.listStacks() {
+                let zoneWindows = windowsByZone[stack.name] ?? []
+                if zoneWindows.count <= stackThreshold {
+                    try? stackManager.deleteStack(name: stack.name)
+                }
             }
         }
 
@@ -309,9 +331,19 @@ final class DesktopZoneManager {
             let zoneWindows = windowsByZone[zone.name] ?? []
             guard !zoneWindows.isEmpty else { continue }
 
+            if behavior == .interactiveResize {
+                if stackManager.stack(named: zone.name) != nil {
+                    try? stackManager.resizeStackWithoutRaising(name: zone.name, frame: zone.frame)
+                } else {
+                    resizeWindows(zoneWindows, to: zone.frame)
+                }
+                continue
+            }
+
             if zoneWindows.count > stackThreshold {
                 // Stack behavior
                 for window in zoneWindows {
+                    guard window.isControllable else { continue }
                     let identity = WindowIdentity(
                         bundleId: window.bundleId,
                         title: window.title,
@@ -323,6 +355,7 @@ final class DesktopZoneManager {
                 // Ordinary behavior: all windows fill the full zone frame
                 try? stackManager.deleteStack(name: zone.name)
                 for window in zoneWindows {
+                    guard window.isControllable else { continue }
                     try? windowController.setWindowFrame(
                         bundleId: window.bundleId,
                         windowNumber: window.windowNumber,
@@ -333,10 +366,22 @@ final class DesktopZoneManager {
         }
     }
 
+    private func resizeWindows(_ windows: [WindowInfo], to frame: CGRect) {
+        for window in windows {
+            guard window.isControllable else { continue }
+            try? windowController.setWindowFrame(
+                bundleId: window.bundleId,
+                windowNumber: window.windowNumber,
+                frame: frame
+            )
+        }
+    }
+
     // MARK: - Apply Logic
 
     private func applyStackZone(_ zone: DesktopZone) throws {
         for window in zone.windows {
+            guard window.isControllable else { continue }
             let identity = WindowIdentity(
                 bundleId: window.bundleId,
                 title: window.title,
@@ -356,6 +401,7 @@ final class DesktopZoneManager {
 
     private func applySingleZone(_ zone: DesktopZone) throws {
         for window in zone.windows {
+            guard window.isControllable else { continue }
             do {
                 try windowController.setWindowFrame(
                     bundleId: window.bundleId,

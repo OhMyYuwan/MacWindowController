@@ -1,4 +1,5 @@
 import AppKit
+import Carbon
 import Foundation
 
 @MainActor
@@ -32,12 +33,16 @@ enum DesktopMergeMode: Int, CaseIterable {
 private enum WorkbenchSection: Int, CaseIterable {
     case layouts
     case stacks
+    case quickDrop
+    case unconstrained
     case settings
 
     var title: String {
         switch self {
         case .layouts: return "布局"
         case .stacks: return "堆叠"
+        case .quickDrop: return "快捷键"
+        case .unconstrained: return "临时窗口"
         case .settings: return "设置"
         }
     }
@@ -46,9 +51,94 @@ private enum WorkbenchSection: Int, CaseIterable {
         switch self {
         case .layouts: return "square.split.2x2.fill"
         case .stacks: return "square.3.layers.3d.top.filled"
+        case .quickDrop: return "keyboard.fill"
+        case .unconstrained: return "sparkles.rectangle.stack.fill"
         case .settings: return "gearshape.fill"
         }
     }
+}
+
+private enum WorkbenchShortcutAction: String, CaseIterable {
+    case layoutHUD
+    case quickDropLeftPrimary
+    case quickDropRightPrimary
+    case quickDropLeftSecondary
+    case quickDropRightSecondary
+    case tileLeft
+    case tileRight
+    case tileTop
+    case tileBottom
+
+    var title: String {
+        switch self {
+        case .layoutHUD: return "布局九宫格 HUD"
+        case .quickDropLeftPrimary: return "移到左侧主块"
+        case .quickDropRightPrimary: return "移到右侧主块"
+        case .quickDropLeftSecondary: return "移到左侧次块"
+        case .quickDropRightSecondary: return "移到右侧次块"
+        case .tileLeft: return "平铺到左侧"
+        case .tileRight: return "平铺到右侧"
+        case .tileTop: return "平铺到上方"
+        case .tileBottom: return "平铺到下方"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .layoutHUD:
+            return "按住时显示九宫格，松开隐藏"
+        case .quickDropLeftPrimary, .quickDropRightPrimary:
+            return "把当前聚焦窗口送入左右两侧最大候选块"
+        case .quickDropLeftSecondary, .quickDropRightSecondary:
+            return "默认投到上半区；按住 Shift 触发下半区"
+        case .tileLeft, .tileRight, .tileTop, .tileBottom:
+            return "直接把当前聚焦窗口贴到屏幕边缘"
+        }
+    }
+
+    var defaultShortcut: DesktopConfig.Shortcut {
+        switch self {
+        case .layoutHUD:
+            return .init(keyCode: 37, command: true, option: true, shift: false, control: false)
+        case .quickDropLeftPrimary:
+            return .init(keyCode: 123, command: true, option: false, shift: false, control: true)
+        case .quickDropRightPrimary:
+            return .init(keyCode: 124, command: true, option: false, shift: false, control: true)
+        case .quickDropLeftSecondary:
+            return .init(keyCode: 123, command: true, option: true, shift: false, control: true)
+        case .quickDropRightSecondary:
+            return .init(keyCode: 124, command: true, option: true, shift: false, control: true)
+        case .tileLeft:
+            return .init(keyCode: 123, command: true, option: true, shift: false, control: false)
+        case .tileRight:
+            return .init(keyCode: 124, command: true, option: true, shift: false, control: false)
+        case .tileTop:
+            return .init(keyCode: 126, command: true, option: true, shift: false, control: false)
+        case .tileBottom:
+            return .init(keyCode: 125, command: true, option: true, shift: false, control: false)
+        }
+    }
+}
+
+private struct ShortcutConflict {
+    let title: String
+    let detail: String
+}
+
+private struct InstalledApplicationRoute {
+    let bundleId: String
+    let appName: String
+    let appURL: URL?
+    let icon: NSImage?
+}
+
+private struct AppRoutingItem {
+    let bundleId: String
+    let appName: String
+    let appURL: URL?
+    let icon: NSImage?
+    let windowCount: Int
+    let isRoutingLocked: Bool
 }
 
 @MainActor
@@ -88,6 +178,12 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         let title: String
         let keyCode: UInt16
     }
+    private enum QuickDropTarget {
+        case leftPrimary
+        case rightPrimary
+        case leftSecondary
+        case rightSecondary
+    }
 
     private let windowController: WindowController
     private let stackManager: StackManager
@@ -104,6 +200,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
 
     private var focusedLayoutName: String?
     private var appConfig = DesktopConfig.load()
+    private var installedApplicationsCache: [InstalledApplicationRoute]?
     private var mergeMode: DesktopMergeMode {
         get { partitionState.mergeMode }
         set { partitionState.mergeMode = newValue }
@@ -136,21 +233,33 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     private var isShowingLayoutOverlay = false
     private var settingsWindow: NSWindow?
     private var desktopPartitionPanel: NSPanel?
+    private var displayWakePanel: NSPanel?
     private var shortcutKeyPopup: NSPopUpButton?
     private var shortcutCommandToggle: NSButton?
     private var shortcutOptionToggle: NSButton?
     private var shortcutShiftToggle: NSButton?
     private var shortcutControlToggle: NSButton?
     private var shortcutCurrentLabel: NSTextField?
+    private var appearancePopup: NSPopUpButton?
     private var splitApplyWorkItem: DispatchWorkItem?
+    private let interactiveSplitApplyInterval: TimeInterval = 0.04
+    private var lastInteractiveSplitApplyTime: TimeInterval = 0
     private var partitionModelInitialized = false
     private var lastWindowFramesByNumber: [Int: CGRect] = [:]
     private var isProgrammaticZoneTransfer = false
     private var desktopOverlayEditingEnabled = true
     private var isOptionDragTransferMode = false
     private var currentSection: WorkbenchSection = .layouts
+    private var rootBackgroundView: TitaniumBackgroundView?
     private var contentContainer: NSView?
     private var sidebarItems: [SidebarItemView] = []
+    private var unconstrainedFrontmostLabel: NSTextField?
+    private var addFocusedWindowRuleButton: NSButton?
+    private var focusedRoutingWindow: WindowInfo?
+    private var appRoutingListStackView: NSStackView?
+    private var titleRuleListStackView: NSStackView?
+    private var temporaryMatchListStackView: NSStackView?
+    private var recordingShortcutAction: WorkbenchShortcutAction?
 
     init(
         windowController: WindowController,
@@ -176,6 +285,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             windowController: windowController,
             stackManager: stackManager,
             store: layoutStore,
+            screenManager: screenManager,
             partitionState: partitionState
         )
         self.appConfig = config
@@ -189,8 +299,9 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             defer: false
         )
         window.title = "WinCtlManager"
-        window.titleVisibility = .hidden
-        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .visible
+        window.titlebarAppearsTransparent = false
+        window.toolbarStyle = .unifiedCompact
         window.isMovableByWindowBackground = false
         window.minSize = NSSize(width: 1100, height: 760)
         window.backgroundColor = NSColor.windowBackgroundColor
@@ -198,12 +309,23 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         window.delegate = self
         self.window = window
 
+        let backgroundView = TitaniumBackgroundView()
+        backgroundView.translatesAutoresizingMaskIntoConstraints = false
+        self.rootBackgroundView = backgroundView
+        window.contentView = backgroundView
+
         // Root split view: sidebar (220pt fixed) + content area
         let splitView = NSSplitView()
         splitView.isVertical = true
         splitView.dividerStyle = .thin
         splitView.translatesAutoresizingMaskIntoConstraints = false
-        window.contentView = splitView
+        backgroundView.addSubview(splitView)
+        NSLayoutConstraint.activate([
+            splitView.leadingAnchor.constraint(equalTo: backgroundView.leadingAnchor),
+            splitView.trailingAnchor.constraint(equalTo: backgroundView.trailingAnchor),
+            splitView.topAnchor.constraint(equalTo: backgroundView.topAnchor),
+            splitView.bottomAnchor.constraint(equalTo: backgroundView.bottomAnchor)
+        ])
 
         let sidebar = makeSidebarView()
         splitView.addArrangedSubview(sidebar)
@@ -230,12 +352,12 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
 
         let desktopView = DesktopContainerView(displayFrame: screenManager.mainVisibleFrame())
         desktopView.translatesAutoresizingMaskIntoConstraints = false
-        desktopView.onBucketTabSelected = { [weak self] index in
-            self?.switchLeftBucket(to: index)
-        }
         desktopView.onSplitChanged = { [weak self] x, y, isFinal in
             guard let self else { return }
             self.handleSplitChanged(x: x, y: y, isFinal: isFinal)
+        }
+        desktopView.onWindowDroppedIntoZone = { [weak self] window, zoneName in
+            self?.movePreviewWindow(window, toZoneNamed: zoneName)
         }
         self.desktopView = desktopView
         installDesktopOverlayPanel()
@@ -254,7 +376,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         noteStack.spacing = 10
         noteStack.edgeInsets = NSEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
         noteStack.alignment = .top
-        noteStack.frame = NSRect(x: 0, y: 0, width: 900, height: 204)
+        noteStack.frame = NSRect(x: 0, y: 0, width: 900, height: LayoutNoteCardView.cardSize.height + 16)
         self.noteStackView = noteStack
 
         let noteScroll = NSScrollView()
@@ -264,9 +386,10 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         noteScroll.autohidesScrollers = true
         noteScroll.documentView = noteStack
         noteScroll.translatesAutoresizingMaskIntoConstraints = false
-        noteScroll.heightAnchor.constraint(equalToConstant: 220).isActive = true
+        noteScroll.heightAnchor.constraint(equalToConstant: LayoutNoteCardView.cardSize.height + 32).isActive = true
         self.noteScrollView = noteScroll
 
+        applyWorkbenchAppearance(reloadSection: false)
         switchSection(.layouts, animated: false)
 
         window.makeKeyAndOrderFront(nil)
@@ -295,6 +418,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         splitApplyWorkItem?.cancel()
         layoutOverlayPanel?.close()
         desktopPartitionPanel?.close()
+        displayWakePanel?.close()
         for panel in stackPanels.values { panel.close() }
         stackPanels.removeAll()
         NSApplication.shared.terminate(nil)
@@ -350,36 +474,26 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         let keyDownMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
             let flags = event.modifierFlags.intersection([.command, .option, .shift, .control])
-            if self.shortcutMatches(flags: flags, keyCode: event.keyCode) {
-                if !event.isARepeat {
-                    self.showLayoutModeOverlay()
-                }
+
+            if let recordingAction = self.recordingShortcutAction {
+                self.captureShortcut(from: event, for: recordingAction)
                 return nil
             }
 
-            let tileFlagsRequired = flags.contains(.command) && flags.contains(.option)
-            guard tileFlagsRequired else { return event }
-            switch event.keyCode {
-            case 123:
-                self.tileFrontmost(position: .left)
-                return nil
-            case 124:
-                self.tileFrontmost(position: .right)
-                return nil
-            case 126:
-                self.tileFrontmost(position: .top)
-                return nil
-            case 125:
-                self.tileFrontmost(position: .bottom)
-                return nil
-            default:
+            guard let action = self.shortcutAction(matching: flags, keyCode: event.keyCode) else {
                 return event
             }
+            self.performShortcutAction(action, event: event)
+            return nil
         }
 
         let keyUpMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyUp) { [weak self] event in
             guard let self else { return event }
-            if event.keyCode == self.appConfig.layoutHUDShortcut.keyCode {
+            if event.keyCode == self.shortcut(for: .layoutHUD).keyCode {
+                self.hideLayoutModeOverlay()
+                return nil
+            }
+            if self.recordingShortcutAction == .layoutHUD {
                 self.hideLayoutModeOverlay()
                 return nil
             }
@@ -401,7 +515,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
 
     private func handleFlagsChanged(_ modifierFlags: NSEvent.ModifierFlags) {
         let flags = modifierFlags.intersection([.command, .option, .shift, .control])
-        if self.isShowingLayoutOverlay && !self.shortcutFlagsSatisfied(flags: flags) {
+        if self.isShowingLayoutOverlay && !self.shortcutFlagsSatisfied(flags: flags, shortcut: shortcut(for: .layoutHUD)) {
             self.hideLayoutModeOverlay()
         }
 
@@ -425,6 +539,14 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         }
         updateDesktopOverlayPanelFrame()
         let windows = windowController.listWindows(onScreenOnly: true)
+        let visibleNumbers = Set(windows.map(\.windowNumber))
+        partitionState.unconstrainedWindowNumbers = currentUnconstrainedWindowNumbers(in: windows).intersection(visibleNumbers)
+        partitionState.zoneAssignmentsByWindowNumber = partitionState.zoneAssignmentsByWindowNumber.filter {
+            visibleNumbers.contains($0.key) && !partitionState.unconstrainedWindowNumbers.contains($0.key)
+        }
+        lastWindowFramesByNumber = lastWindowFramesByNumber.filter {
+            visibleNumbers.contains($0.key) && !partitionState.unconstrainedWindowNumbers.contains($0.key)
+        }
         _ = stackManager.reconcileStacks(with: windows)
 
         if !partitionModelInitialized, !stackManager.listStacks().isEmpty {
@@ -455,6 +577,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         refreshAllStackPanels()
         reloadLayoutCards()
         updateLayoutModeOverlayHighlight()
+        refreshUnconstrainedWindowList(with: windows)
     }
 
     private func installDesktopOverlayPanel() {
@@ -584,16 +707,83 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         splitApplyWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            let windows = self.windowController.listWindows(onScreenOnly: true)
-            try? self.zoneManager.applyForcedZones(windows: windows, mergeMode: self.mergeMode)
-            self.refreshAllStackPanels()
+            self.lastInteractiveSplitApplyTime = Date.timeIntervalSinceReferenceDate
+            self.applySplitToDesktopWindows(
+                behavior: .interactiveResize,
+                statusText: isFinal ? "已同步分区大小到桌面窗口" : "正在实时调整分区窗口"
+            )
         }
         splitApplyWorkItem = work
 
         if isFinal {
             DispatchQueue.main.async(execute: work)
-        } else {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.04, execute: work)
+            return
+        }
+
+        let now = Date.timeIntervalSinceReferenceDate
+        let elapsed = now - lastInteractiveSplitApplyTime
+        let delay = max(0, interactiveSplitApplyInterval - elapsed)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func applySplitToDesktopWindows(behavior: ZoneApplyBehavior, statusText: String) {
+        let windows = windowController.listWindows(onScreenOnly: true)
+        let unconstrained = currentUnconstrainedWindowNumbers(in: windows)
+        partitionState.unconstrainedWindowNumbers = unconstrained
+        do {
+            try zoneManager.applyForcedZones(
+                windows: windows,
+                mergeMode: mergeMode,
+                excludingWindowNumbers: unconstrained,
+                behavior: behavior
+            )
+            refreshAllStackPanels()
+            setStatus(statusText, error: false)
+        } catch {
+            setStatus("同步分区窗口失败：\(error.localizedDescription)", error: true)
+        }
+    }
+
+    private func movePreviewWindow(_ window: WindowInfo, toZoneNamed zoneName: String) {
+        let windows = windowController.listWindows(onScreenOnly: true)
+        let visibleNumbers = Set(windows.map(\.windowNumber))
+        guard visibleNumbers.contains(window.windowNumber) else {
+            setStatus("目标窗口已不在当前桌面可见区域", error: true)
+            refreshWorkbench()
+            return
+        }
+        guard window.isControllable else {
+            setStatus("该窗口缺少可控 App 身份，已作为不可控窗口跳过", error: true)
+            refreshWorkbench()
+            return
+        }
+        guard let targetZone = zoneManager.zoneDefinitions(mergeMode: mergeMode).first(where: { $0.name == zoneName }) else {
+            setStatus("未找到目标分区：\(zoneName)", error: true)
+            return
+        }
+
+        do {
+            try windowController.setWindowFrame(
+                bundleId: window.bundleId,
+                windowNumber: window.windowNumber,
+                frame: targetZone.frame
+            )
+            partitionState.zoneAssignmentsByWindowNumber[window.windowNumber] = zoneName
+            lastWindowFramesByNumber[window.windowNumber] = targetZone.frame
+            partitionModelInitialized = true
+
+            let updatedWindows = windowController.listWindows(onScreenOnly: true)
+            let unconstrained = currentUnconstrainedWindowNumbers(in: updatedWindows)
+            partitionState.unconstrainedWindowNumbers = unconstrained
+            try zoneManager.applyForcedZones(
+                windows: updatedWindows,
+                mergeMode: mergeMode,
+                excludingWindowNumbers: unconstrained
+            )
+            setStatus("已将 \(window.appName) 移到 \(zoneName)", error: false)
+            refreshWorkbench()
+        } catch {
+            setStatus("移动窗口到分区失败：\(error.localizedDescription)", error: true)
         }
     }
 
@@ -602,14 +792,25 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         guard isOptionDragTransferMode else { return }  // Only transfer when Command+Shift is held
 
         let visibleNumbers = Set(windows.map(\.windowNumber))
-        partitionState.zoneAssignmentsByWindowNumber = partitionState.zoneAssignmentsByWindowNumber.filter { visibleNumbers.contains($0.key) }
-        lastWindowFramesByNumber = lastWindowFramesByNumber.filter { visibleNumbers.contains($0.key) }
+        partitionState.unconstrainedWindowNumbers = currentUnconstrainedWindowNumbers(in: windows).intersection(visibleNumbers)
+        partitionState.zoneAssignmentsByWindowNumber = partitionState.zoneAssignmentsByWindowNumber.filter {
+            visibleNumbers.contains($0.key) && !partitionState.unconstrainedWindowNumbers.contains($0.key)
+        }
+        lastWindowFramesByNumber = lastWindowFramesByNumber.filter {
+            visibleNumbers.contains($0.key) && !partitionState.unconstrainedWindowNumbers.contains($0.key)
+        }
 
-        let assignments = zoneManager.currentZoneAssignments(windows: windows, mergeMode: mergeMode)
-        desktopHandleOverlayView?.activeZoneNames = Set(assignments.values)
+        let unconstrained = partitionState.unconstrainedWindowNumbers
+        let assignments = zoneManager.currentZoneAssignments(
+            windows: windows,
+            mergeMode: mergeMode,
+            excludingWindowNumbers: unconstrained
+        )
+        desktopHandleOverlayView?.activeZoneNames = []
 
         for window in windows {
             let number = window.windowNumber
+            guard !unconstrained.contains(number) else { continue }
             let frame = window.frame.cgRect
             let targetZone = assignments[number]
 
@@ -636,7 +837,11 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             desktopHandleOverlayView?.needsDisplay = true
 
             do {
-                try zoneManager.applyForcedZones(windows: windows, mergeMode: mergeMode)
+                try zoneManager.applyForcedZones(
+                    windows: windows,
+                    mergeMode: mergeMode,
+                    excludingWindowNumbers: unconstrained
+                )
                 setStatus("窗口已进入分区：\(newZone)", error: false)
             } catch {
                 setStatus("窗口转移分区失败：\(error.localizedDescription)", error: true)
@@ -655,6 +860,10 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
 
         for window in windows {
             let number = window.windowNumber
+            guard window.isControllable else { continue }
+            if partitionState.unconstrainedWindowNumbers.contains(number) {
+                continue
+            }
             guard let assignedZone = partitionState.zoneAssignmentsByWindowNumber[number],
                   let zoneFrame = zoneMap[assignedZone] else { continue }
 
@@ -752,6 +961,288 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         tileFrontmost(position: .bottom)
     }
 
+    @objc
+    private func quickDropToLeftPrimary() {
+        quickDropFrontmost(to: .leftPrimary)
+    }
+
+    @objc
+    private func quickDropToRightPrimary() {
+        quickDropFrontmost(to: .rightPrimary)
+    }
+
+    @objc
+    private func quickDropToLeftSecondary() {
+        quickDropFrontmost(to: .leftSecondary)
+    }
+
+    @objc
+    private func quickDropToRightSecondary() {
+        quickDropFrontmost(to: .rightSecondary)
+    }
+
+    @objc
+    private func showShortcutSection() {
+        switchSection(.quickDrop, animated: true)
+    }
+
+    private func quickDropFrontmost(to target: QuickDropTarget, preferLowerSecondary explicitPreference: Bool? = nil) {
+        guard let identity = targetWindowIdentity() else {
+            setStatus("未找到可操作的目标窗口（先点一次目标 App）", error: true)
+            return
+        }
+
+        let preferLowerSecondary = explicitPreference ?? (NSApp.currentEvent?.modifierFlags.contains(.shift) == true)
+        guard let zone = quickDropZone(for: target, preferLowerSecondary: preferLowerSecondary) else {
+            let hint: String
+            switch target {
+            case .leftSecondary, .rightSecondary:
+                hint = "当前布局没有可用的次块，请切换到四分/左二右大/左大右二后再试。"
+            default:
+                hint = "当前布局没有可用目标块。"
+            }
+            setStatus(hint, error: true)
+            return
+        }
+
+        let windows = windowController.listWindows(onScreenOnly: true)
+        guard let window = resolveTargetWindowInfo(identity: identity, windows: windows) else {
+            setStatus("未找到目标窗口实例，请先激活目标窗口。", error: true)
+            return
+        }
+
+        do {
+            try windowController.setWindowFrame(
+                bundleId: window.bundleId,
+                windowNumber: window.windowNumber,
+                frame: zone.frame
+            )
+            partitionState.zoneAssignmentsByWindowNumber[window.windowNumber] = zone.name
+            lastWindowFramesByNumber[window.windowNumber] = zone.frame
+            partitionModelInitialized = true
+
+            let updatedWindows = windowController.listWindows(onScreenOnly: true)
+            let unconstrained = currentUnconstrainedWindowNumbers(in: updatedWindows)
+            partitionState.unconstrainedWindowNumbers = unconstrained
+            try zoneManager.applyForcedZones(
+                windows: updatedWindows,
+                mergeMode: mergeMode,
+                excludingWindowNumbers: unconstrained
+            )
+
+            setStatus("已将 \(window.appName) 投放到 \(zone.name)", error: false)
+            refreshWorkbench()
+        } catch {
+            setStatus("快捷投放失败：\(error.localizedDescription)", error: true)
+        }
+    }
+
+    private func quickDropZone(for target: QuickDropTarget, preferLowerSecondary: Bool) -> DesktopZone? {
+        let zones = zoneManager.zoneDefinitions(mergeMode: mergeMode)
+        guard !zones.isEmpty else { return nil }
+
+        let screenMidX = screenManager.mainVisibleFrameInScreenCoordinates().midX
+        let leftZones = zones.filter { $0.frame.midX <= screenMidX }
+        let rightZones = zones.filter { $0.frame.midX > screenMidX }
+
+        func primaryZone(in candidates: [DesktopZone], fallbackTo all: [DesktopZone], preferLeft: Bool) -> DesktopZone? {
+            let pool = candidates.isEmpty ? all : candidates
+            guard !pool.isEmpty else { return nil }
+            return pool.max { lhs, rhs in
+                let leftArea = lhs.frame.width * lhs.frame.height
+                let rightArea = rhs.frame.width * rhs.frame.height
+                if leftArea == rightArea {
+                    return preferLeft ? lhs.frame.midX > rhs.frame.midX : lhs.frame.midX < rhs.frame.midX
+                }
+                return leftArea < rightArea
+            }
+        }
+
+        func secondaryZone(in candidates: [DesktopZone]) -> DesktopZone? {
+            guard candidates.count >= 2 else { return nil }
+            let sorted = candidates.sorted { $0.frame.midY < $1.frame.midY } // AX: smaller y = upper half
+            return preferLowerSecondary ? sorted.last : sorted.first
+        }
+
+        switch target {
+        case .leftPrimary:
+            if let named = zones.first(where: { $0.name == "left" }) { return named }
+            return primaryZone(in: leftZones, fallbackTo: zones, preferLeft: true)
+        case .rightPrimary:
+            if let named = zones.first(where: { $0.name == "right" }) { return named }
+            return primaryZone(in: rightZones, fallbackTo: zones, preferLeft: false)
+        case .leftSecondary:
+            return secondaryZone(in: leftZones)
+        case .rightSecondary:
+            return secondaryZone(in: rightZones)
+        }
+    }
+
+    private func resolveTargetWindowInfo(identity: WindowIdentity, windows: [WindowInfo]) -> WindowInfo? {
+        if let number = identity.windowNumber,
+           let exact = windows.first(where: { $0.windowNumber == number }) {
+            return exact
+        }
+
+        if !identity.title.isEmpty,
+           let exactTitle = windows.first(where: { $0.bundleId == identity.bundleId && $0.title == identity.title }) {
+            return exactTitle
+        }
+
+        return windows.first(where: { $0.bundleId == identity.bundleId })
+    }
+
+    private func windowRoutingType(for window: WindowInfo) -> WindowRoutingType {
+        guard window.isControllable else { return .uncontrollable }
+        if let titleRule = partitionState.titleRoutingRules.last(where: { rule in
+            rule.bundleId == window.bundleId
+                && !rule.title.isEmpty
+                && !window.title.isEmpty
+                && window.title.localizedCaseInsensitiveContains(rule.title)
+        }) {
+            return titleRule.type
+        }
+        return partitionState.appRoutingTypesByBundleId[window.bundleId] ?? .managed
+    }
+
+    private func currentUnconstrainedWindowNumbers(in windows: [WindowInfo]) -> Set<Int> {
+        Set(
+            windows
+                .filter { windowRoutingType(for: $0).isExcludedFromLayout }
+                .map(\.windowNumber)
+        )
+    }
+
+    private func scanInstalledApps(with windows: [WindowInfo]) -> [AppRoutingItem] {
+        let windowCounts = Dictionary(grouping: windows, by: \.bundleId).mapValues(\.count)
+        var appsByBundleId = Dictionary(
+            uniqueKeysWithValues: installedApplications().map { ($0.bundleId, $0) }
+        )
+
+        let selfBundle = Bundle.main.bundleIdentifier
+        for runningApp in NSWorkspace.shared.runningApplications {
+            guard runningApp.activationPolicy == .regular,
+                  let bundleId = runningApp.bundleIdentifier,
+                  bundleId != selfBundle else { continue }
+            if appsByBundleId[bundleId] == nil {
+                appsByBundleId[bundleId] = InstalledApplicationRoute(
+                    bundleId: bundleId,
+                    appName: runningApp.localizedName ?? bundleId,
+                    appURL: runningApp.bundleURL,
+                    icon: runningApp.icon
+                )
+            }
+        }
+
+        for window in windows where !window.isControllable {
+            if appsByBundleId[window.bundleId] == nil {
+                appsByBundleId[window.bundleId] = InstalledApplicationRoute(
+                    bundleId: window.bundleId,
+                    appName: window.appName.isEmpty ? "不可识别窗口" : window.appName,
+                    appURL: nil,
+                    icon: NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: "不可控窗口")
+                )
+            }
+        }
+
+        return appsByBundleId.values
+            .map {
+                AppRoutingItem(
+                    bundleId: $0.bundleId,
+                    appName: $0.appName,
+                    appURL: $0.appURL,
+                    icon: $0.icon,
+                    windowCount: windowCounts[$0.bundleId] ?? 0,
+                    isRoutingLocked: $0.bundleId == WindowInfo.unknownBundleId
+                )
+            }
+            .sorted {
+                if $0.windowCount == $1.windowCount {
+                    return $0.appName.localizedCaseInsensitiveCompare($1.appName) == .orderedAscending
+                }
+                return $0.windowCount > $1.windowCount
+            }
+    }
+
+    private func installedApplications() -> [InstalledApplicationRoute] {
+        if let installedApplicationsCache {
+            return installedApplicationsCache
+        }
+
+        let fileManager = FileManager.default
+        var roots = Set<URL>()
+        for domain in [FileManager.SearchPathDomainMask.localDomainMask, .systemDomainMask, .userDomainMask] {
+            fileManager.urls(for: .applicationDirectory, in: domain).forEach { roots.insert($0) }
+        }
+        roots.insert(URL(fileURLWithPath: "/Applications/Utilities", isDirectory: true))
+        roots.insert(URL(fileURLWithPath: "/System/Applications/Utilities", isDirectory: true))
+
+        let selfBundle = Bundle.main.bundleIdentifier
+        var appsByBundleId: [String: InstalledApplicationRoute] = [:]
+
+        for root in roots where fileManager.fileExists(atPath: root.path) {
+            guard let enumerator = fileManager.enumerator(
+                at: root,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles, .skipsPackageDescendants]
+            ) else { continue }
+
+            for case let url as URL in enumerator {
+                guard url.pathExtension.localizedCaseInsensitiveCompare("app") == .orderedSame else { continue }
+                guard let appBundle = Bundle(url: url),
+                      let bundleId = appBundle.bundleIdentifier,
+                      bundleId != selfBundle else { continue }
+
+                let displayName = appBundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
+                let bundleName = appBundle.object(forInfoDictionaryKey: "CFBundleName") as? String
+                let appName = displayName ?? bundleName ?? url.deletingPathExtension().lastPathComponent
+                let icon = NSWorkspace.shared.icon(forFile: url.path)
+                icon.size = NSSize(width: 24, height: 24)
+
+                if appsByBundleId[bundleId] == nil {
+                    appsByBundleId[bundleId] = InstalledApplicationRoute(
+                        bundleId: bundleId,
+                        appName: appName,
+                        appURL: url,
+                        icon: icon
+                    )
+                }
+            }
+        }
+
+        let apps = Array(appsByBundleId.values)
+        installedApplicationsCache = apps
+        return apps
+    }
+
+    private func resolveFocusedRoutingWindow(in windows: [WindowInfo]) -> WindowInfo? {
+        if let focusedRoutingWindow,
+           windows.contains(where: { $0.windowNumber == focusedRoutingWindow.windowNumber }) {
+            return focusedRoutingWindow
+        }
+
+        if let identity = targetWindowIdentity(),
+           let resolved = resolveTargetWindowInfo(identity: identity, windows: windows) {
+            return resolved
+        }
+
+        if let lastExternalWindowIdentity,
+           let resolved = resolveTargetWindowInfo(identity: lastExternalWindowIdentity, windows: windows) {
+            return resolved
+        }
+
+        return nil
+    }
+
+    private func matchedTitleRule(for window: WindowInfo) -> WindowTitleRoutingRule? {
+        partitionState.titleRoutingRules.last(where: { rule in
+            rule.bundleId == window.bundleId
+                && !rule.title.isEmpty
+                && !window.title.isEmpty
+                && window.title.localizedCaseInsensitiveContains(rule.title)
+        })
+    }
+
     private func tileFrontmost(position: TilePosition) {
         guard let target = targetWindowIdentity() else {
             setStatus("未找到可操作的目标窗口（先点一次目标 App）", error: true)
@@ -796,6 +1287,224 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             return "bottom-right"
         case .fullscreen:
             return "fullscreen"
+        }
+    }
+
+    @objc
+    private func addFrontmostToUnconstrained() {
+        let windows = windowController.listWindows(onScreenOnly: true)
+        let resolved = resolveFocusedRoutingWindow(in: windows)
+
+        guard let window = resolved else {
+            setStatus("未找到可操作的目标窗口（先点一次目标 App）", error: true)
+            return
+        }
+
+        let windowTitle = window.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !windowTitle.isEmpty else {
+            setStatus("当前窗口标题为空，无法创建标题匹配规则", error: true)
+            return
+        }
+
+        if let idx = partitionState.titleRoutingRules.firstIndex(where: {
+            $0.bundleId == window.bundleId && $0.title.caseInsensitiveCompare(windowTitle) == .orderedSame
+        }) {
+            partitionState.titleRoutingRules[idx].type = .temporary
+        } else {
+            partitionState.titleRoutingRules.append(
+                WindowTitleRoutingRule(
+                    bundleId: window.bundleId,
+                    appName: window.appName,
+                    title: windowTitle,
+                    type: .temporary
+                )
+            )
+        }
+
+        setStatus("已添加标题规则：\(windowTitle) · \(window.appName) -> 临时窗口", error: false)
+        refreshWorkbench()
+    }
+
+    @objc
+    private func clearUnconstrainedWindows() {
+        partitionState.titleRoutingRules.removeAll()
+        setStatus("已清空窗口标题规则", error: false)
+        refreshWorkbench()
+    }
+
+    @objc
+    private func changeAppRoutingType(_ sender: BundleRoutingTypePopupButton) {
+        let selected = WindowRoutingType.allCases[safe: sender.indexOfSelectedItem] ?? .managed
+        if selected == .managed {
+            partitionState.appRoutingTypesByBundleId.removeValue(forKey: sender.bundleId)
+        } else {
+            partitionState.appRoutingTypesByBundleId[sender.bundleId] = selected
+        }
+        refreshWorkbench()
+    }
+
+    @objc
+    private func changeTitleRuleRoutingType(_ sender: TitleRuleRoutingTypePopupButton) {
+        guard let ruleId = sender.ruleId,
+              let idx = partitionState.titleRoutingRules.firstIndex(where: { $0.id == ruleId }) else {
+            return
+        }
+        let selected = WindowRoutingType.allCases[safe: sender.indexOfSelectedItem] ?? .managed
+        partitionState.titleRoutingRules[idx].type = selected
+        refreshWorkbench()
+    }
+
+    @objc
+    private func removeTitleRoutingRule(_ sender: RoutingRuleRemoveButton) {
+        guard let ruleId = sender.ruleId else { return }
+        partitionState.titleRoutingRules.removeAll { $0.id == ruleId }
+        setStatus("已删除窗口标题规则", error: false)
+        refreshWorkbench()
+    }
+
+    @objc
+    private func resetAllAppRoutingTypes() {
+        partitionState.appRoutingTypesByBundleId.removeAll()
+        setStatus("已重置 App 级窗口类型为管理窗口", error: false)
+        refreshWorkbench()
+    }
+
+    @objc
+    private func refreshWindowRoutingRules() {
+        installedApplicationsCache = nil
+        refreshUnconstrainedWindowList(with: windowController.listWindows(onScreenOnly: true))
+        setStatus("已刷新系统 App 与窗口扫描结果", error: false)
+    }
+
+    private func refreshUnconstrainedWindowList(with windows: [WindowInfo]) {
+        let unconstrainedNumbers = currentUnconstrainedWindowNumbers(in: windows)
+        partitionState.unconstrainedWindowNumbers = unconstrainedNumbers
+
+        let focusedWindow = resolveFocusedRoutingWindow(in: windows)
+        focusedRoutingWindow = focusedWindow
+
+        if let frontmost = focusedWindow {
+            let focusedTitle = frontmost.title.isEmpty ? "（无标题窗口）" : frontmost.title
+            unconstrainedFrontmostLabel?.stringValue = "\(focusedTitle) · \(frontmost.appName)"
+            addFocusedWindowRuleButton?.title = "添加当前聚焦窗口：\(focusedTitle) · \(frontmost.appName)  【添加为临时窗口】"
+            addFocusedWindowRuleButton?.isEnabled = frontmost.isControllable
+                && !frontmost.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        } else {
+            unconstrainedFrontmostLabel?.stringValue = "-"
+            addFocusedWindowRuleButton?.title = "添加当前聚焦窗口：-  【添加为临时窗口】"
+            addFocusedWindowRuleButton?.isEnabled = false
+        }
+
+        if let appStack = appRoutingListStackView {
+            appStack.arrangedSubviews.forEach {
+                appStack.removeArrangedSubview($0)
+                $0.removeFromSuperview()
+            }
+
+            let apps = scanInstalledApps(with: windows)
+            if apps.isEmpty {
+                let emptyLabel = NSTextField(labelWithString: "未扫描到可管理的系统 App")
+                emptyLabel.textColor = .tertiaryLabelColor
+                appStack.addArrangedSubview(emptyLabel)
+            } else {
+                for app in apps {
+                    let popup = BundleRoutingTypePopupButton(frame: .zero, pullsDown: false)
+                    popup.bundleId = app.bundleId
+                    popup.addItems(withTitles: WindowRoutingType.allCases.map(\.title))
+                    let selected = partitionState.appRoutingTypesByBundleId[app.bundleId]
+                        ?? (app.bundleId == WindowInfo.unknownBundleId ? .uncontrollable : .managed)
+                    if let idx = WindowRoutingType.allCases.firstIndex(of: selected) {
+                        popup.selectItem(at: idx)
+                    }
+                    popup.isEnabled = !app.isRoutingLocked
+                    if app.isRoutingLocked {
+                        popup.toolTip = "自动识别的不可控窗口不可修改类型"
+                    }
+                    popup.target = self
+                    popup.action = #selector(changeAppRoutingType(_:))
+                    popup.translatesAutoresizingMaskIntoConstraints = false
+                    popup.widthAnchor.constraint(equalToConstant: 120).isActive = true
+                    appStack.addArrangedSubview(makeAppRoutingRow(app: app, popup: popup))
+                }
+            }
+        }
+
+        if let titleRuleStack = titleRuleListStackView {
+            titleRuleStack.arrangedSubviews.forEach {
+                titleRuleStack.removeArrangedSubview($0)
+                $0.removeFromSuperview()
+            }
+
+            if partitionState.titleRoutingRules.isEmpty {
+                let emptyLabel = NSTextField(labelWithString: "暂无窗口标题规则")
+                emptyLabel.textColor = .tertiaryLabelColor
+                titleRuleStack.addArrangedSubview(emptyLabel)
+            } else {
+                for rule in partitionState.titleRoutingRules {
+                    let popup = TitleRuleRoutingTypePopupButton(frame: .zero, pullsDown: false)
+                    popup.ruleId = rule.id
+                    popup.addItems(withTitles: WindowRoutingType.allCases.map(\.title))
+                    if let idx = WindowRoutingType.allCases.firstIndex(of: rule.type) {
+                        popup.selectItem(at: idx)
+                    }
+                    popup.target = self
+                    popup.action = #selector(changeTitleRuleRoutingType(_:))
+                    popup.translatesAutoresizingMaskIntoConstraints = false
+                    popup.widthAnchor.constraint(equalToConstant: 120).isActive = true
+
+                    let removeButton = RoutingRuleRemoveButton(title: "删除", target: self, action: #selector(removeTitleRoutingRule(_:)))
+                    removeButton.ruleId = rule.id
+                    removeButton.controlSize = .small
+                    titleRuleStack.addArrangedSubview(makeActionRow(
+                        title: rule.title,
+                        detail: rule.appName,
+                        controls: [popup, removeButton]
+                    ))
+                }
+            }
+        }
+
+        if let temporaryStack = temporaryMatchListStackView {
+            temporaryStack.arrangedSubviews.forEach {
+                temporaryStack.removeArrangedSubview($0)
+                $0.removeFromSuperview()
+            }
+
+            let matchedNonManagedWindows = windows
+                .filter { unconstrainedNumbers.contains($0.windowNumber) }
+                .sorted {
+                    if $0.bundleId == $1.bundleId {
+                        return $0.windowNumber < $1.windowNumber
+                    }
+                    return $0.bundleId < $1.bundleId
+                }
+
+            if matchedNonManagedWindows.isEmpty {
+                let emptyLabel = NSTextField(labelWithString: "当前没有命中非管理规则的窗口")
+                emptyLabel.textColor = .tertiaryLabelColor
+                temporaryStack.addArrangedSubview(emptyLabel)
+            } else {
+                for window in matchedNonManagedWindows {
+                    let routingType = windowRoutingType(for: window)
+                    let reason: String
+                    if !window.isControllable {
+                        reason = "自动识别：缺少可控 App 身份"
+                    } else if let titleRule = matchedTitleRule(for: window) {
+                        reason = "标题规则：\(titleRule.title)"
+                    } else {
+                        reason = "App 规则"
+                    }
+
+                    let title = window.title.isEmpty ? window.bundleId : window.title
+                    temporaryStack.addArrangedSubview(makeActionRow(
+                        title: title,
+                        detail: window.appName,
+                        controls: [],
+                        trailingNote: "\(routingType.title) · \(reason)",
+                        muted: !window.isControllable
+                    ))
+                }
+            }
         }
     }
 
@@ -851,8 +1560,53 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         refreshWorkbench()
     }
 
-    private func shortcutFlagsSatisfied(flags: NSEvent.ModifierFlags) -> Bool {
-        let shortcut = appConfig.layoutHUDShortcut
+    @objc
+    private func changeWorkbenchAppearance(_ sender: NSPopUpButton) {
+        let options = DesktopConfig.WorkbenchAppearance.allCases
+        let selected = options[safe: sender.indexOfSelectedItem] ?? .system
+        appConfig.workbenchAppearance = selected
+        do {
+            try appConfig.save()
+            applyWorkbenchAppearance(reloadSection: true)
+            setStatus("外观已切换：\(selected.title)", error: false)
+        } catch {
+            setStatus("保存外观失败：\(error.localizedDescription)", error: true)
+        }
+    }
+
+    private func applyWorkbenchAppearance(reloadSection: Bool) {
+        switch appConfig.workbenchAppearance {
+        case .system:
+            window?.appearance = nil
+        case .titaniumLight:
+            window?.appearance = NSAppearance(named: .aqua)
+        case .titaniumDark:
+            window?.appearance = NSAppearance(named: .darkAqua)
+        }
+        rootBackgroundView?.appearanceMode = appConfig.workbenchAppearance
+        statusLabel?.textColor = .secondaryLabelColor
+        if reloadSection {
+            switchSection(currentSection, animated: false)
+        }
+    }
+
+    private func shortcut(for action: WorkbenchShortcutAction) -> DesktopConfig.Shortcut {
+        if action == .layoutHUD {
+            return appConfig.layoutHUDShortcut
+        }
+        return appConfig.shortcutBindings[action.rawValue] ?? action.defaultShortcut
+    }
+
+    private func setShortcut(_ shortcut: DesktopConfig.Shortcut, for action: WorkbenchShortcutAction) {
+        if action == .layoutHUD {
+            appConfig.layoutHUDShortcut = shortcut
+        } else {
+            appConfig.shortcutBindings[action.rawValue] = shortcut
+        }
+        appConfig.shortcutConflictOverrides[action.rawValue] = false
+    }
+
+    private func shortcutFlagsSatisfied(flags: NSEvent.ModifierFlags, shortcut: DesktopConfig.Shortcut) -> Bool {
         if shortcut.command && !flags.contains(.command) { return false }
         if shortcut.option && !flags.contains(.option) { return false }
         if shortcut.shift && !flags.contains(.shift) { return false }
@@ -860,8 +1614,82 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         return true
     }
 
-    private func shortcutMatches(flags: NSEvent.ModifierFlags, keyCode: UInt16) -> Bool {
-        keyCode == appConfig.layoutHUDShortcut.keyCode && shortcutFlagsSatisfied(flags: flags)
+    private func shortcutMatches(_ shortcut: DesktopConfig.Shortcut, flags: NSEvent.ModifierFlags, keyCode: UInt16) -> Bool {
+        keyCode == shortcut.keyCode
+            && flags.contains(.command) == shortcut.command
+            && flags.contains(.option) == shortcut.option
+            && flags.contains(.shift) == shortcut.shift
+            && flags.contains(.control) == shortcut.control
+    }
+
+    private func shortcutAction(matching flags: NSEvent.ModifierFlags, keyCode: UInt16) -> WorkbenchShortcutAction? {
+        WorkbenchShortcutAction.allCases.first { action in
+            shortcutMatches(shortcut(for: action), flags: flags, keyCode: keyCode)
+        }
+    }
+
+    private func performShortcutAction(_ action: WorkbenchShortcutAction, event: NSEvent) {
+        if event.isARepeat && action == .layoutHUD {
+            return
+        }
+
+        switch action {
+        case .layoutHUD:
+            showLayoutModeOverlay()
+        case .quickDropLeftPrimary:
+            quickDropFrontmost(to: .leftPrimary)
+        case .quickDropRightPrimary:
+            quickDropFrontmost(to: .rightPrimary)
+        case .quickDropLeftSecondary:
+            let shortcut = shortcut(for: action)
+            let preferLower = event.modifierFlags.contains(.shift) && !shortcut.shift
+            quickDropFrontmost(to: .leftSecondary, preferLowerSecondary: preferLower)
+        case .quickDropRightSecondary:
+            let shortcut = shortcut(for: action)
+            let preferLower = event.modifierFlags.contains(.shift) && !shortcut.shift
+            quickDropFrontmost(to: .rightSecondary, preferLowerSecondary: preferLower)
+        case .tileLeft:
+            tileFrontmost(position: .left)
+        case .tileRight:
+            tileFrontmost(position: .right)
+        case .tileTop:
+            tileFrontmost(position: .top)
+        case .tileBottom:
+            tileFrontmost(position: .bottom)
+        }
+    }
+
+    private func captureShortcut(from event: NSEvent, for action: WorkbenchShortcutAction) {
+        let flags = event.modifierFlags.intersection([.command, .option, .shift, .control])
+        guard flags.contains(.command) || flags.contains(.option) || flags.contains(.shift) || flags.contains(.control) else {
+            setStatus("快捷键至少需要一个修饰键：⌘ / ⌥ / ⇧ / ⌃", error: true)
+            return
+        }
+
+        let shortcut = DesktopConfig.Shortcut(
+            keyCode: event.keyCode,
+            command: flags.contains(.command),
+            option: flags.contains(.option),
+            shift: flags.contains(.shift),
+            control: flags.contains(.control)
+        )
+
+        setShortcut(shortcut, for: action)
+        recordingShortcutAction = nil
+        do {
+            try appConfig.save()
+            installKeyboardShortcuts()
+            updateShortcutHintLabel()
+            let conflict = shortcutConflict(for: action, shortcut: shortcut)
+            if let conflict {
+                setStatus("已录入 \(action.title)：\(shortcutDisplayText(for: shortcut))，但检测到冲突：\(conflict.title)", error: true)
+            } else {
+                setStatus("已录入 \(action.title)：\(shortcutDisplayText(for: shortcut))", error: false)
+            }
+            switchSection(.quickDrop, animated: false)
+        } catch {
+            setStatus("保存快捷键失败：\(error.localizedDescription)", error: true)
+        }
     }
 
     private func shortcutKeyOptions() -> [ShortcutKeyOption] {
@@ -878,7 +1706,17 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             .init(title: "0", keyCode: 29), .init(title: "1", keyCode: 18), .init(title: "2", keyCode: 19),
             .init(title: "3", keyCode: 20), .init(title: "4", keyCode: 21), .init(title: "5", keyCode: 23),
             .init(title: "6", keyCode: 22), .init(title: "7", keyCode: 26), .init(title: "8", keyCode: 28),
-            .init(title: "9", keyCode: 25)
+            .init(title: "9", keyCode: 25),
+            .init(title: "←", keyCode: 123), .init(title: "→", keyCode: 124),
+            .init(title: "↓", keyCode: 125), .init(title: "↑", keyCode: 126),
+            .init(title: "Space", keyCode: 49), .init(title: "Tab", keyCode: 48),
+            .init(title: "Return", keyCode: 36), .init(title: "Esc", keyCode: 53),
+            .init(title: "-", keyCode: 27), .init(title: "=", keyCode: 24),
+            .init(title: "[", keyCode: 33), .init(title: "]", keyCode: 30),
+            .init(title: ";", keyCode: 41), .init(title: "'", keyCode: 39),
+            .init(title: ",", keyCode: 43), .init(title: ".", keyCode: 47),
+            .init(title: "/", keyCode: 44), .init(title: "\\", keyCode: 42),
+            .init(title: "`", keyCode: 50)
         ]
     }
 
@@ -887,7 +1725,10 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     }
 
     private func shortcutDisplayText() -> String {
-        let shortcut = appConfig.layoutHUDShortcut
+        shortcutDisplayText(for: shortcut(for: .layoutHUD))
+    }
+
+    private func shortcutDisplayText(for shortcut: DesktopConfig.Shortcut) -> String {
         var parts: [String] = []
         if shortcut.control { parts.append("⌃") }
         if shortcut.option { parts.append("⌥") }
@@ -897,8 +1738,108 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         return parts.joined()
     }
 
+    private func shortcutDisplayParts(for shortcut: DesktopConfig.Shortcut) -> [String] {
+        var parts: [String] = []
+        if shortcut.control { parts.append("⌃") }
+        if shortcut.option { parts.append("⌥") }
+        if shortcut.shift { parts.append("⇧") }
+        if shortcut.command { parts.append("⌘") }
+        parts.append(keyTitle(for: shortcut.keyCode))
+        return parts
+    }
+
     private func updateShortcutHintLabel() {
         shortcutHintLabel?.stringValue = "按住 \(shortcutDisplayText()) 显示布局九宫格"
+    }
+
+    private func shortcutConflict(for action: WorkbenchShortcutAction, shortcut candidate: DesktopConfig.Shortcut) -> ShortcutConflict? {
+        if let duplicate = WorkbenchShortcutAction.allCases.first(where: { other in
+            other != action && shortcutsEqual(shortcut(for: other), candidate)
+        }) {
+            return ShortcutConflict(title: "与「\(duplicate.title)」重复", detail: "同一个组合键已经分配给另一个 WinCtlManager 动作。")
+        }
+
+        if !canRegisterGlobalShortcut(candidate) {
+            return ShortcutConflict(title: "本机快捷键已被占用", detail: "macOS 或其他 App 已占用这个组合键；你可以覆盖使用，或重新录入。")
+        }
+
+        return nil
+    }
+
+    private func shortcutsEqual(_ lhs: DesktopConfig.Shortcut, _ rhs: DesktopConfig.Shortcut) -> Bool {
+        lhs.keyCode == rhs.keyCode
+            && lhs.command == rhs.command
+            && lhs.option == rhs.option
+            && lhs.shift == rhs.shift
+            && lhs.control == rhs.control
+    }
+
+    private func canRegisterGlobalShortcut(_ shortcut: DesktopConfig.Shortcut) -> Bool {
+        var hotKeyRef: EventHotKeyRef?
+        let signature = OSType(0x57434D48) // "WCMH"
+        let hotKeyID = EventHotKeyID(signature: signature, id: UInt32(shortcut.keyCode))
+        let status = RegisterEventHotKey(
+            UInt32(shortcut.keyCode),
+            carbonModifiers(for: shortcut),
+            hotKeyID,
+            GetEventDispatcherTarget(),
+            0,
+            &hotKeyRef
+        )
+        if status == noErr, let hotKeyRef {
+            UnregisterEventHotKey(hotKeyRef)
+            return true
+        }
+        return false
+    }
+
+    private func carbonModifiers(for shortcut: DesktopConfig.Shortcut) -> UInt32 {
+        var modifiers: UInt32 = 0
+        if shortcut.command { modifiers |= UInt32(cmdKey) }
+        if shortcut.option { modifiers |= UInt32(optionKey) }
+        if shortcut.shift { modifiers |= UInt32(shiftKey) }
+        if shortcut.control { modifiers |= UInt32(controlKey) }
+        return modifiers
+    }
+
+    @objc
+    private func handleShortcutStatusButton(_ sender: ShortcutActionButton) {
+        let action = sender.shortcutAction
+        let shortcut = shortcut(for: action)
+        guard let conflict = shortcutConflict(for: action, shortcut: shortcut) else {
+            beginRecordingShortcut(for: action)
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "快捷键冲突：\(action.title)"
+        alert.informativeText = "\(shortcutDisplayText(for: shortcut)) \(conflict.detail)"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "覆盖使用")
+        alert.addButton(withTitle: "重新设置")
+        alert.addButton(withTitle: "取消")
+        let response = alert.runModal()
+        switch response {
+        case .alertFirstButtonReturn:
+            appConfig.shortcutConflictOverrides[action.rawValue] = true
+            do {
+                try appConfig.save()
+                setStatus("已覆盖使用 \(action.title)：\(shortcutDisplayText(for: shortcut))", error: false)
+                switchSection(.quickDrop, animated: false)
+            } catch {
+                setStatus("保存覆盖选择失败：\(error.localizedDescription)", error: true)
+            }
+        case .alertSecondButtonReturn:
+            beginRecordingShortcut(for: action)
+        default:
+            break
+        }
+    }
+
+    private func beginRecordingShortcut(for action: WorkbenchShortcutAction) {
+        recordingShortcutAction = action
+        setStatus("正在录入「\(action.title)」：请直接按下新的组合键，例如 ⌘⇧↑", error: false)
+        switchSection(.quickDrop, animated: false)
     }
 
     @objc
@@ -1135,9 +2076,10 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         }
         do {
             let description = "Saved from workbench \(Date())"
-            _ = try layoutCoordinator.saveCurrentDesktop(name: name, description: description)
+            let layout = try layoutCoordinator.saveCurrentDesktop(name: name, description: description)
             selectedLayoutName = name
-            setStatus("已保存布局：\(name)", error: false)
+            let displayNote = layout.preferredDisplay.map { " · 默认屏幕：\($0.name)" } ?? ""
+            setStatus("已保存布局：\(name)\(displayNote)", error: false)
             reloadLayoutCards()
         } catch {
             setStatus(error.localizedDescription, error: true)
@@ -1161,36 +2103,180 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
                 self?.reloadLayoutCards()
             }
             card.onApply = { [weak self] selectedName in
-                self?.applyLayout(named: selectedName)
+                self?.selectedLayoutName = selectedName
+                self?.layoutNameField?.stringValue = selectedName
+                self?.wakeLayout(named: selectedName)
+            }
+            card.onDelete = { [weak self] selectedName in
+                self?.confirmDeleteLayout(named: selectedName)
             }
             noteStackView.addArrangedSubview(card)
         }
 
         // Keep document width in sync with content to prevent Auto Layout conflicts
         // inside NSStackView when cards have fixed widths.
-        let cardWidth: CGFloat = 210
+        let cardWidth: CGFloat = LayoutNoteCardView.cardSize.width
         let spacing: CGFloat = noteStackView.spacing
         let insets = noteStackView.edgeInsets
         let count = CGFloat(layouts.count)
         let cardsTotal = count * cardWidth + max(0, count - 1) * spacing
         let minimumVisibleWidth = noteScrollView?.contentSize.width ?? 420
         let targetWidth = max(minimumVisibleWidth, insets.left + cardsTotal + insets.right)
-        noteStackView.frame = NSRect(x: 0, y: 0, width: targetWidth, height: 204)
+        noteStackView.frame = NSRect(x: 0, y: 0, width: targetWidth, height: LayoutNoteCardView.cardSize.height + 16)
     }
 
-    private func applyLayout(named name: String) {
+    private func confirmDeleteLayout(named name: String) {
+        let alert = NSAlert()
+        alert.messageText = "删除布局「\(name)」？"
+        alert.informativeText = "这个操作会移除已保存的布局文件，不能在应用内撤销。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "删除")
+        alert.addButton(withTitle: "取消")
+
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.deleteLayout(named: name)
+        }
+
+        if let window {
+            alert.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(alert.runModal())
+        }
+    }
+
+    private func deleteLayout(named name: String) {
         do {
-            try layoutCoordinator.applyDesktop(name: name)
-            setStatus("已应用布局：\(name)", error: false)
+            try layoutCoordinator.deleteDesktop(name: name)
+            if selectedLayoutName == name {
+                selectedLayoutName = nil
+                layoutNameField?.stringValue = "workspace_\(dateSuffix())"
+            }
+            setStatus("已删除布局：\(name)", error: false)
+            reloadLayoutCards()
+        } catch {
+            setStatus("删除布局失败：\(error.localizedDescription)", error: true)
+        }
+    }
+
+    private func wakeLayout(named name: String) {
+        let displays = screenManager.displaySnapshots()
+        if displays.count > 1 {
+            do {
+                let layout = try layoutCoordinator.loadDesktop(name: name)
+                showDisplayWakePanel(layout: layout, displays: displays)
+            } catch {
+                setStatus(error.localizedDescription, error: true)
+            }
+            return
+        }
+
+        wakeLayout(named: name, targetDisplayId: displays.first?.id)
+    }
+
+    private func wakeLayout(named name: String, targetDisplayId: UInt32?) {
+        do {
+            try layoutCoordinator.wakeDesktop(name: name, targetDisplayId: targetDisplayId)
+            partitionModelInitialized = true
+            closeDisplayWakePanel()
+            setStatus("已唤醒布局：\(name)", error: false)
             refreshWorkbench()
         } catch {
             setStatus(error.localizedDescription, error: true)
         }
     }
 
+    private func showDisplayWakePanel(layout: DesktopLayout, displays: [LayoutDisplaySnapshot]) {
+        closeDisplayWakePanel()
+
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 360),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "选择唤醒屏幕"
+        panel.isReleasedWhenClosed = false
+
+        let effect = NSVisualEffectView()
+        effect.material = .hudWindow
+        effect.blendingMode = .withinWindow
+        effect.state = .active
+        effect.translatesAutoresizingMaskIntoConstraints = false
+
+        let root = NSStackView()
+        root.orientation = .vertical
+        root.spacing = 14
+        root.edgeInsets = NSEdgeInsets(top: 22, left: 24, bottom: 20, right: 24)
+        root.translatesAutoresizingMaskIntoConstraints = false
+        effect.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
+            root.topAnchor.constraint(equalTo: effect.topAnchor),
+            root.bottomAnchor.constraint(equalTo: effect.bottomAnchor)
+        ])
+
+        let title = NSTextField(labelWithString: "唤醒「\(layout.name)」到哪个屏幕？")
+        title.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
+        title.alignment = .left
+        root.addArrangedSubview(title)
+
+        let subtitle = NSTextField(labelWithString: "保存布局时的 preferredDisplayId 会作为默认提示；点击任意屏幕即可恢复浏览器 URL 并排布窗口。")
+        subtitle.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+        subtitle.textColor = .secondaryLabelColor
+        subtitle.alignment = .left
+        subtitle.lineBreakMode = .byWordWrapping
+        subtitle.maximumNumberOfLines = 2
+        root.addArrangedSubview(subtitle)
+
+        let mapView = DisplayWakeMapView(displays: displays, preferredDisplayId: layout.preferredDisplay?.id)
+        mapView.translatesAutoresizingMaskIntoConstraints = false
+        mapView.heightAnchor.constraint(equalToConstant: 210).isActive = true
+        mapView.onSelect = { [weak self] display in
+            self?.wakeLayout(named: layout.name, targetDisplayId: display.id)
+        }
+        root.addArrangedSubview(mapView)
+
+        let actions = NSStackView()
+        actions.orientation = .horizontal
+        actions.alignment = .centerY
+        actions.spacing = 10
+        let spacer = NSView()
+        actions.addArrangedSubview(spacer)
+        let cancel = NSButton(title: "取消", target: self, action: #selector(cancelDisplayWakeSelection))
+        cancel.bezelStyle = .rounded
+        actions.addArrangedSubview(cancel)
+        root.addArrangedSubview(actions)
+
+        panel.contentView = effect
+        displayWakePanel = panel
+        if let window {
+            window.beginSheet(panel)
+        } else {
+            panel.center()
+            panel.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    @objc
+    private func cancelDisplayWakeSelection() {
+        closeDisplayWakePanel()
+    }
+
+    private func closeDisplayWakePanel() {
+        guard let panel = displayWakePanel else { return }
+        if let sheetParent = panel.sheetParent {
+            sheetParent.endSheet(panel)
+        } else {
+            panel.close()
+        }
+        displayWakePanel = nil
+    }
+
     private func makeSidebarView() -> NSView {
         let sidebar = NSVisualEffectView()
-        sidebar.material = .sidebar
+        sidebar.material = .hudWindow
         sidebar.blendingMode = .behindWindow
         sidebar.state = .active
         sidebar.translatesAutoresizingMaskIntoConstraints = false
@@ -1198,7 +2284,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         let container = NSStackView()
         container.orientation = .vertical
         container.spacing = 0
-        container.edgeInsets = NSEdgeInsets(top: 20, left: 0, bottom: 20, right: 0)
+        container.edgeInsets = NSEdgeInsets(top: 24, left: 0, bottom: 20, right: 0)
         container.translatesAutoresizingMaskIntoConstraints = false
         sidebar.addSubview(container)
         NSLayoutConstraint.activate([
@@ -1209,9 +2295,14 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         ])
 
         let appTitle = NSTextField(labelWithString: "WinCtlManager")
-        appTitle.font = NSFont.systemFont(ofSize: 18, weight: .bold)
-        appTitle.alignment = .center
-        container.addArrangedSubview(appTitle)
+        appTitle.font = NSFont.systemFont(ofSize: 18, weight: .semibold)
+        appTitle.alignment = .left
+        appTitle.textColor = .labelColor
+        let titleRow = NSStackView()
+        titleRow.orientation = .horizontal
+        titleRow.edgeInsets = NSEdgeInsets(top: 0, left: 18, bottom: 0, right: 18)
+        titleRow.addArrangedSubview(appTitle)
+        container.addArrangedSubview(titleRow)
 
         let spacer1 = NSView()
         spacer1.translatesAutoresizingMaskIntoConstraints = false
@@ -1250,6 +2341,8 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         switch section {
         case .layouts: newPanel = makeLayoutsPanel()
         case .stacks: newPanel = makeStacksPanel()
+        case .quickDrop: newPanel = makeQuickDropPanel()
+        case .unconstrained: newPanel = makeUnconstrainedWindowsPanel()
         case .settings: newPanel = makeSettingsPanel()
         }
 
@@ -1275,44 +2368,41 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     }
 
     private func makeLayoutsPanel() -> NSView {
-        let root = NSStackView()
-        root.orientation = .vertical
-        root.spacing = 12
-        root.edgeInsets = NSEdgeInsets(top: 18, left: 18, bottom: 18, right: 18)
+        let root = makePanelRoot()
+        root.addArrangedSubview(makeSectionTitle("布局", subtitle: "保存、切换与调整当前桌面分区。"))
 
-        // Quick Actions card: save row + shortcut hint
-        let saveRow = NSStackView()
-        saveRow.orientation = .horizontal
-        saveRow.spacing = 8
-        saveRow.alignment = .centerY
+        var saveControls: [NSView] = []
         if let nameField = layoutNameField {
-            saveRow.addArrangedSubview(nameField)
+            nameField.translatesAutoresizingMaskIntoConstraints = false
+            nameField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
+            saveControls.append(nameField)
         }
         let saveBtn = makeButton("保存当前布局", action: #selector(saveCurrentLayout))
         saveBtn.contentTintColor = .controlAccentColor
-        saveRow.addArrangedSubview(saveBtn)
+        saveControls.append(saveBtn)
         let shortcutHintLabel = NSTextField(labelWithString: "")
         shortcutHintLabel.textColor = .secondaryLabelColor
         shortcutHintLabel.font = NSFont.systemFont(ofSize: 11)
         self.shortcutHintLabel = shortcutHintLabel
-        saveRow.addArrangedSubview(shortcutHintLabel)
+        saveControls.append(shortcutHintLabel)
         updateShortcutHintLabel()
-        root.addArrangedSubview(makeGlassCard(containing: saveRow))
+        root.addArrangedSubview(makeGlassCard(containing: makeActionRow(
+            title: "项目名称",
+            detail: selectedLayoutName ?? "当前工作区快照",
+            controls: saveControls
+        )))
 
-        // Mode card
-        let modeRow = NSStackView()
-        modeRow.orientation = .horizontal
-        modeRow.spacing = 10
-        modeRow.alignment = .centerY
-        let modeLabel = NSTextField(labelWithString: "布局模式")
-        modeLabel.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        modeLabel.textColor = .secondaryLabelColor
-        modeRow.addArrangedSubview(modeLabel)
-        if let mergeControl { modeRow.addArrangedSubview(mergeControl) }
+        var modeControls: [NSView] = []
+        if let mergeControl { modeControls.append(mergeControl) }
         let overlayToggle = makeButton("桌面分区柄：显示", action: #selector(toggleDesktopOverlayEditing))
         desktopOverlayToggleButton = overlayToggle
-        modeRow.addArrangedSubview(overlayToggle)
-        root.addArrangedSubview(makeGlassCard(containing: modeRow))
+        modeControls.append(overlayToggle)
+        root.addArrangedSubview(makeGlassCard(containing: makeActionRow(
+            title: "布局模式",
+            detail: mergeMode.title,
+            controls: modeControls,
+            trailingNote: "\(partitionState.stackThreshold) 阈值"
+        )))
 
         // Canvas card
         if let desktopView {
@@ -1342,53 +2432,44 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     }
 
     private func makeStacksPanel() -> NSView {
-        let root = NSStackView()
-        root.orientation = .vertical
-        root.spacing = 12
-        root.edgeInsets = NSEdgeInsets(top: 18, left: 18, bottom: 18, right: 18)
+        let root = makePanelRoot()
+        root.addArrangedSubview(makeSectionTitle("堆叠", subtitle: "把前台窗口收纳到固定区域或标签桶。"))
 
-        // Tile shortcuts card
-        let tileRow = NSStackView()
-        tileRow.orientation = .horizontal
-        tileRow.spacing = 8
-        tileRow.alignment = .centerY
-        tileRow.addArrangedSubview(makeButton("左半屏 ⌥⌘←", action: #selector(tileFrontmostLeft)))
-        tileRow.addArrangedSubview(makeButton("右半屏 ⌥⌘→", action: #selector(tileFrontmostRight)))
-        tileRow.addArrangedSubview(makeButton("上半屏 ⌥⌘↑", action: #selector(tileFrontmostTop)))
-        tileRow.addArrangedSubview(makeButton("下半屏 ⌥⌘↓", action: #selector(tileFrontmostBottom)))
-        root.addArrangedSubview(makeGlassCard(containing: tileRow))
+        let tileControls = [
+            makeButton("左半屏", action: #selector(tileFrontmostLeft)),
+            makeButton("右半屏", action: #selector(tileFrontmostRight)),
+            makeButton("上半屏", action: #selector(tileFrontmostTop)),
+            makeButton("下半屏", action: #selector(tileFrontmostBottom))
+        ]
+        root.addArrangedSubview(makeGlassCard(containing: makeActionRow(
+            title: "快捷平铺",
+            detail: "Command + Option + 方向键",
+            controls: tileControls
+        )))
 
-        // Left bucket controls
-        let bucketRow = NSStackView()
-        bucketRow.orientation = .horizontal
-        bucketRow.spacing = 8
-        bucketRow.alignment = .centerY
-        bucketRow.addArrangedSubview(makeButton("加入左桶", action: #selector(addFrontmostToLeftBucket)))
         let bucketToggle = NSButton(checkboxWithTitle: "左半屏使用桶堆叠", target: self, action: #selector(toggleLeftBucket))
         bucketToggle.state = leftBucketEnabled ? .on : .off
-        bucketRow.addArrangedSubview(bucketToggle)
-        root.addArrangedSubview(makeGlassCard(containing: bucketRow))
+        root.addArrangedSubview(makeGlassCard(containing: makeActionRow(
+            title: "左侧标签桶",
+            detail: leftBucketEnabled ? "当前开启" : "当前关闭",
+            controls: [makeButton("加入左桶", action: #selector(addFrontmostToLeftBucket)), bucketToggle]
+        )))
 
-        // Active stacks list
-        let headerLabel = NSTextField(labelWithString: "活跃堆叠")
-        headerLabel.font = NSFont.systemFont(ofSize: 16, weight: .semibold)
-        root.addArrangedSubview(headerLabel)
+        root.addArrangedSubview(makeSectionTitle("活跃堆叠"))
 
         let stacks = stackManager.listStacks()
         if stacks.isEmpty {
             let emptyLabel = NSTextField(labelWithString: "暂无活跃堆叠")
             emptyLabel.textColor = .tertiaryLabelColor
-            root.addArrangedSubview(emptyLabel)
+            root.addArrangedSubview(makeGlassCard(containing: emptyLabel))
         } else {
             for stack in stacks {
-                let row = NSStackView()
-                row.orientation = .horizontal
-                row.spacing = 8
-                row.alignment = .centerY
-                let nameLabel = NSTextField(labelWithString: "\(stack.name)  (\(stack.windows.count) 窗口)")
-                nameLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
-                row.addArrangedSubview(nameLabel)
-                root.addArrangedSubview(makeGlassCard(containing: row))
+                root.addArrangedSubview(makeGlassCard(containing: makeActionRow(
+                    title: stack.name,
+                    detail: stack.windows.first?.title ?? "窗口堆叠",
+                    controls: [],
+                    trailingNote: "\(stack.windows.count) 窗口"
+                )))
             }
         }
 
@@ -1399,77 +2480,180 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         return root
     }
 
-    private func makeSettingsPanel() -> NSView {
-        let root = NSStackView()
-        root.orientation = .vertical
-        root.spacing = 12
-        root.edgeInsets = NSEdgeInsets(top: 18, left: 18, bottom: 18, right: 18)
+    private func makeQuickDropPanel() -> NSView {
+        let root = makePanelRoot()
+        root.addArrangedSubview(makeSectionTitle(
+            "快捷键",
+            subtitle: "点击右侧 ↻ 重新录入；检测到本机或内部冲突时显示 ❗️，可选择覆盖使用或重新设置。"
+        ))
 
-        // Hotkey section
-        let hotkeyTitle = NSTextField(labelWithString: "布局九宫格快捷键")
-        hotkeyTitle.font = NSFont.systemFont(ofSize: 17, weight: .semibold)
-        root.addArrangedSubview(hotkeyTitle)
+        let groups: [(title: String, note: String, actions: [WorkbenchShortcutAction])] = [
+            ("窗口投放", "次块默认上半；按住 Shift 执行动作时会改投下半区。", [
+                .quickDropLeftPrimary,
+                .quickDropRightPrimary,
+                .quickDropLeftSecondary,
+                .quickDropRightSecondary
+            ]),
+            ("键盘平铺", "保留原来的方向键直觉，也可以改成你自己的组合。", [
+                .tileLeft,
+                .tileRight,
+                .tileTop,
+                .tileBottom
+            ]),
+            ("布局辅助", "HUD 是按住式快捷键，松开主按键后自动隐藏。", [
+                .layoutHUD
+            ])
+        ]
 
-        let hint = NSTextField(labelWithString: "按住该快捷键时显示九宫格 HUD，松开自动隐藏。")
-        hint.textColor = .secondaryLabelColor
-        hint.font = NSFont.systemFont(ofSize: 12)
-        root.addArrangedSubview(hint)
+        for group in groups {
+            let groupStack = NSStackView()
+            groupStack.orientation = .vertical
+            groupStack.spacing = 8
+            groupStack.alignment = .width
+            applyFullWidthAlignment(to: groupStack)
 
-        let keyRow = NSStackView()
-        keyRow.orientation = .horizontal
-        keyRow.spacing = 8
-        keyRow.alignment = .centerY
-        let keyLabel = NSTextField(labelWithString: "主按键")
-        keyLabel.font = NSFont.systemFont(ofSize: 13)
-        keyRow.addArrangedSubview(keyLabel)
-        let keyPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-        let options = shortcutKeyOptions()
-        keyPopup.addItems(withTitles: options.map(\.title))
-        if let idx = options.firstIndex(where: { $0.keyCode == appConfig.layoutHUDShortcut.keyCode }) {
-            keyPopup.selectItem(at: idx)
+            let groupTitle = NSTextField(labelWithString: group.title)
+            groupTitle.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+            groupTitle.textColor = .labelColor
+            groupTitle.alignment = .left
+            groupStack.addArrangedSubview(groupTitle)
+
+            let groupNote = NSTextField(labelWithString: group.note)
+            groupNote.font = NSFont.systemFont(ofSize: 11)
+            groupNote.textColor = .secondaryLabelColor
+            groupNote.alignment = .left
+            groupNote.lineBreakMode = .byWordWrapping
+            groupNote.maximumNumberOfLines = 2
+            groupStack.addArrangedSubview(groupNote)
+
+            for action in group.actions {
+                groupStack.addArrangedSubview(makeShortcutActionRow(for: action))
+            }
+
+            root.addArrangedSubview(makeGlassCard(
+                containing: groupStack,
+                insets: NSEdgeInsets(top: 12, left: 14, bottom: 12, right: 14)
+            ))
         }
-        shortcutKeyPopup = keyPopup
-        keyRow.addArrangedSubview(keyPopup)
-        root.addArrangedSubview(makeGlassCard(containing: keyRow))
 
-        let modRow = NSStackView()
-        modRow.orientation = .horizontal
-        modRow.spacing = 12
-        modRow.alignment = .centerY
-        let cmdToggle = NSButton(checkboxWithTitle: "⌘", target: nil, action: nil)
-        cmdToggle.state = appConfig.layoutHUDShortcut.command ? .on : .off
-        shortcutCommandToggle = cmdToggle
-        modRow.addArrangedSubview(cmdToggle)
-        let optToggle = NSButton(checkboxWithTitle: "⌥", target: nil, action: nil)
-        optToggle.state = appConfig.layoutHUDShortcut.option ? .on : .off
-        shortcutOptionToggle = optToggle
-        modRow.addArrangedSubview(optToggle)
-        let shiftToggle = NSButton(checkboxWithTitle: "⇧", target: nil, action: nil)
-        shiftToggle.state = appConfig.layoutHUDShortcut.shift ? .on : .off
-        shortcutShiftToggle = shiftToggle
-        modRow.addArrangedSubview(shiftToggle)
-        let controlToggle = NSButton(checkboxWithTitle: "⌃", target: nil, action: nil)
-        controlToggle.state = appConfig.layoutHUDShortcut.control ? .on : .off
-        shortcutControlToggle = controlToggle
-        modRow.addArrangedSubview(controlToggle)
-        root.addArrangedSubview(makeGlassCard(containing: modRow))
+        if let statusLabel {
+            root.addArrangedSubview(makeGlassCard(
+                containing: statusLabel,
+                insets: NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 10)
+            ))
+        }
 
-        let current = NSTextField(labelWithString: "当前：\(shortcutDisplayText())")
-        current.textColor = .secondaryLabelColor
-        shortcutCurrentLabel = current
-        root.addArrangedSubview(current)
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        root.addArrangedSubview(spacer)
+        return root
+    }
 
-        root.addArrangedSubview(makeButton("保存快捷键", action: #selector(saveShortcutSettings)))
+    private func makeUnconstrainedWindowsPanel() -> NSView {
+        let root = makePanelRoot()
+        root.addArrangedSubview(makeSectionTitle("窗口类型策略", subtitle: "App 是基础规则，窗口标题规则优先级更高；不可控窗口会自动排除出布局管理。"))
+        root.addArrangedSubview(makeActionRow(
+            title: "App 基础规则",
+            detail: "扫描系统中的 App 并设置默认窗口类型",
+            controls: [
+                makeButton("刷新扫描", action: #selector(refreshWindowRoutingRules)),
+                makeButton("重置 App 类型", action: #selector(resetAllAppRoutingTypes))
+            ]
+        ))
 
-        // Advanced section (collapsed)
-        let advancedTitle = NSTextField(labelWithString: "高级工具")
-        advancedTitle.font = NSFont.systemFont(ofSize: 16, weight: .semibold)
-        advancedTitle.textColor = .secondaryLabelColor
-        root.addArrangedSubview(advancedTitle)
+        let appRoutingStack = NSStackView()
+        appRoutingStack.orientation = .vertical
+        appRoutingStack.spacing = 8
+        appRoutingStack.alignment = .width
+        applyFullWidthAlignment(to: appRoutingStack)
+        appRoutingListStackView = appRoutingStack
+        root.addArrangedSubview(makeGlassCard(
+            containing: makeBoundedScrollView(containing: appRoutingStack, height: 320),
+            insets: NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 6)
+        ))
+
+        root.addArrangedSubview(makeSectionTitle("窗口覆盖规则", subtitle: "匹配 App + 窗口标题，覆盖 App 基础规则。"))
+
+        let frontmostLabel = NSTextField(labelWithString: "-")
+        frontmostLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        frontmostLabel.textColor = .secondaryLabelColor
+        frontmostLabel.alignment = .left
+        unconstrainedFrontmostLabel = frontmostLabel
+        let focusedButton = makeButton("添加当前聚焦窗口：-  【添加为临时窗口】", action: #selector(addFrontmostToUnconstrained))
+        focusedButton.lineBreakMode = .byTruncatingMiddle
+        addFocusedWindowRuleButton = focusedButton
+        root.addArrangedSubview(makeGlassCard(containing: makeActionRow(
+            title: "当前聚焦窗口",
+            detail: "取 WinCtlManager 操作窗口之外的最顶层窗口；点击右侧添加标题覆盖规则",
+            controls: [frontmostLabel, focusedButton]
+        )))
+
+        root.addArrangedSubview(makeActionRow(
+            title: "窗口标题规则",
+            detail: "标题规则优先于 App 规则",
+            controls: [makeButton("清空标题规则", action: #selector(clearUnconstrainedWindows))]
+        ))
+
+        let titleRuleStack = NSStackView()
+        titleRuleStack.orientation = .vertical
+        titleRuleStack.spacing = 8
+        titleRuleStack.alignment = .width
+        applyFullWidthAlignment(to: titleRuleStack)
+        titleRuleListStackView = titleRuleStack
+        root.addArrangedSubview(makeGlassCard(containing: titleRuleStack))
+
+        root.addArrangedSubview(makeSectionTitle("命中非管理规则的当前窗口"))
+
+        let temporaryMatchStack = NSStackView()
+        temporaryMatchStack.orientation = .vertical
+        temporaryMatchStack.spacing = 8
+        temporaryMatchStack.alignment = .width
+        applyFullWidthAlignment(to: temporaryMatchStack)
+        temporaryMatchListStackView = temporaryMatchStack
+        root.addArrangedSubview(makeGlassCard(containing: temporaryMatchStack))
+
+        refreshUnconstrainedWindowList(with: windowController.listWindows(onScreenOnly: true))
+
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        root.addArrangedSubview(spacer)
+        return root
+    }
+
+    private func makeSettingsPanel() -> NSView {
+        let root = makePanelRoot()
+        root.addArrangedSubview(makeSectionTitle("设置", subtitle: "外观、快捷键和高级工具。"))
+
+        let appearancePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+        appearancePopup.addItems(withTitles: DesktopConfig.WorkbenchAppearance.allCases.map(\.title))
+        if let idx = DesktopConfig.WorkbenchAppearance.allCases.firstIndex(of: appConfig.workbenchAppearance) {
+            appearancePopup.selectItem(at: idx)
+        }
+        appearancePopup.target = self
+        appearancePopup.action = #selector(changeWorkbenchAppearance(_:))
+        appearancePopup.translatesAutoresizingMaskIntoConstraints = false
+        appearancePopup.widthAnchor.constraint(equalToConstant: 140).isActive = true
+        self.appearancePopup = appearancePopup
+        root.addArrangedSubview(makeSettingRow(
+            title: "外观",
+            detail: "钛金属浅色 / 深色 / 跟随系统",
+            control: appearancePopup
+        ))
+
+        root.addArrangedSubview(makeSectionTitle("快捷键"))
+        root.addArrangedSubview(makeGlassCard(containing: makeActionRow(
+            title: "统一快捷键配置",
+            detail: "HUD、窗口投放和平铺快捷键已移到侧边栏「快捷键」页面",
+            controls: [makeButton("打开快捷键", action: #selector(showShortcutSection))]
+        )))
+
+        root.addArrangedSubview(makeSectionTitle("高级工具"))
 
         let advRow = NSStackView()
         advRow.orientation = .vertical
         advRow.spacing = 8
+        advRow.alignment = .width
+        applyFullWidthAlignment(to: advRow)
         let bundleRow = NSStackView()
         bundleRow.orientation = .horizontal
         bundleRow.spacing = 8
@@ -1479,9 +2663,11 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         appBundleIdField.translatesAutoresizingMaskIntoConstraints = false
         appBundleIdField.widthAnchor.constraint(equalToConstant: 280).isActive = true
         self.appBundleIdField = appBundleIdField
-        bundleRow.addArrangedSubview(appBundleIdField)
-        bundleRow.addArrangedSubview(makeButton("打开 App", action: #selector(launchAppFromInput)))
-        advRow.addArrangedSubview(bundleRow)
+        advRow.addArrangedSubview(makeActionRow(
+            title: "打开 App",
+            detail: "Bundle ID",
+            controls: [appBundleIdField, makeButton("打开", action: #selector(launchAppFromInput))]
+        ))
 
         let chromeRow = NSStackView()
         chromeRow.orientation = .horizontal
@@ -1493,11 +2679,17 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         chromeCountField.translatesAutoresizingMaskIntoConstraints = false
         chromeCountField.widthAnchor.constraint(equalToConstant: 60).isActive = true
         self.chromeWindowCountField = chromeCountField
-        chromeRow.addArrangedSubview(chromeCountField)
-        chromeRow.addArrangedSubview(makeButton("多开 Chrome", action: #selector(openMultipleChromeWindows)))
-        advRow.addArrangedSubview(chromeRow)
+        advRow.addArrangedSubview(makeActionRow(
+            title: "多开 Chrome",
+            detail: "开发测试窗口",
+            controls: [chromeCountField, makeButton("打开", action: #selector(openMultipleChromeWindows))]
+        ))
 
-        advRow.addArrangedSubview(makeButton("立即扫描", action: #selector(runAutoScan)))
+        advRow.addArrangedSubview(makeActionRow(
+            title: "分区扫描",
+            detail: "重新计算窗口归属",
+            controls: [makeButton("立即扫描", action: #selector(runAutoScan))]
+        ))
         root.addArrangedSubview(makeGlassCard(containing: advRow))
 
         let spacer = NSView()
@@ -1515,17 +2707,269 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         return button
     }
 
+    private func makeShortcutActionRow(for action: WorkbenchShortcutAction) -> NSView {
+        let shortcut = shortcut(for: action)
+        let conflict = shortcutConflict(for: action, shortcut: shortcut)
+        let isRecording = recordingShortcutAction == action
+
+        let statusButton = ShortcutActionButton(
+            shortcutAction: action,
+            title: conflict == nil ? "↻" : "❗️",
+            target: self,
+            action: #selector(handleShortcutStatusButton(_:))
+        )
+        statusButton.toolTip = conflict == nil ? "重新录入快捷键" : "检测到冲突，点击处理"
+        statusButton.bezelStyle = .rounded
+        statusButton.controlSize = .small
+        statusButton.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+
+        if let conflict {
+            let overridden = appConfig.shortcutConflictOverrides[action.rawValue] == true ? "（已覆盖）" : ""
+            statusButton.toolTip = "\(conflict.title)\(overridden)：点击处理"
+        }
+
+        return makeActionRow(
+            title: action.title,
+            detail: nil,
+            controls: [
+                makeShortcutDisplay(for: shortcut, isRecording: isRecording),
+                statusButton
+            ]
+        )
+    }
+
+    private func makeShortcutDisplay(for shortcut: DesktopConfig.Shortcut, isRecording: Bool) -> NSStackView {
+        let stack = NSStackView()
+        stack.orientation = .horizontal
+        stack.spacing = 4
+        stack.alignment = .centerY
+        stack.setContentHuggingPriority(.required, for: .horizontal)
+
+        if isRecording {
+            stack.addArrangedSubview(makeShortcutToken("录入中", emphasized: true))
+        } else {
+            shortcutDisplayParts(for: shortcut).forEach {
+                stack.addArrangedSubview(makeShortcutToken($0, emphasized: $0 == keyTitle(for: shortcut.keyCode)))
+            }
+        }
+        return stack
+    }
+
+    private func makeShortcutToken(_ text: String, emphasized: Bool) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = emphasized
+            ? NSFont.monospacedSystemFont(ofSize: 11, weight: .semibold)
+            : NSFont.monospacedSystemFont(ofSize: 11, weight: .medium)
+        label.textColor = emphasized ? .labelColor : .secondaryLabelColor
+        label.alignment = .center
+        label.wantsLayer = true
+        label.layer?.cornerRadius = 5
+        label.layer?.masksToBounds = true
+        label.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(emphasized ? 0.10 : 0.06).cgColor
+        label.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.20).cgColor
+        label.layer?.borderWidth = 1
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.widthAnchor.constraint(greaterThanOrEqualToConstant: max(24, CGFloat(text.count * 8 + 12))).isActive = true
+        label.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        return label
+    }
+
+    private func makePanelRoot() -> NSStackView {
+        let root = NSStackView()
+        root.orientation = .vertical
+        root.spacing = 10
+        root.alignment = .width
+        root.distribution = .fill
+        root.edgeInsets = NSEdgeInsets(top: 24, left: 28, bottom: 24, right: 28)
+        applyFullWidthAlignment(to: root)
+        return root
+    }
+
+    private func makeSectionTitle(_ title: String, subtitle: String? = nil) -> NSStackView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.spacing = 3
+        stack.alignment = .width
+        applyFullWidthAlignment(to: stack)
+
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = NSFont.systemFont(ofSize: 18, weight: .semibold)
+        titleLabel.textColor = .labelColor
+        titleLabel.alignment = .left
+        stack.addArrangedSubview(titleLabel)
+
+        if let subtitle {
+            let subtitleLabel = NSTextField(labelWithString: subtitle)
+            subtitleLabel.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+            subtitleLabel.textColor = .secondaryLabelColor
+            subtitleLabel.alignment = .left
+            subtitleLabel.lineBreakMode = .byWordWrapping
+            subtitleLabel.maximumNumberOfLines = 2
+            stack.addArrangedSubview(subtitleLabel)
+        }
+
+        return stack
+    }
+
+    private func makeControlCluster(_ controls: [NSView]) -> NSStackView {
+        let cluster = NSStackView()
+        cluster.orientation = .horizontal
+        cluster.spacing = 8
+        cluster.alignment = .centerY
+        cluster.setContentHuggingPriority(.required, for: .horizontal)
+        controls.forEach { cluster.addArrangedSubview($0) }
+        return cluster
+    }
+
+    private func makeAppRoutingRow(app: AppRoutingItem, popup: NSPopUpButton) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.spacing = 14
+        row.alignment = .centerY
+        applyFullWidthAlignment(to: row)
+        row.alphaValue = app.isRoutingLocked ? 0.62 : 1.0
+
+        let iconView = NSImageView()
+        iconView.image = app.icon
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        iconView.widthAnchor.constraint(equalToConstant: 26).isActive = true
+        iconView.heightAnchor.constraint(equalToConstant: 26).isActive = true
+
+        let titleLabel = NSTextField(labelWithString: app.appName)
+        titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        titleLabel.textColor = app.isRoutingLocked ? .tertiaryLabelColor : .labelColor
+        titleLabel.alignment = .left
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.toolTip = app.bundleId
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let titleStack = NSStackView()
+        titleStack.orientation = .horizontal
+        titleStack.spacing = 10
+        titleStack.alignment = .centerY
+        titleStack.addArrangedSubview(iconView)
+        titleStack.addArrangedSubview(titleLabel)
+        titleStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(titleStack)
+
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        row.addArrangedSubview(spacer)
+
+        row.addArrangedSubview(makeControlCluster([popup]))
+
+        let note = app.isRoutingLocked ? "只读" : (app.windowCount > 0 ? "运行中 \(app.windowCount)" : "未打开")
+        let noteLabel = NSTextField(labelWithString: note)
+        noteLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        noteLabel.textColor = app.isRoutingLocked || app.windowCount == 0 ? .tertiaryLabelColor : .secondaryLabelColor
+        noteLabel.alignment = .right
+        noteLabel.setContentHuggingPriority(.required, for: .horizontal)
+        row.addArrangedSubview(noteLabel)
+
+        return row
+    }
+
+    private func makeActionRow(
+        title: String,
+        detail: String? = nil,
+        controls: [NSView],
+        trailingNote: String? = nil,
+        muted: Bool = false
+    ) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.spacing = 14
+        row.alignment = .centerY
+        applyFullWidthAlignment(to: row)
+        row.alphaValue = muted ? 0.62 : 1.0
+
+        let textStack = NSStackView()
+        textStack.orientation = .vertical
+        textStack.spacing = 2
+        textStack.alignment = .leading
+        textStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        titleLabel.textColor = muted ? .tertiaryLabelColor : .labelColor
+        titleLabel.alignment = .left
+        titleLabel.lineBreakMode = .byTruncatingTail
+        textStack.addArrangedSubview(titleLabel)
+
+        if let detail {
+            let detailLabel = NSTextField(labelWithString: detail)
+            detailLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
+            detailLabel.textColor = muted ? .tertiaryLabelColor : .secondaryLabelColor
+            detailLabel.alignment = .left
+            detailLabel.lineBreakMode = .byTruncatingTail
+            textStack.addArrangedSubview(detailLabel)
+        }
+
+        row.addArrangedSubview(textStack)
+
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        row.addArrangedSubview(spacer)
+
+        row.addArrangedSubview(makeControlCluster(controls))
+
+        if let trailingNote {
+            let noteLabel = NSTextField(labelWithString: trailingNote)
+            noteLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+            noteLabel.textColor = .tertiaryLabelColor
+            noteLabel.alignment = .right
+            noteLabel.setContentHuggingPriority(.required, for: .horizontal)
+            row.addArrangedSubview(noteLabel)
+        }
+
+        return row
+    }
+
+    private func makeSettingRow(title: String, detail: String? = nil, control: NSView) -> NSView {
+        makeGlassCard(containing: makeActionRow(title: title, detail: detail, controls: [control]))
+    }
+
+    private func makeBoundedScrollView(containing content: NSView, height: CGFloat) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = false
+        scrollView.hasHorizontalScroller = false
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.heightAnchor.constraint(equalToConstant: height).isActive = true
+        applyFullWidthAlignment(to: scrollView)
+
+        let documentView = NSView()
+        documentView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.documentView = documentView
+
+        content.translatesAutoresizingMaskIntoConstraints = false
+        documentView.addSubview(content)
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: documentView.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: documentView.trailingAnchor),
+            content.topAnchor.constraint(equalTo: documentView.topAnchor),
+            content.bottomAnchor.constraint(equalTo: documentView.bottomAnchor),
+            content.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor)
+        ])
+
+        return scrollView
+    }
+
     private func makeGlassCard(containing content: NSView, insets: NSEdgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 10)) -> NSVisualEffectView {
         let card = NSVisualEffectView()
-        card.material = .underWindowBackground
+        card.material = .contentBackground
         card.blendingMode = .withinWindow
         card.state = .active
         card.wantsLayer = true
-        card.layer?.cornerRadius = 12
+        card.layer?.cornerRadius = 8
         card.layer?.masksToBounds = true
-        card.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.25).cgColor
+        card.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.18).cgColor
         card.layer?.borderWidth = 1
         card.translatesAutoresizingMaskIntoConstraints = false
+        applyFullWidthAlignment(to: card)
 
         content.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(content)
@@ -1536,6 +2980,11 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             content.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -insets.bottom)
         ])
         return card
+    }
+
+    private func applyFullWidthAlignment(to view: NSView) {
+        view.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        view.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
     }
 
     private func setStatus(_ text: String, error: Bool) {
@@ -1564,10 +3013,23 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     private func runAutoScan() {
         do {
             let windows = windowController.listWindows(onScreenOnly: true)
-            try zoneManager.applyForcedZones(windows: windows, mergeMode: mergeMode)
-            partitionState.zoneAssignmentsByWindowNumber = zoneManager.currentZoneAssignments(windows: windows, mergeMode: mergeMode)
+            let unconstrained = currentUnconstrainedWindowNumbers(in: windows)
+            partitionState.unconstrainedWindowNumbers = unconstrained
+            try zoneManager.applyForcedZones(
+                windows: windows,
+                mergeMode: mergeMode,
+                excludingWindowNumbers: unconstrained
+            )
+            partitionState.zoneAssignmentsByWindowNumber = zoneManager.currentZoneAssignments(
+                windows: windows,
+                mergeMode: mergeMode,
+                excludingWindowNumbers: unconstrained
+            )
             lastWindowFramesByNumber.removeAll()
             for window in windows {
+                if unconstrained.contains(window.windowNumber) {
+                    continue
+                }
                 lastWindowFramesByNumber[window.windowNumber] = window.frame.cgRect
             }
             partitionModelInitialized = true
@@ -1729,20 +3191,125 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
 }
 
 @MainActor
+private final class DisplayWakeButton: NSButton {
+    let display: LayoutDisplaySnapshot
+
+    init(display: LayoutDisplaySnapshot, isPreferred: Bool) {
+        self.display = display
+        super.init(frame: .zero)
+        title = isPreferred ? "屏幕 \(display.index + 1)\n默认" : "屏幕 \(display.index + 1)"
+        toolTip = "\(display.name) · displayId \(display.id)"
+        bezelStyle = .regularSquare
+        setButtonType(.momentaryPushIn)
+        alignment = .center
+        font = NSFont.systemFont(ofSize: 12, weight: isPreferred ? .semibold : .medium)
+        lineBreakMode = .byWordWrapping
+        wantsLayer = true
+        layer?.cornerRadius = 10
+        layer?.masksToBounds = true
+        contentTintColor = isPreferred ? .controlAccentColor : .labelColor
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+}
+
+@MainActor
+private final class DisplayWakeMapView: NSView {
+    let displays: [LayoutDisplaySnapshot]
+    let preferredDisplayId: UInt32?
+    var onSelect: ((LayoutDisplaySnapshot) -> Void)?
+
+    private var buttons: [DisplayWakeButton] = []
+
+    init(displays: [LayoutDisplaySnapshot], preferredDisplayId: UInt32?) {
+        self.displays = displays
+        self.preferredDisplayId = preferredDisplayId
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.cornerRadius = 16
+        layer?.masksToBounds = true
+        layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.045).cgColor
+        layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.22).cgColor
+        layer?.borderWidth = 1
+
+        for display in displays {
+            let button = DisplayWakeButton(display: display, isPreferred: display.id == preferredDisplayId)
+            button.target = self
+            button.action = #selector(selectDisplay(_:))
+            addSubview(button)
+            buttons.append(button)
+        }
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override var isFlipped: Bool { true }
+
+    override func layout() {
+        super.layout()
+        guard !displays.isEmpty else { return }
+
+        let frames = displays.map { $0.frame.cgRect }
+        let union = frames.reduce(frames[0]) { $0.union($1) }
+        guard union.width > 1, union.height > 1 else { return }
+
+        let canvas = bounds.insetBy(dx: 22, dy: 18)
+        let scale = min(canvas.width / union.width, canvas.height / union.height)
+        let contentSize = CGSize(width: union.width * scale, height: union.height * scale)
+        let origin = CGPoint(
+            x: canvas.midX - contentSize.width / 2,
+            y: canvas.midY - contentSize.height / 2
+        )
+
+        for (index, display) in displays.enumerated() {
+            let frame = display.frame.cgRect
+            let rect = NSRect(
+                x: origin.x + (frame.minX - union.minX) * scale,
+                y: origin.y + (frame.minY - union.minY) * scale,
+                width: max(92, frame.width * scale),
+                height: max(56, frame.height * scale)
+            )
+            buttons[index].frame = rect
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let guide = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 16, yRadius: 16)
+        NSColor.controlAccentColor.withAlphaComponent(0.05).setFill()
+        guide.fill()
+    }
+
+    @objc
+    private func selectDisplay(_ sender: DisplayWakeButton) {
+        onSelect?(sender.display)
+    }
+}
+
+@MainActor
 private final class LayoutNoteCardView: NSView {
-    let layout: DesktopLayout
+    static let cardSize = NSSize(width: 336, height: 236)
+
+    let desktopLayout: DesktopLayout
     var onSelect: ((String) -> Void)?
     var onApply: ((String) -> Void)?
+    var onDelete: ((String) -> Void)?
 
     private let selected: Bool
 
     init(layout: DesktopLayout, selected: Bool) {
-        self.layout = layout
+        self.desktopLayout = layout
         self.selected = selected
-        super.init(frame: NSRect(x: 0, y: 0, width: 210, height: 180))
+        super.init(frame: NSRect(origin: .zero, size: Self.cardSize))
         translatesAutoresizingMaskIntoConstraints = false
-        widthAnchor.constraint(equalToConstant: 210).isActive = true
-        heightAnchor.constraint(equalToConstant: 180).isActive = true
+        widthAnchor.constraint(equalToConstant: Self.cardSize.width).isActive = true
+        heightAnchor.constraint(equalToConstant: Self.cardSize.height).isActive = true
         wantsLayer = true
     }
 
@@ -1754,8 +3321,8 @@ private final class LayoutNoteCardView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
 
-        let bg = selected ? NSColor.systemYellow.withAlphaComponent(0.35) : NSColor.systemYellow.withAlphaComponent(0.2)
-        let border = selected ? NSColor.systemOrange : NSColor.systemYellow.withAlphaComponent(0.8)
+        let bg = selected ? NSColor.controlAccentColor.withAlphaComponent(0.16) : NSColor.labelColor.withAlphaComponent(0.045)
+        let border = selected ? NSColor.controlAccentColor.withAlphaComponent(0.78) : NSColor.separatorColor.withAlphaComponent(0.36)
 
         let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 10, yRadius: 10)
         bg.setFill()
@@ -1768,31 +3335,56 @@ private final class LayoutNoteCardView: NSView {
             .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
             .foregroundColor: NSColor.labelColor
         ]
-        layout.name.draw(in: NSRect(x: 10, y: bounds.height - 26, width: bounds.width - 20, height: 18), withAttributes: titleAttrs)
+        desktopLayout.name.draw(in: NSRect(x: 12, y: bounds.height - 28, width: bounds.width - 168, height: 18), withAttributes: titleAttrs)
 
         let subAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11, weight: .regular),
             .foregroundColor: NSColor.secondaryLabelColor
         ]
-        "\(layout.windows.count) 窗口 / \(layout.stacks.count) 堆叠".draw(
-            in: NSRect(x: 10, y: bounds.height - 44, width: bounds.width - 20, height: 16),
+        layoutSubtitle.draw(
+            in: NSRect(x: 12, y: bounds.height - 46, width: bounds.width - 24, height: 16),
             withAttributes: subAttrs
         )
 
-        let preview = NSRect(x: 10, y: 12, width: bounds.width - 20, height: bounds.height - 64)
-        drawPreview(in: preview)
+        drawWakePill(in: wakeActionRect)
+        drawDeletePill(in: deleteActionRect)
+
+        let miniMap = NSRect(x: 12, y: bounds.height - 102, width: 92, height: 48)
+        drawPreview(in: miniMap)
+
+        let displayAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10, weight: .medium),
+            .foregroundColor: NSColor.tertiaryLabelColor
+        ]
+        preferredDisplayText.draw(
+            in: NSRect(x: 114, y: bounds.height - 82, width: bounds.width - 126, height: 14),
+            withAttributes: displayAttrs
+        )
+        savedAtText.draw(
+            in: NSRect(x: 114, y: bounds.height - 100, width: bounds.width - 126, height: 14),
+            withAttributes: displayAttrs
+        )
+
+        drawWindowList(in: NSRect(x: 12, y: 12, width: bounds.width - 24, height: bounds.height - 124))
     }
 
     override func mouseDown(with event: NSEvent) {
-        onSelect?(layout.name)
-        if event.clickCount >= 2 {
-            onApply?(layout.name)
+        let point = convert(event.locationInWindow, from: nil)
+        if deleteActionRect.contains(point) {
+            onDelete?(desktopLayout.name)
+            return
         }
+        if wakeActionRect.contains(point) || event.clickCount >= 2 {
+            onApply?(desktopLayout.name)
+            return
+        }
+
+        onSelect?(desktopLayout.name)
     }
 
     private func drawPreview(in rect: NSRect) {
         let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
-        NSColor.white.withAlphaComponent(0.75).setFill()
+        NSColor.textBackgroundColor.withAlphaComponent(0.72).setFill()
         path.fill()
 
         let linePath = NSBezierPath()
@@ -1811,9 +3403,155 @@ private final class LayoutNoteCardView: NSView {
         }
     }
 
+    private func drawWakePill(in rect: NSRect) {
+        let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
+        NSColor.controlAccentColor.withAlphaComponent(selected ? 0.28 : 0.18).setFill()
+        path.fill()
+        NSColor.controlAccentColor.withAlphaComponent(0.42).setStroke()
+        path.lineWidth = 1
+        path.stroke()
+
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+            .foregroundColor: NSColor.controlAccentColor
+        ]
+        "唤醒".draw(in: rect.insetBy(dx: 12, dy: 5), withAttributes: attrs)
+    }
+
+    private func drawDeletePill(in rect: NSRect) {
+        let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
+        NSColor.systemRed.withAlphaComponent(selected ? 0.18 : 0.10).setFill()
+        path.fill()
+        NSColor.systemRed.withAlphaComponent(0.28).setStroke()
+        path.lineWidth = 1
+        path.stroke()
+
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+            .foregroundColor: NSColor.systemRed.withAlphaComponent(0.86)
+        ]
+        "删除".draw(in: rect.insetBy(dx: 12, dy: 5), withAttributes: attrs)
+    }
+
+    private func drawWindowList(in rect: NSRect) {
+        let windows = previewWindows
+        guard !windows.isEmpty else {
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+                .foregroundColor: NSColor.tertiaryLabelColor
+            ]
+            "这个布局没有保存可显示的窗口".draw(in: rect, withAttributes: attrs)
+            return
+        }
+
+        let visibleRows = Array(windows.prefix(4))
+        for (index, window) in visibleRows.enumerated() {
+            let rowTop = rect.maxY - CGFloat(index + 1) * 35
+            let row = NSRect(x: rect.minX, y: rowTop, width: rect.width, height: 30)
+            drawWindowRow(window, in: row)
+        }
+
+        let hiddenCount = windows.count - visibleRows.count
+        if hiddenCount > 0 {
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 10, weight: .medium),
+                .foregroundColor: NSColor.tertiaryLabelColor
+            ]
+            "+\(hiddenCount) 个窗口".draw(
+                in: NSRect(x: rect.minX + 2, y: rect.minY, width: rect.width - 4, height: 14),
+                withAttributes: attrs
+            )
+        }
+    }
+
+    private func drawWindowRow(_ window: LayoutWindow, in rect: NSRect) {
+        let bgPath = NSBezierPath(roundedRect: rect, xRadius: 7, yRadius: 7)
+        NSColor.labelColor.withAlphaComponent(0.035).setFill()
+        bgPath.fill()
+
+        let iconRect = NSRect(x: rect.minX + 6, y: rect.minY + 5, width: 20, height: 20)
+        if let icon = icon(for: window) {
+            icon.draw(in: iconRect)
+        } else {
+            let dot = NSBezierPath(roundedRect: iconRect, xRadius: 5, yRadius: 5)
+            NSColor.controlAccentColor.withAlphaComponent(0.22).setFill()
+            dot.fill()
+            let initial = String(window.appName.prefix(1))
+            initial.draw(in: iconRect.insetBy(dx: 5, dy: 3), withAttributes: [
+                .font: NSFont.systemFont(ofSize: 10, weight: .bold),
+                .foregroundColor: NSColor.controlAccentColor
+            ])
+        }
+
+        let title = window.title.isEmpty ? window.appName : window.title
+        let detailParts = [
+            window.appName,
+            window.zoneName.map { "块：\($0)" },
+            window.browserURL.flatMap { URL(string: $0)?.host ?? $0 }
+        ].compactMap { $0 }
+
+        title.draw(
+            in: NSRect(x: rect.minX + 34, y: rect.minY + 14, width: rect.width - 42, height: 13),
+            withAttributes: [
+                .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                .foregroundColor: NSColor.labelColor
+            ]
+        )
+        detailParts.joined(separator: " · ").draw(
+            in: NSRect(x: rect.minX + 34, y: rect.minY + 3, width: rect.width - 42, height: 11),
+            withAttributes: [
+                .font: NSFont.systemFont(ofSize: 9, weight: .regular),
+                .foregroundColor: NSColor.secondaryLabelColor
+            ]
+        )
+    }
+
+    private var wakeActionRect: NSRect {
+        NSRect(x: bounds.width - 72, y: bounds.height - 34, width: 60, height: 24)
+    }
+
+    private var deleteActionRect: NSRect {
+        NSRect(x: bounds.width - 138, y: bounds.height - 34, width: 60, height: 24)
+    }
+
+    private var layoutSubtitle: String {
+        "\(previewWindows.count) 窗口 / \(desktopLayout.stacks.count) 堆叠"
+    }
+
+    private var preferredDisplayText: String {
+        desktopLayout.preferredDisplay.map { "默认屏幕：\($0.name)" } ?? "默认屏幕：未记录"
+    }
+
+    private var savedAtText: String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MM-dd HH:mm"
+        return "保存于 \(formatter.string(from: desktopLayout.createdAt))"
+    }
+
+    private var previewWindows: [LayoutWindow] {
+        var seen = Set<String>()
+        let combined = desktopLayout.windows + desktopLayout.stacks.flatMap(\.windows)
+        return combined.filter { window in
+            let key = "\(window.bundleId)|\(window.title)|\(window.frame.x)|\(window.frame.y)"
+            guard !seen.contains(key) else { return false }
+            seen.insert(key)
+            return true
+        }
+    }
+
+    private func icon(for window: LayoutWindow) -> NSImage? {
+        if let iconPath = window.iconPath, let image = NSImage(contentsOfFile: iconPath) {
+            return image
+        }
+        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: window.bundleId) {
+            return NSWorkspace.shared.icon(forFile: appURL.path)
+        }
+        return nil
+    }
+
     private func occupiedQuadrants() -> Set<Int> {
         var result: Set<Int> = []
-        let allFrames = layout.windows.map(\.frame.cgRect) + layout.stacks.map(\.frame.cgRect)
+        let allFrames = previewWindows.map(\.frame.cgRect) + desktopLayout.stacks.map(\.frame.cgRect)
         for frame in allFrames {
             let mid = CGPoint(x: frame.midX, y: frame.midY)
             let horizontal = mid.x >= 0 ? 1 : 0
@@ -1838,17 +3576,17 @@ private final class LayoutNoteCardView: NSView {
 @MainActor
 private final class DesktopContainerView: NSView {
     private struct Section {
+        var zoneName: String
         var title: String
         var frame: CGRect
         var isBucket: Bool
-        var tabs: [String]
-        var activeTabIndex: Int
         var windows: [WindowInfo]
     }
 
-    private struct TabHitArea {
+    private struct WindowHitArea {
         var rect: CGRect
-        var index: Int
+        var window: WindowInfo
+        var sourceZoneName: String
     }
 
     private enum Quadrant: CaseIterable {
@@ -1860,22 +3598,33 @@ private final class DesktopContainerView: NSView {
 
     private enum DragAxis { case horizontal, vertical, both }
 
+    private struct PreviewDivider {
+        let isVertical: Bool
+        let start: NSPoint
+        let end: NSPoint
+        let center: NSPoint
+    }
+
     private let displayFrame: CGRect
     private var sections: [Section] = []
-    private var tabHitAreas: [TabHitArea] = []
+    private var windowHitAreas: [WindowHitArea] = []
     private var cachedWindows: [WindowInfo] = []
     private var cachedLeftBucket: WindowStack?
     private var cachedLeftBucketEnabled = true
-    var onBucketTabSelected: ((Int) -> Void)?
     var onSplitChanged: ((CGFloat, CGFloat, Bool) -> Void)?
+    var onWindowDroppedIntoZone: ((WindowInfo, String) -> Void)?
 
     // Split ratios (0~1), default 0.5
     var splitX: CGFloat = 0.5
     var splitY: CGFloat = 0.5
 
     private var draggingAxis: DragAxis?
+    private var draggingWindow: WindowInfo?
+    private var draggingSourceZoneName: String?
+    private var dragLocation: NSPoint?
+    private var dragTargetZoneName: String?
     private let dividerHitWidth: CGFloat = 20
-    private let dividerBarWidth: CGFloat = 6
+    private let previewZoneGap: CGFloat = 8
     private var currentMergeMode: DesktopMergeMode = .leftColumn
 
     init(displayFrame: CGRect) {
@@ -1917,78 +3666,81 @@ private final class DesktopContainerView: NSView {
         let map = Dictionary(grouping: cachedWindows) { classify(window: $0) }
         sections = buildSections(for: currentMergeMode).map { descriptor in
             let sectionWindows = descriptor.quadrants.flatMap { map[$0] ?? [] }
-            if descriptor.isLeftArea, cachedLeftBucketEnabled {
-                let tabs = cachedLeftBucket?.windows.map { $0.title.isEmpty ? $0.bundleId : $0.title } ?? []
-                let activeTabIndex = cachedLeftBucket?.activeIndex ?? 0
+            if descriptor.isLeftArea, hasVisibleLeftBucket {
                 return Section(
+                    zoneName: descriptor.zoneName,
                     title: descriptor.title + "（标签桶）",
                     frame: descriptor.frame,
                     isBucket: true,
-                    tabs: tabs,
-                    activeTabIndex: activeTabIndex,
-                    windows: sectionWindows
+                    windows: visibleLeftBucketWindows.isEmpty ? sectionWindows : visibleLeftBucketWindows
                 )
             }
 
             return Section(
+                zoneName: descriptor.zoneName,
                 title: descriptor.title,
                 frame: descriptor.frame,
                 isBucket: false,
-                tabs: [],
-                activeTabIndex: 0,
                 windows: sectionWindows
             )
+        }
+    }
+
+    private var hasVisibleLeftBucket: Bool {
+        cachedLeftBucketEnabled && !(cachedLeftBucket?.windows.isEmpty ?? true)
+    }
+
+    private var visibleLeftBucketWindows: [WindowInfo] {
+        guard let bucket = cachedLeftBucket else { return [] }
+        return bucket.windows.compactMap { identity in
+            if let windowNumber = identity.windowNumber,
+               let exact = cachedWindows.first(where: { $0.windowNumber == windowNumber }) {
+                return exact
+            }
+            if !identity.title.isEmpty,
+               let titled = cachedWindows.first(where: { $0.bundleId == identity.bundleId && $0.title == identity.title }) {
+                return titled
+            }
+            return cachedWindows.first(where: { $0.bundleId == identity.bundleId })
         }
     }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         drawCanvasBackground()
-        tabHitAreas.removeAll()
+        windowHitAreas.removeAll()
         for section in sections {
-            tabHitAreas.append(contentsOf: drawSection(section))
+            drawSection(section)
         }
 
-        // Draw divider lines
+        drawPreviewDividers()
+        drawDraggedWindowGhost()
+    }
+
+    private func drawPreviewDividers() {
         guard let inset = sanitizedInsetBounds() else { return }
-        let xDivider = inset.minX + inset.width * splitX
-        let yDivider = inset.minY + inset.height * splitY
-
-        if modeUsesVerticalDivider(currentMergeMode) {
-            let vRect = NSRect(
-                x: xDivider - dividerBarWidth / 2,
-                y: inset.minY,
-                width: dividerBarWidth,
-                height: inset.height
-            )
-            if let safeVRect = safeRect(vRect, minWidth: 2, minHeight: 2) {
-                let vBar = NSBezierPath(roundedRect: safeVRect, xRadius: 3, yRadius: 3)
-                NSColor.white.withAlphaComponent(0.36).setFill()
-                vBar.fill()
-                NSColor.systemBlue.withAlphaComponent(0.18).setStroke()
-                vBar.lineWidth = 1
-                vBar.stroke()
-                drawSplitHandle(at: NSPoint(x: xDivider, y: inset.midY), vertical: true)
-            }
+        for divider in previewDividers(in: inset) {
+            drawSplitHandle(at: divider.center, vertical: divider.isVertical)
         }
+    }
 
-        if modeUsesHorizontalDivider(currentMergeMode) {
-            let hRect = NSRect(
-                x: inset.minX,
-                y: yDivider - dividerBarWidth / 2,
-                width: inset.width,
-                height: dividerBarWidth
-            )
-            if let safeHRect = safeRect(hRect, minWidth: 2, minHeight: 2) {
-                let hBar = NSBezierPath(roundedRect: safeHRect, xRadius: 3, yRadius: 3)
-                NSColor.white.withAlphaComponent(0.36).setFill()
-                hBar.fill()
-                NSColor.systemBlue.withAlphaComponent(0.18).setStroke()
-                hBar.lineWidth = 1
-                hBar.stroke()
-                drawSplitHandle(at: NSPoint(x: inset.midX, y: yDivider), vertical: false)
-            }
-        }
+    private func drawDraggedWindowGhost() {
+        guard let draggingWindow, let dragLocation else { return }
+        let label = draggingWindow.title.isEmpty ? draggingWindow.appName : "\(draggingWindow.appName) - \(draggingWindow.title)"
+        let width = min(max(CGFloat(label.count) * 6.8 + 24, 140), 260)
+        let rect = NSRect(x: dragLocation.x + 12, y: dragLocation.y - 12, width: width, height: 24)
+        guard let safe = safeRect(rect, minWidth: 80, minHeight: 16) else { return }
+        let path = NSBezierPath(roundedRect: safe, xRadius: 7, yRadius: 7)
+        NSColor.controlAccentColor.withAlphaComponent(0.18).setFill()
+        path.fill()
+        NSColor.controlAccentColor.withAlphaComponent(0.72).setStroke()
+        path.lineWidth = 1.2
+        path.stroke()
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+            .foregroundColor: NSColor.labelColor
+        ]
+        label.draw(in: safe.insetBy(dx: 8, dy: 5), withAttributes: attrs)
     }
 
     /// macOS-style draggable handle: small white pill with shadow at the divider center.
@@ -2061,9 +3813,12 @@ private final class DesktopContainerView: NSView {
     override func mouseDown(with event: NSEvent) {
         let location = convert(event.locationInWindow, from: nil)
 
-        // Check tab hits first
-        if let hitArea = tabHitAreas.first(where: { $0.rect.contains(location) }) {
-            onBucketTabSelected?(hitArea.index)
+        if let hitArea = windowHitAreas.first(where: { $0.rect.contains(location) }) {
+            draggingWindow = hitArea.window
+            draggingSourceZoneName = hitArea.sourceZoneName
+            dragLocation = location
+            dragTargetZoneName = hitArea.sourceZoneName
+            needsDisplay = true
             return
         }
 
@@ -2073,7 +3828,7 @@ private final class DesktopContainerView: NSView {
             return
         }
         let xDivider = inset.minX + inset.width * splitX
-        let yDivider = inset.minY + inset.height * splitY
+        let yDivider = visualYDivider(in: inset)
 
         let hitX = modeUsesVerticalDivider(currentMergeMode) && abs(location.x - xDivider) < dividerHitWidth
         let hitY = modeUsesHorizontalDivider(currentMergeMode) && abs(location.y - yDivider) < dividerHitWidth
@@ -2091,6 +3846,14 @@ private final class DesktopContainerView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if draggingWindow != nil {
+            let location = convert(event.locationInWindow, from: nil)
+            dragLocation = location
+            dragTargetZoneName = section(at: location)?.zoneName
+            needsDisplay = true
+            return
+        }
+
         guard let axis = draggingAxis else {
             super.mouseDragged(with: event)
             return
@@ -2108,7 +3871,7 @@ private final class DesktopContainerView: NSView {
         }
 
         if axis == .vertical || axis == .both {
-            let newY = (location.y - inset.minY) / max(inset.height, 1)
+            let newY = 1.0 - ((location.y - inset.minY) / max(inset.height, 1))
             splitY = clampSplit(newY)
         }
 
@@ -2118,6 +3881,20 @@ private final class DesktopContainerView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if let draggingWindow {
+            let targetZoneName = dragTargetZoneName
+            let sourceZoneName = draggingSourceZoneName
+            self.draggingWindow = nil
+            draggingSourceZoneName = nil
+            dragLocation = nil
+            dragTargetZoneName = nil
+            needsDisplay = true
+            if let targetZoneName, targetZoneName != sourceZoneName {
+                onWindowDroppedIntoZone?(draggingWindow, targetZoneName)
+            }
+            return
+        }
+
         if draggingAxis != nil {
             onSplitChanged?(splitX, splitY, true)
         }
@@ -2130,7 +3907,7 @@ private final class DesktopContainerView: NSView {
 
         guard let inset = sanitizedInsetBounds() else { return }
         let xDivider = inset.minX + inset.width * splitX
-        let yDivider = inset.minY + inset.height * splitY
+        let yDivider = visualYDivider(in: inset)
 
         // Horizontal divider cursor
         if modeUsesVerticalDivider(currentMergeMode) {
@@ -2155,9 +3932,10 @@ private final class DesktopContainerView: NSView {
         }
     }
 
-    private func drawSection(_ section: Section) -> [TabHitArea] {
-        guard let sectionRect = safeRect(section.frame, minWidth: 6, minHeight: 6) else { return [] }
+    private func drawSection(_ section: Section) {
+        guard let sectionRect = safeRect(section.frame, minWidth: 6, minHeight: 6) else { return }
         let path = NSBezierPath(roundedRect: sectionRect, xRadius: 10, yRadius: 10)
+        let isDropTarget = draggingWindow != nil && dragTargetZoneName == section.zoneName
         let shadow = NSShadow()
         shadow.shadowColor = NSColor.black.withAlphaComponent(0.08)
         shadow.shadowOffset = NSSize(width: 0, height: -1)
@@ -2165,10 +3943,10 @@ private final class DesktopContainerView: NSView {
         shadow.set()
 
         let fillGradient: NSGradient?
-        if section.isBucket {
+        if isDropTarget {
             fillGradient = NSGradient(colors: [
-                NSColor.systemBlue.withAlphaComponent(0.28),
-                NSColor.systemCyan.withAlphaComponent(0.2)
+                NSColor.controlAccentColor.withAlphaComponent(0.22),
+                NSColor.controlAccentColor.withAlphaComponent(0.08)
             ])
         } else {
             fillGradient = NSGradient(colors: [
@@ -2180,108 +3958,56 @@ private final class DesktopContainerView: NSView {
         NSGraphicsContext.current?.saveGraphicsState()
         NSShadow().set()
 
-        (section.isBucket ? NSColor.systemBlue.withAlphaComponent(0.72) : NSColor.systemGray.withAlphaComponent(0.40)).setStroke()
-        path.lineWidth = 1.5
+        (isDropTarget ? NSColor.controlAccentColor.withAlphaComponent(0.80) : NSColor.systemGray.withAlphaComponent(0.40)).setStroke()
+        path.lineWidth = isDropTarget ? 2 : 1.5
         path.stroke()
         NSGraphicsContext.current?.restoreGraphicsState()
 
         let titleAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
-            .foregroundColor: section.isBucket ? NSColor.systemBlue : NSColor.labelColor
+            .foregroundColor: NSColor.labelColor
         ]
         section.title.draw(
             in: NSRect(x: sectionRect.minX + 10, y: sectionRect.maxY - 24, width: sectionRect.width - 20, height: 16),
             withAttributes: titleAttrs
         )
 
-        if section.isBucket {
-            return drawTabs(
-                section.tabs,
-                activeIndex: section.activeTabIndex,
-                in: sectionRect.insetBy(dx: 8, dy: 28)
-            )
-        } else {
-            drawStackList(section.windows, in: sectionRect.insetBy(dx: 10, dy: 28))
-            return []
-        }
+        windowHitAreas.append(contentsOf: drawStackList(
+            section.windows,
+            in: sectionRect.insetBy(dx: 10, dy: 28),
+            zoneName: section.zoneName
+        ))
     }
 
-    private func drawTabs(_ tabs: [String], activeIndex: Int, in rect: CGRect) -> [TabHitArea] {
-        guard let safeArea = safeRect(rect, minWidth: 12, minHeight: 18) else { return [] }
-        var hitAreas: [TabHitArea] = []
-        if let tabBarRect = safeRect(CGRect(x: safeArea.minX, y: safeArea.maxY - 30, width: safeArea.width, height: 24), minWidth: 12, minHeight: 8) {
-            let bar = NSBezierPath(roundedRect: tabBarRect, xRadius: 6, yRadius: 6)
-            NSColor.systemBlue.withAlphaComponent(0.12).setFill()
-            bar.fill()
-        }
-
-        if tabs.isEmpty {
-            drawPlaceholder("空桶（点击“加入左桶”或将窗口平铺到左侧）", in: safeArea.insetBy(dx: 4, dy: 6))
-            return hitAreas
-        }
-
-        let safeActiveIndex = min(max(activeIndex, 0), tabs.count - 1)
-        var x = safeArea.minX
-        let topY = safeArea.maxY - 30
-        for (index, tab) in tabs.prefix(6).enumerated() {
-            let label = "\(index + 1). \(tab)"
-            let preferredWidth = min(140, max(80, CGFloat(label.count) * 7.2))
-            let remainingWidth = safeArea.maxX - x
-            if remainingWidth < 56 { break }
-
-            guard let tabRect = safeRect(
-                CGRect(x: x, y: topY, width: min(preferredWidth, remainingWidth), height: 22),
-                minWidth: 48,
-                minHeight: 10
-            ) else { break }
-
-            let p = NSBezierPath(roundedRect: tabRect, xRadius: 6, yRadius: 6)
-            let isActive = index == safeActiveIndex
-            (isActive ? NSColor.systemBlue.withAlphaComponent(0.62) : NSColor.systemBlue.withAlphaComponent(0.24)).setFill()
-            p.fill()
-            NSColor.systemBlue.withAlphaComponent(0.75).setStroke()
-            p.lineWidth = 1
-            p.stroke()
-
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 11, weight: .medium),
-                .foregroundColor: NSColor.labelColor
-            ]
-            label.draw(in: tabRect.insetBy(dx: 8, dy: 4), withAttributes: attrs)
-            hitAreas.append(TabHitArea(rect: tabRect, index: index))
-            x = tabRect.maxX + 6
-            if x > safeArea.maxX - 42 { break }
-        }
-
-        let infoAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 11, weight: .regular),
-            .foregroundColor: NSColor.secondaryLabelColor
-        ]
-        let activeTitle = tabs[safeActiveIndex]
-        "当前标签：\(activeTitle)（点击上方标签切换）".draw(
-            in: NSRect(x: safeArea.minX + 2, y: safeArea.maxY - 52, width: safeArea.width - 6, height: 16),
-            withAttributes: infoAttrs
-        )
-        return hitAreas
-    }
-
-    private func drawStackList(_ windows: [WindowInfo], in rect: CGRect) {
-        guard let safeArea = safeRect(rect, minWidth: 8, minHeight: 8) else { return }
+    private func drawStackList(_ windows: [WindowInfo], in rect: CGRect, zoneName: String) -> [WindowHitArea] {
+        guard let safeArea = safeRect(rect, minWidth: 8, minHeight: 8) else { return [] }
         if windows.isEmpty {
             drawPlaceholder("空区域", in: safeArea)
-            return
+            return []
         }
+        var hitAreas: [WindowHitArea] = []
         let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 11, weight: .regular),
-            .foregroundColor: NSColor.secondaryLabelColor
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: NSColor.labelColor
         ]
-        var y = safeArea.maxY - 20
+        var y = safeArea.maxY - 22
         for window in windows.prefix(8) {
             let title = window.title.isEmpty ? window.appName : "\(window.appName) - \(window.title)"
-            title.draw(in: NSRect(x: safeArea.minX, y: y, width: safeArea.width - 4, height: 14), withAttributes: attrs)
-            y -= 15
+            let rect = NSRect(x: safeArea.minX, y: y, width: safeArea.width - 4, height: 20)
+            if let safeRect = safeRect(rect, minWidth: 40, minHeight: 12) {
+                let pill = NSBezierPath(roundedRect: safeRect, xRadius: 5, yRadius: 5)
+                NSColor.labelColor.withAlphaComponent(0.05).setFill()
+                pill.fill()
+                NSColor.separatorColor.withAlphaComponent(0.22).setStroke()
+                pill.lineWidth = 1
+                pill.stroke()
+                title.draw(in: safeRect.insetBy(dx: 7, dy: 3), withAttributes: attrs)
+                hitAreas.append(WindowHitArea(rect: safeRect, window: window, sourceZoneName: zoneName))
+            }
+            y -= 23
             if y < safeArea.minY { break }
         }
+        return hitAreas
     }
 
     private func drawPlaceholder(_ text: String, in rect: CGRect) {
@@ -2304,7 +4030,7 @@ private final class DesktopContainerView: NSView {
         let xMid = displayFrame.midX
         let yMid = displayFrame.midY
         let isRight = center.x >= xMid
-        let isTop = center.y >= yMid
+        let isTop = center.y < yMid
 
         switch (isTop, isRight) {
         case (true, false): return .tl
@@ -2314,13 +4040,12 @@ private final class DesktopContainerView: NSView {
         }
     }
 
-    private func buildSections(for mode: DesktopMergeMode) -> [(title: String, frame: CGRect, quadrants: [Quadrant], isLeftArea: Bool)] {
+    private func buildSections(for mode: DesktopMergeMode) -> [(zoneName: String, title: String, frame: CGRect, quadrants: [Quadrant], isLeftArea: Bool)] {
         guard let inset = sanitizedInsetBounds() else { return [] }
 
         let safeSplitX = clampSplit(splitX)
-        let safeSplitY = clampSplit(splitY)
         let xSplit = inset.minX + inset.width * safeSplitX
-        let ySplit = inset.minY + inset.height * safeSplitY
+        let ySplit = visualYDivider(in: inset)
 
         let leftW = xSplit - inset.minX
         let rightW = inset.maxX - xSplit
@@ -2331,76 +4056,129 @@ private final class DesktopContainerView: NSView {
         let tr = CGRect(x: xSplit, y: ySplit, width: rightW, height: topH)
         let bl = CGRect(x: inset.minX, y: inset.minY, width: leftW, height: bottomH)
         let br = CGRect(x: xSplit, y: inset.minY, width: rightW, height: bottomH)
+        let gap = previewZoneGap
+
+        func insetTL(_ rect: CGRect) -> CGRect {
+            previewZoneRect(CGRect(
+                x: rect.minX,
+                y: rect.minY + gap / 2,
+                width: max(40, rect.width - gap / 2),
+                height: max(40, rect.height - gap / 2)
+            ))
+        }
+
+        func insetTR(_ rect: CGRect) -> CGRect {
+            previewZoneRect(CGRect(
+                x: rect.minX + gap / 2,
+                y: rect.minY + gap / 2,
+                width: max(40, rect.width - gap / 2),
+                height: max(40, rect.height - gap / 2)
+            ))
+        }
+
+        func insetBL(_ rect: CGRect) -> CGRect {
+            previewZoneRect(CGRect(
+                x: rect.minX,
+                y: rect.minY,
+                width: max(40, rect.width - gap / 2),
+                height: max(40, rect.height - gap / 2)
+            ))
+        }
+
+        func insetBR(_ rect: CGRect) -> CGRect {
+            previewZoneRect(CGRect(
+                x: rect.minX + gap / 2,
+                y: rect.minY,
+                width: max(40, rect.width - gap / 2),
+                height: max(40, rect.height - gap / 2)
+            ))
+        }
+
+        func insetLeftHalf(_ rect: CGRect) -> CGRect {
+            previewZoneRect(CGRect(x: rect.minX, y: rect.minY, width: max(40, rect.width - gap / 2), height: rect.height))
+        }
+
+        func insetRightHalf(_ rect: CGRect) -> CGRect {
+            previewZoneRect(CGRect(x: rect.minX + gap / 2, y: rect.minY, width: max(40, rect.width - gap / 2), height: rect.height))
+        }
+
+        func insetTopHalf(_ rect: CGRect) -> CGRect {
+            previewZoneRect(CGRect(x: rect.minX, y: rect.minY + gap / 2, width: rect.width, height: max(40, rect.height - gap / 2)))
+        }
+
+        func insetBottomHalf(_ rect: CGRect) -> CGRect {
+            previewZoneRect(CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: max(40, rect.height - gap / 2)))
+        }
 
         switch mode {
         case .grid:
             return [
-                ("左上", tl, [.tl], true),
-                ("右上", tr, [.tr], false),
-                ("左下", bl, [.bl], true),
-                ("右下", br, [.br], false)
+                ("top-left", "左上", insetTL(tl), [.tl], true),
+                ("top-right", "右上", insetTR(tr), [.tr], false),
+                ("bottom-left", "左下", insetBL(bl), [.bl], true),
+                ("bottom-right", "右下", insetBR(br), [.br], false)
             ]
         case .leftColumn:
             let left = CGRect(x: inset.minX, y: inset.minY, width: leftW, height: inset.height)
             return [
-                ("左侧大块", left, [.tl, .bl], true),
-                ("右上", tr, [.tr], false),
-                ("右下", br, [.br], false)
+                ("left", "左侧大块", insetLeftHalf(left), [.tl, .bl], true),
+                ("top-right", "右上", insetTR(tr), [.tr], false),
+                ("bottom-right", "右下", insetBR(br), [.br], false)
             ]
         case .rightColumn:
             let right = CGRect(x: xSplit, y: inset.minY, width: rightW, height: inset.height)
             return [
-                ("左上", tl, [.tl], true),
-                ("左下", bl, [.bl], true),
-                ("右侧大块", right, [.tr, .br], false)
+                ("top-left", "左上", insetTL(tl), [.tl], true),
+                ("bottom-left", "左下", insetBL(bl), [.bl], true),
+                ("right", "右侧大块", insetRightHalf(right), [.tr, .br], false)
             ]
         case .topRow:
             let top = CGRect(x: inset.minX, y: ySplit, width: inset.width, height: topH)
             return [
-                ("上方大块", top, [.tl, .tr], true),
-                ("左下", bl, [.bl], true),
-                ("右下", br, [.br], false)
+                ("top", "上方大块", insetTopHalf(top), [.tl, .tr], true),
+                ("bottom-left", "左下", insetBL(bl), [.bl], true),
+                ("bottom-right", "右下", insetBR(br), [.br], false)
             ]
         case .bottomRow:
             let bottom = CGRect(x: inset.minX, y: inset.minY, width: inset.width, height: bottomH)
             return [
-                ("左上", tl, [.tl], true),
-                ("右上", tr, [.tr], false),
-                ("下方大块", bottom, [.bl, .br], true)
+                ("top-left", "左上", insetTL(tl), [.tl], true),
+                ("top-right", "右上", insetTR(tr), [.tr], false),
+                ("bottom", "下方大块", insetBottomHalf(bottom), [.bl, .br], true)
             ]
         case .leftRight:
             let left = CGRect(x: inset.minX, y: inset.minY, width: leftW, height: inset.height)
             let right = CGRect(x: xSplit, y: inset.minY, width: rightW, height: inset.height)
             return [
-                ("左侧", left, [.tl, .bl], true),
-                ("右侧", right, [.tr, .br], false)
+                ("left", "左侧", insetLeftHalf(left), [.tl, .bl], true),
+                ("right", "右侧", insetRightHalf(right), [.tr, .br], false)
             ]
         case .topBottom:
             let top = CGRect(x: inset.minX, y: ySplit, width: inset.width, height: topH)
             let bottom = CGRect(x: inset.minX, y: inset.minY, width: inset.width, height: bottomH)
             return [
-                ("上方", top, [.tl, .tr], true),
-                ("下方", bottom, [.bl, .br], false)
+                ("top", "上方", insetTopHalf(top), [.tl, .tr], true),
+                ("bottom", "下方", insetBottomHalf(bottom), [.bl, .br], false)
             ]
         case .threeColumns:
             let thirdW = inset.width / 3
-            let c1 = CGRect(x: inset.minX, y: inset.minY, width: thirdW, height: inset.height)
-            let c2 = CGRect(x: inset.minX + thirdW, y: inset.minY, width: thirdW, height: inset.height)
-            let c3 = CGRect(x: inset.minX + thirdW * 2, y: inset.minY, width: thirdW, height: inset.height)
+            let c1 = previewZoneRect(CGRect(x: inset.minX, y: inset.minY, width: max(40, thirdW - gap / 2), height: inset.height))
+            let c2 = previewZoneRect(CGRect(x: inset.minX + thirdW + gap / 2, y: inset.minY, width: max(40, thirdW - gap), height: inset.height))
+            let c3 = previewZoneRect(CGRect(x: inset.minX + thirdW * 2 + gap / 2, y: inset.minY, width: max(40, thirdW - gap / 2), height: inset.height))
             return [
-                ("左列", c1, [.tl, .bl], true),
-                ("中列", c2, [.tl, .bl, .tr, .br], false),
-                ("右列", c3, [.tr, .br], false)
+                ("col-left", "左列", c1, [.tl, .bl], true),
+                ("col-center", "中列", c2, [.tl, .bl, .tr, .br], false),
+                ("col-right", "右列", c3, [.tr, .br], false)
             ]
         case .threeRows:
             let thirdH = inset.height / 3
-            let r1 = CGRect(x: inset.minX, y: inset.minY + thirdH * 2, width: inset.width, height: thirdH)
-            let r2 = CGRect(x: inset.minX, y: inset.minY + thirdH, width: inset.width, height: thirdH)
-            let r3 = CGRect(x: inset.minX, y: inset.minY, width: inset.width, height: thirdH)
+            let r1 = previewZoneRect(CGRect(x: inset.minX, y: inset.minY + thirdH * 2 + gap / 2, width: inset.width, height: max(40, thirdH - gap / 2)))
+            let r2 = previewZoneRect(CGRect(x: inset.minX, y: inset.minY + thirdH + gap / 2, width: inset.width, height: max(40, thirdH - gap)))
+            let r3 = previewZoneRect(CGRect(x: inset.minX, y: inset.minY, width: inset.width, height: max(40, thirdH - gap / 2)))
             return [
-                ("上行", r1, [.tl, .tr], true),
-                ("中行", r2, [.tl, .tr, .bl, .br], false),
-                ("下行", r3, [.bl, .br], false)
+                ("row-top", "上行", r1, [.tl, .tr], true),
+                ("row-center", "中行", r2, [.tl, .tr, .bl, .br], false),
+                ("row-bottom", "下行", r3, [.bl, .br], false)
             ]
         }
     }
@@ -2421,6 +4199,91 @@ private final class DesktopContainerView: NSView {
         default:
             return false
         }
+    }
+
+    private func visualYDivider(in inset: CGRect) -> CGFloat {
+        inset.minY + inset.height * (1.0 - clampSplit(splitY))
+    }
+
+    private func previewDividers(in inset: CGRect) -> [PreviewDivider] {
+        let xDivider = inset.minX + inset.width * clampSplit(splitX)
+        let yDivider = visualYDivider(in: inset)
+
+        switch currentMergeMode {
+        case .leftRight:
+            return [PreviewDivider(isVertical: true, start: NSPoint(x: xDivider, y: inset.minY), end: NSPoint(x: xDivider, y: inset.maxY), center: NSPoint(x: xDivider, y: inset.midY))]
+        case .topBottom:
+            return [PreviewDivider(isVertical: false, start: NSPoint(x: inset.minX, y: yDivider), end: NSPoint(x: inset.maxX, y: yDivider), center: NSPoint(x: inset.midX, y: yDivider))]
+        case .leftColumn:
+            return [
+                PreviewDivider(isVertical: true, start: NSPoint(x: xDivider, y: inset.minY), end: NSPoint(x: xDivider, y: inset.maxY), center: NSPoint(x: xDivider, y: inset.midY)),
+                PreviewDivider(isVertical: false, start: NSPoint(x: xDivider, y: yDivider), end: NSPoint(x: inset.maxX, y: yDivider), center: NSPoint(x: (xDivider + inset.maxX) / 2, y: yDivider))
+            ]
+        case .rightColumn:
+            return [
+                PreviewDivider(isVertical: true, start: NSPoint(x: xDivider, y: inset.minY), end: NSPoint(x: xDivider, y: inset.maxY), center: NSPoint(x: xDivider, y: inset.midY)),
+                PreviewDivider(isVertical: false, start: NSPoint(x: inset.minX, y: yDivider), end: NSPoint(x: xDivider, y: yDivider), center: NSPoint(x: (inset.minX + xDivider) / 2, y: yDivider))
+            ]
+        case .topRow:
+            return [
+                PreviewDivider(isVertical: false, start: NSPoint(x: inset.minX, y: yDivider), end: NSPoint(x: inset.maxX, y: yDivider), center: NSPoint(x: inset.midX, y: yDivider)),
+                PreviewDivider(isVertical: true, start: NSPoint(x: xDivider, y: inset.minY), end: NSPoint(x: xDivider, y: yDivider), center: NSPoint(x: xDivider, y: (inset.minY + yDivider) / 2))
+            ]
+        case .bottomRow:
+            return [
+                PreviewDivider(isVertical: false, start: NSPoint(x: inset.minX, y: yDivider), end: NSPoint(x: inset.maxX, y: yDivider), center: NSPoint(x: inset.midX, y: yDivider)),
+                PreviewDivider(isVertical: true, start: NSPoint(x: xDivider, y: yDivider), end: NSPoint(x: xDivider, y: inset.maxY), center: NSPoint(x: xDivider, y: (yDivider + inset.maxY) / 2))
+            ]
+        case .grid:
+            return [
+                PreviewDivider(
+                    isVertical: true,
+                    start: NSPoint(x: xDivider, y: yDivider),
+                    end: NSPoint(x: xDivider, y: inset.maxY),
+                    center: NSPoint(x: xDivider, y: (yDivider + inset.maxY) / 2)
+                ),
+                PreviewDivider(
+                    isVertical: true,
+                    start: NSPoint(x: xDivider, y: inset.minY),
+                    end: NSPoint(x: xDivider, y: yDivider),
+                    center: NSPoint(x: xDivider, y: (inset.minY + yDivider) / 2)
+                ),
+                PreviewDivider(
+                    isVertical: false,
+                    start: NSPoint(x: inset.minX, y: yDivider),
+                    end: NSPoint(x: xDivider, y: yDivider),
+                    center: NSPoint(x: (inset.minX + xDivider) / 2, y: yDivider)
+                ),
+                PreviewDivider(
+                    isVertical: false,
+                    start: NSPoint(x: xDivider, y: yDivider),
+                    end: NSPoint(x: inset.maxX, y: yDivider),
+                    center: NSPoint(x: (xDivider + inset.maxX) / 2, y: yDivider)
+                )
+            ]
+        case .threeColumns:
+            let first = inset.minX + inset.width / 3
+            let second = inset.minX + inset.width * 2 / 3
+            return [
+                PreviewDivider(isVertical: true, start: NSPoint(x: first, y: inset.minY), end: NSPoint(x: first, y: inset.maxY), center: NSPoint(x: first, y: inset.midY)),
+                PreviewDivider(isVertical: true, start: NSPoint(x: second, y: inset.minY), end: NSPoint(x: second, y: inset.maxY), center: NSPoint(x: second, y: inset.midY))
+            ]
+        case .threeRows:
+            let first = inset.minY + inset.height / 3
+            let second = inset.minY + inset.height * 2 / 3
+            return [
+                PreviewDivider(isVertical: false, start: NSPoint(x: inset.minX, y: first), end: NSPoint(x: inset.maxX, y: first), center: NSPoint(x: inset.midX, y: first)),
+                PreviewDivider(isVertical: false, start: NSPoint(x: inset.minX, y: second), end: NSPoint(x: inset.maxX, y: second), center: NSPoint(x: inset.midX, y: second))
+            ]
+        }
+    }
+
+    private func section(at point: NSPoint) -> Section? {
+        sections.first { $0.frame.contains(point) }
+    }
+
+    private func previewZoneRect(_ rect: CGRect) -> CGRect {
+        safeRect(rect, minWidth: 24, minHeight: 24) ?? rect.standardized
     }
 
     private func clampSplit(_ value: CGFloat) -> CGFloat {
@@ -2450,6 +4313,72 @@ private final class DesktopContainerView: NSView {
 private final class StackTabButton: NSButton {
     var stackName: String = ""
     var tabIndex: Int = 0
+}
+
+private final class TitaniumBackgroundView: NSView {
+    var appearanceMode: DesktopConfig.WorkbenchAppearance = .system {
+        didSet { needsDisplay = true }
+    }
+
+    override var isOpaque: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let isDark: Bool
+        switch appearanceMode {
+        case .system:
+            isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        case .titaniumLight:
+            isDark = false
+        case .titaniumDark:
+            isDark = true
+        }
+
+        let top = isDark
+            ? NSColor(calibratedRed: 0.075, green: 0.078, blue: 0.083, alpha: 1)
+            : NSColor(calibratedRed: 0.87, green: 0.86, blue: 0.835, alpha: 1)
+        let bottom = isDark
+            ? NSColor(calibratedRed: 0.032, green: 0.034, blue: 0.038, alpha: 1)
+            : NSColor(calibratedRed: 0.965, green: 0.956, blue: 0.93, alpha: 1)
+        NSGradient(starting: top, ending: bottom)?.draw(in: bounds, angle: 88)
+
+        let lineColor = isDark
+            ? NSColor.white.withAlphaComponent(0.025)
+            : NSColor.black.withAlphaComponent(0.035)
+        lineColor.setStroke()
+        let path = NSBezierPath()
+        path.lineWidth = 1
+        var y = bounds.minY
+        while y < bounds.maxY {
+            path.move(to: NSPoint(x: bounds.minX, y: y.rounded()))
+            path.line(to: NSPoint(x: bounds.maxX, y: y.rounded()))
+            y += 5
+        }
+        path.stroke()
+
+        let vignette = NSBezierPath(rect: bounds)
+        (isDark ? NSColor.black.withAlphaComponent(0.18) : NSColor.white.withAlphaComponent(0.18)).setFill()
+        vignette.fill()
+    }
+}
+
+private final class BundleRoutingTypePopupButton: NSPopUpButton {
+    var bundleId: String = ""
+}
+
+private final class TitleRuleRoutingTypePopupButton: NSPopUpButton {
+    var ruleId: UUID?
+}
+
+private final class RoutingRuleRemoveButton: NSButton {
+    var ruleId: UUID?
+}
+
+private extension Array {
+    subscript(safe index: Int) -> Element? {
+        guard indices.contains(index) else { return nil }
+        return self[index]
+    }
 }
 
 @MainActor
@@ -2713,24 +4642,24 @@ private final class DesktopHandleOverlayView: NSView {
                 // Cyan-blue glow bands for target zone
                 drawGlowingZone(zoneFrame)
             } else if isActive {
-                // Subtle blue boundary for active zones with rounded corners
+                // Neutral boundary for active zones; color is reserved for drop targets.
                 let boundaryPath = NSBezierPath(roundedRect: zoneFrame, xRadius: 8, yRadius: 8)
-                NSColor.systemBlue.withAlphaComponent(0.4).setStroke()
+                NSColor.labelColor.withAlphaComponent(0.20).setStroke()
                 boundaryPath.lineWidth = 2
                 boundaryPath.stroke()
 
                 let fillPath = NSBezierPath(roundedRect: zoneFrame, xRadius: 8, yRadius: 8)
-                NSColor.systemBlue.withAlphaComponent(0.06).setFill()
+                NSColor.labelColor.withAlphaComponent(0.025).setFill()
                 fillPath.fill()
             } else {
                 // Faint boundary for inactive zones with rounded corners
                 let boundaryPath = NSBezierPath(roundedRect: zoneFrame, xRadius: 8, yRadius: 8)
-                NSColor.systemBlue.withAlphaComponent(0.22).setStroke()
+                NSColor.separatorColor.withAlphaComponent(0.34).setStroke()
                 boundaryPath.lineWidth = 1.5
                 boundaryPath.stroke()
 
                 let fillPath = NSBezierPath(roundedRect: zoneFrame, xRadius: 8, yRadius: 8)
-                NSColor.systemBlue.withAlphaComponent(0.025).setFill()
+                NSColor.labelColor.withAlphaComponent(0.012).setFill()
                 fillPath.fill()
             }
         }
@@ -3100,6 +5029,21 @@ private final class DesktopHandleOverlayView: NSView {
         }
         return standardized
     }
+}
+
+private final class ShortcutActionButton: NSButton {
+    let shortcutAction: WorkbenchShortcutAction
+
+    init(shortcutAction: WorkbenchShortcutAction, title: String, target: AnyObject?, action: Selector?) {
+        self.shortcutAction = shortcutAction
+        super.init(frame: .zero)
+        self.title = title
+        self.target = target
+        self.action = action
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { nil }
 }
 
 @MainActor

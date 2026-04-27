@@ -44,7 +44,35 @@ ACP requests/plans/changes, CLI descriptions, and UI copy.
 - Required Rule: In `tabbed` mode, each zone MUST be partitioned into `tab_bar + content_area`.
 - Geometry Rule: `tab_bar` and `content_area` must form one complete non-overlapping zone rectangle.
 
+## 6) 满宽两端对齐 (Full-Width Alignment)
+
+- Canonical Term: `full_width_alignment`
+- Definition: A visual frame/card/row stretches to the full available width of
+  its containing display area; its left and right edges align with the content
+  region boundaries.
+- Not Equivalent To: Content-internal spacing alone. A row can have left text and
+  right controls, but if the outer frame shrinks to the content's intrinsic
+  width, it is NOT `full_width_alignment`.
+- Required Rule: Workbench setting panels, rule panels, cards, and action rows
+  should use `full_width_alignment` unless there is an explicit compact-control
+  reason not to.
+- UI Rule: Internal content should still use two-end composition where useful:
+  primary label/function name on the left, controls/status/notes on the right.
+
+## 7) 不可控窗口 (Uncontrollable Window)
+
+- Canonical Term: `uncontrollable_window`
+- Definition: A visible window that can be observed by CoreGraphics but should
+  not be controlled through AX layout operations.
+- Auto-Detection: A window is uncontrollable when it has no stable controllable
+  app identity, such as `unknown.bundle`, an empty bundle id, or an invalid
+  window number.
+- Required Rule: `uncontrollable_window` entries must be excluded from zone
+  resize, forced return, stack/bucket assignment, and drag-to-zone operations.
+- UI Rule: Users may still see these windows in routing diagnostics and mark
+  matching App/title rules as `不可控窗口`.
+
 ## Naming Guidance
 
-- Prefer `display / desktop / zone / stacking_mode / tab_bar / content_area` in code and docs.
+- Prefer `display / desktop / zone / stacking_mode / tab_bar / content_area / full_width_alignment / uncontrollable_window` in code and docs.
 - Avoid mixing synonyms in one feature spec unless they are mapped once in this glossary.

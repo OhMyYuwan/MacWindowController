@@ -227,6 +227,11 @@ final class StackManager {
         try save()
     }
 
+    /// Resize stack members without changing active tab or raising any window.
+    func resizeStackWithoutRaising(name: String, frame: CGRect) throws {
+        try resizeStack(name: name, frame: frame)
+    }
+
     /// Reconcile persisted stack windows with currently visible on-screen windows.
     /// This removes minimized/non-existing windows from stacks and updates titles/windowNumbers.
     @discardableResult
@@ -321,7 +326,10 @@ final class StackManager {
                     title: liveWindow?.title ?? identity.title,
                     windowNumber: liveWindow?.windowNumber,
                     frame: liveWindow?.frame ?? stack.frame,
-                    iconPath: iconPath
+                    iconPath: iconPath,
+                    zoneName: stack.name,
+                    browserURL: nil,
+                    browserKind: nil
                 )
             }
 

@@ -73,7 +73,7 @@ final class WindowController {
             }
 
             let runningApp = NSRunningApplication(processIdentifier: pid)
-            let bundleId = runningApp?.bundleIdentifier ?? "unknown.bundle"
+            let bundleId = runningApp?.bundleIdentifier ?? WindowInfo.unknownBundleId
             let ownerName = windowDict[kCGWindowOwnerName as String] as? String ?? bundleId
             let title = (windowDict[kCGWindowName as String] as? String) ?? ""
             let windowNumber = windowDict[kCGWindowNumber as String] as? Int ?? -1
