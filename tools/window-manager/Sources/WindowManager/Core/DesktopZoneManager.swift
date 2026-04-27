@@ -15,35 +15,57 @@ struct DesktopZoneScanResult {
     let screenFrame: CGRect
 }
 
+@MainActor
 final class DesktopZoneManager {
     private let windowController: WindowController
     private let screenManager: ScreenManager
     private let stackManager: StackManager
     private let layoutEngine: LayoutEngine
     private var config: DesktopConfig
+    private weak var partitionState: DesktopPartitionState?
 
-    /// Custom split ratios (0~1). nil = use 0.5 (equal split)
-    var splitX: CGFloat = 0.5
-    var splitY: CGFloat = 0.5
+    /// Gap between zones in points — creates visible separation and room for drag handles
+    static let zoneGap: CGFloat = 8
+
+    /// Custom split ratios (0~1), default 0.5. Backed by partitionState if available.
+    var splitX: CGFloat {
+        get { partitionState?.splitX ?? _splitX }
+        set {
+            _splitX = newValue
+            partitionState?.splitX = newValue
+        }
+    }
+    var splitY: CGFloat {
+        get { partitionState?.splitY ?? _splitY }
+        set {
+            _splitY = newValue
+            partitionState?.splitY = newValue
+        }
+    }
+    private var _splitX: CGFloat = 0.5
+    private var _splitY: CGFloat = 0.5
 
     init(
         windowController: WindowController,
         screenManager: ScreenManager,
         stackManager: StackManager,
         layoutEngine: LayoutEngine = LayoutEngine(),
-        config: DesktopConfig = .load()
+        config: DesktopConfig = .load(),
+        partitionState: DesktopPartitionState? = nil
     ) {
         self.windowController = windowController
         self.screenManager = screenManager
         self.stackManager = stackManager
         self.layoutEngine = layoutEngine
         self.config = config
+        self.partitionState = partitionState
     }
 
     var stackThreshold: Int {
-        get { config.stackThreshold }
+        get { partitionState?.stackThreshold ?? config.stackThreshold }
         set {
             config.stackThreshold = newValue
+            partitionState?.stackThreshold = newValue
             try? config.save()
         }
     }
@@ -118,10 +140,40 @@ final class DesktopZoneManager {
         let xSplit = screenFrame.minX + screenFrame.width * splitX
         let ySplit = screenFrame.minY + screenFrame.height * splitY
 
+        // Gap between zones — leaves room for the desktop drag handles and prevents
+        // window edges from sitting directly on the divider line.
+        let zoneGap: CGFloat = Self.zoneGap
+
         let leftW = xSplit - screenFrame.minX
         let rightW = screenFrame.maxX - xSplit
         let topH = ySplit - screenFrame.minY
         let bottomH = screenFrame.maxY - ySplit
+
+        // Build raw rects, then inset each toward the divider sides by gap/2
+        func insetTL(_ r: CGRect) -> CGRect {
+            CGRect(x: r.minX, y: r.minY, width: max(40, r.width - zoneGap / 2), height: max(40, r.height - zoneGap / 2))
+        }
+        func insetTR(_ r: CGRect) -> CGRect {
+            CGRect(x: r.minX + zoneGap / 2, y: r.minY, width: max(40, r.width - zoneGap / 2), height: max(40, r.height - zoneGap / 2))
+        }
+        func insetBL(_ r: CGRect) -> CGRect {
+            CGRect(x: r.minX, y: r.minY + zoneGap / 2, width: max(40, r.width - zoneGap / 2), height: max(40, r.height - zoneGap / 2))
+        }
+        func insetBR(_ r: CGRect) -> CGRect {
+            CGRect(x: r.minX + zoneGap / 2, y: r.minY + zoneGap / 2, width: max(40, r.width - zoneGap / 2), height: max(40, r.height - zoneGap / 2))
+        }
+        func insetLeftHalf(_ r: CGRect) -> CGRect {
+            CGRect(x: r.minX, y: r.minY, width: max(40, r.width - zoneGap / 2), height: r.height)
+        }
+        func insetRightHalf(_ r: CGRect) -> CGRect {
+            CGRect(x: r.minX + zoneGap / 2, y: r.minY, width: max(40, r.width - zoneGap / 2), height: r.height)
+        }
+        func insetTopHalf(_ r: CGRect) -> CGRect {
+            CGRect(x: r.minX, y: r.minY, width: r.width, height: max(40, r.height - zoneGap / 2))
+        }
+        func insetBottomHalf(_ r: CGRect) -> CGRect {
+            CGRect(x: r.minX, y: r.minY + zoneGap / 2, width: r.width, height: max(40, r.height - zoneGap / 2))
+        }
 
         let tl = CGRect(x: screenFrame.minX, y: screenFrame.minY, width: leftW, height: topH)
         let tr = CGRect(x: xSplit, y: screenFrame.minY, width: rightW, height: topH)
@@ -131,58 +183,58 @@ final class DesktopZoneManager {
         switch mode {
         case .grid:
             return [
-                DesktopZone(name: "top-left", frame: tl),
-                DesktopZone(name: "top-right", frame: tr),
-                DesktopZone(name: "bottom-left", frame: bl),
-                DesktopZone(name: "bottom-right", frame: br),
+                DesktopZone(name: "top-left", frame: insetTL(tl)),
+                DesktopZone(name: "top-right", frame: insetTR(tr)),
+                DesktopZone(name: "bottom-left", frame: insetBL(bl)),
+                DesktopZone(name: "bottom-right", frame: insetBR(br)),
             ]
         case .leftColumn:
             let left = CGRect(x: screenFrame.minX, y: screenFrame.minY, width: leftW, height: screenFrame.height)
             return [
-                DesktopZone(name: "left", frame: left),
-                DesktopZone(name: "top-right", frame: tr),
-                DesktopZone(name: "bottom-right", frame: br),
+                DesktopZone(name: "left", frame: insetLeftHalf(left)),
+                DesktopZone(name: "top-right", frame: insetTR(tr)),
+                DesktopZone(name: "bottom-right", frame: insetBR(br)),
             ]
         case .rightColumn:
             let right = CGRect(x: xSplit, y: screenFrame.minY, width: rightW, height: screenFrame.height)
             return [
-                DesktopZone(name: "top-left", frame: tl),
-                DesktopZone(name: "bottom-left", frame: bl),
-                DesktopZone(name: "right", frame: right),
+                DesktopZone(name: "top-left", frame: insetTL(tl)),
+                DesktopZone(name: "bottom-left", frame: insetBL(bl)),
+                DesktopZone(name: "right", frame: insetRightHalf(right)),
             ]
         case .topRow:
             let top = CGRect(x: screenFrame.minX, y: screenFrame.minY, width: screenFrame.width, height: topH)
             return [
-                DesktopZone(name: "top", frame: top),
-                DesktopZone(name: "bottom-left", frame: bl),
-                DesktopZone(name: "bottom-right", frame: br),
+                DesktopZone(name: "top", frame: insetTopHalf(top)),
+                DesktopZone(name: "bottom-left", frame: insetBL(bl)),
+                DesktopZone(name: "bottom-right", frame: insetBR(br)),
             ]
         case .bottomRow:
             let bottom = CGRect(x: screenFrame.minX, y: ySplit, width: screenFrame.width, height: bottomH)
             return [
-                DesktopZone(name: "top-left", frame: tl),
-                DesktopZone(name: "top-right", frame: tr),
-                DesktopZone(name: "bottom", frame: bottom),
+                DesktopZone(name: "top-left", frame: insetTL(tl)),
+                DesktopZone(name: "top-right", frame: insetTR(tr)),
+                DesktopZone(name: "bottom", frame: insetBottomHalf(bottom)),
             ]
         case .leftRight:
             let left = CGRect(x: screenFrame.minX, y: screenFrame.minY, width: leftW, height: screenFrame.height)
             let right = CGRect(x: xSplit, y: screenFrame.minY, width: rightW, height: screenFrame.height)
             return [
-                DesktopZone(name: "left", frame: left),
-                DesktopZone(name: "right", frame: right),
+                DesktopZone(name: "left", frame: insetLeftHalf(left)),
+                DesktopZone(name: "right", frame: insetRightHalf(right)),
             ]
         case .topBottom:
             let top = CGRect(x: screenFrame.minX, y: screenFrame.minY, width: screenFrame.width, height: topH)
             let bottom = CGRect(x: screenFrame.minX, y: ySplit, width: screenFrame.width, height: bottomH)
             return [
-                DesktopZone(name: "top", frame: top),
-                DesktopZone(name: "bottom", frame: bottom),
+                DesktopZone(name: "top", frame: insetTopHalf(top)),
+                DesktopZone(name: "bottom", frame: insetBottomHalf(bottom)),
             ]
         case .threeColumns:
             let thirdW = screenFrame.width / 3
-            let c1 = CGRect(x: screenFrame.minX, y: screenFrame.minY, width: thirdW, height: screenFrame.height)
-            let c2 = CGRect(x: screenFrame.minX + thirdW, y: screenFrame.minY, width: thirdW, height: screenFrame.height)
-            let c3 = CGRect(x: screenFrame.minX + thirdW * 2, y: screenFrame.minY, width: thirdW, height: screenFrame.height)
+            let c1 = CGRect(x: screenFrame.minX, y: screenFrame.minY, width: thirdW - zoneGap / 2, height: screenFrame.height)
+            let c2 = CGRect(x: screenFrame.minX + thirdW + zoneGap / 2, y: screenFrame.minY, width: thirdW - zoneGap, height: screenFrame.height)
+            let c3 = CGRect(x: screenFrame.minX + thirdW * 2 + zoneGap / 2, y: screenFrame.minY, width: thirdW - zoneGap / 2, height: screenFrame.height)
             return [
                 DesktopZone(name: "col-left", frame: c1),
                 DesktopZone(name: "col-center", frame: c2),
@@ -190,9 +242,9 @@ final class DesktopZoneManager {
             ]
         case .threeRows:
             let thirdH = screenFrame.height / 3
-            let r1 = CGRect(x: screenFrame.minX, y: screenFrame.minY, width: screenFrame.width, height: thirdH)
-            let r2 = CGRect(x: screenFrame.minX, y: screenFrame.minY + thirdH, width: screenFrame.width, height: thirdH)
-            let r3 = CGRect(x: screenFrame.minX, y: screenFrame.minY + thirdH * 2, width: screenFrame.width, height: thirdH)
+            let r1 = CGRect(x: screenFrame.minX, y: screenFrame.minY, width: screenFrame.width, height: thirdH - zoneGap / 2)
+            let r2 = CGRect(x: screenFrame.minX, y: screenFrame.minY + thirdH + zoneGap / 2, width: screenFrame.width, height: thirdH - zoneGap)
+            let r3 = CGRect(x: screenFrame.minX, y: screenFrame.minY + thirdH * 2 + zoneGap / 2, width: screenFrame.width, height: thirdH - zoneGap / 2)
             return [
                 DesktopZone(name: "row-top", frame: r1),
                 DesktopZone(name: "row-center", frame: r2),
@@ -225,6 +277,60 @@ final class DesktopZoneManager {
             }
         }
         return bestIndex
+    }
+
+    /// Determine current zone membership for visible windows.
+    func currentZoneAssignments(windows: [WindowInfo], mergeMode: DesktopMergeMode) -> [Int: String] {
+        var assignments: [Int: String] = [:]
+        for window in windows {
+            let center = CGPoint(x: window.frame.cgRect.midX, y: window.frame.cgRect.midY)
+            if let zone = zoneFor(point: center, mergeMode: mergeMode) {
+                assignments[window.windowNumber] = zone.name
+            }
+        }
+        return assignments
+    }
+
+    /// Apply forced zone behavior based on current assignments and threshold.
+    func applyForcedZones(windows: [WindowInfo], mergeMode: DesktopMergeMode) throws {
+        let zoneDefs = zoneDefinitions(mergeMode: mergeMode)
+        let assignments = currentZoneAssignments(windows: windows, mergeMode: mergeMode)
+        let windowsByZone = Dictionary(grouping: windows) { assignments[$0.windowNumber] ?? "unassigned" }
+
+        // Remove stacks for zones that are no longer above threshold
+        for stack in stackManager.listStacks() {
+            let zoneWindows = windowsByZone[stack.name] ?? []
+            if zoneWindows.count <= stackThreshold {
+                try? stackManager.deleteStack(name: stack.name)
+            }
+        }
+
+        for zone in zoneDefs {
+            let zoneWindows = windowsByZone[zone.name] ?? []
+            guard !zoneWindows.isEmpty else { continue }
+
+            if zoneWindows.count > stackThreshold {
+                // Stack behavior
+                for window in zoneWindows {
+                    let identity = WindowIdentity(
+                        bundleId: window.bundleId,
+                        title: window.title,
+                        windowNumber: window.windowNumber
+                    )
+                    _ = try? stackManager.putWindowInStack(name: zone.name, frame: zone.frame, window: identity)
+                }
+            } else {
+                // Ordinary behavior: all windows fill the full zone frame
+                try? stackManager.deleteStack(name: zone.name)
+                for window in zoneWindows {
+                    try? windowController.setWindowFrame(
+                        bundleId: window.bundleId,
+                        windowNumber: window.windowNumber,
+                        frame: zone.frame
+                    )
+                }
+            }
+        }
     }
 
     // MARK: - Apply Logic

@@ -492,7 +492,6 @@ final class WindowManagerCLI {
                 DesktopWorkbenchLauncher.open(
                     windowController: windowController,
                     stackManager: stackManager,
-                    layoutCoordinator: layoutCoordinator,
                     layoutStore: layoutStore,
                     screenManager: screenManager,
                     focusedLayoutName: focusedLayoutName
@@ -504,7 +503,6 @@ final class WindowManagerCLI {
                     DesktopWorkbenchLauncher.open(
                         windowController: windowController,
                         stackManager: stackManager,
-                        layoutCoordinator: layoutCoordinator,
                         layoutStore: layoutStore,
                         screenManager: screenManager,
                         focusedLayoutName: focusedLayoutName

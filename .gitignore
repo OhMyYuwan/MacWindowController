@@ -17,6 +17,13 @@ __pycache__/
 *.pyo
 *.pyd
 
+# Skills
+.agents/
+
+# 缓存
+.claude/
+.vscode/
+
 # ACP protocol payload (local reference only, do not upload)
 acp-protocol/
 
