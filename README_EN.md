@@ -1,61 +1,135 @@
-# ACP — Agent Content Protocol
+# WinCtlManager
 
-> Enable any Agent to follow consistent workflow protocols in any project.
+WinCtlManager is a native macOS window layout manager for organizing visible windows, saving and restoring desktop layouts, and editing zones, stacks, and window routing through a visual Workbench.
 
-[中文版](./README.md) · [Handbook](./HANDBOOK.md)
+This project is managed with **ACP — Agent Content Protocol** for request, plan, and change records.
 
----
+[中文版](./README.md)
 
-## What is this
+## Release v0.0.1
 
-ACP (Agent Content Protocol) is a workflow protocol for AI Agents. It defines standard behaviors for Agents to enter projects, understand project structure, and execute tasks following the **Request → Plan → Change** flow.
+v0.0.1 is the first usable release. It focuses on basic window control, forced desktop zones, stack tab bars, saved layouts, and the visual Workbench.
 
-This repository is the ACP v1.0.0 distribution package, containing all files needed for Agents to run ACP.
+### Highlights
 
----
+- Basic window operations: list, move, resize, and tile app windows.
+- Frontmost-window actions: tile the focused window or send it into the left stack.
+- Desktop layouts: save, list, restore, import, export, and delete layouts.
+- Forced zones: partition a desktop into zones and reassign windows by zone rules.
+- Window stacks: group multiple windows in one zone into a tab-like stack with one active window.
+- Visual Workbench: native AppKit UI for layout modes, split ratios, routing rules, temporary windows, and saved layouts.
+- Stack tab styling: choose, preview, save, and apply Stack Tab GlassStyle variants.
+- Uncontrollable-window handling: detect windows that should not be moved through AX operations and keep them out of forced layout flows.
+- ACP-managed history: the project keeps `Request -> Plan -> Change` records for ongoing evolution.
 
-## Quick Start
+## Requirements
 
-**Step 1: Copy distribution package to your project**
+- macOS 13 or later
+- Swift Package Manager
+- Accessibility permission: grant Accessibility access to the terminal or app that runs WinCtlManager before controlling windows
+
+## Build
 
 ```bash
-cp AGENTS.md your-project/AGENTS.md
-cp -r acp-protocol/ your-project/acp-protocol/
+cd tools/window-manager
+swift build
 ```
 
-**Step 2: Initialize project ACP state**
+Run tests:
 
-Create `.acp/` directory structure under `your-project/src/`:
-
-```
-src/
-└── .acp/
-    ├── version.yaml
-    ├── kernel/
-    └── support/
+```bash
+cd tools/window-manager
+swift test
 ```
 
-**Step 3: Activate**
+## Open Workbench
 
-Load the prompt from `acp-protocol/host/minimal_system_prompt.md` in your Agent host, or simply type `acp` / `pcb` to trigger protocol activation.
-
----
-
-## Repository Structure
-
-```
-ACP-Public/
-├── AGENTS.md              ← Copy to project root
-├── acp-protocol/          ← Copy to project root
-│   ├── acp_agent_playbook.yaml   ← Agent behavioral instructions (core)
-│   ├── templates/                ← Kernel object templates
-│   └── host/                     ← Host activation layer
-└── HANDBOOK.md            ← Detailed documentation
+```bash
+cd tools/window-manager
+swift run window-manager open-workbench
 ```
 
----
+Edit the current desktop directly:
 
-## Related Links
+```bash
+swift run window-manager edit-current --name current_desktop
+```
 
+## Common CLI Commands
+
+List windows:
+
+```bash
+swift run window-manager list-windows --all
+```
+
+Tile a specific window:
+
+```bash
+swift run window-manager tile-window --bundle-id com.google.Chrome --position left
+```
+
+Tile the currently focused window:
+
+```bash
+swift run window-manager tile-frontmost --position right
+```
+
+Save the current desktop layout:
+
+```bash
+swift run window-manager save-desktop --name work
+```
+
+Restore a desktop layout:
+
+```bash
+swift run window-manager apply-desktop --name work
+```
+
+Open and edit a saved layout:
+
+```bash
+swift run window-manager edit-desktop --name work
+```
+
+Show all commands:
+
+```bash
+swift run window-manager help
+```
+
+## Project Structure
+
+```text
+WinCtlManager/
+├── tools/window-manager/        # Swift Package, CLI, and AppKit Workbench
+├── src/.acp/                    # ACP project state and change records
+├── acp-protocol/                # Read-only ACP protocol payload
+├── AGENTS.md                    # Agent instructions
+├── README.md                    # Chinese app README
+└── README_EN.md                 # English app README
+```
+
+## Current Limits
+
+- WinCtlManager controls third-party app windows through the macOS Accessibility API. It can move, resize, tile, and raise windows, but public APIs cannot permanently convert arbitrary third-party windows into true system-level always-on-top windows.
+- Some system windows, unstable bundle-id windows, special overlays, or security-restricted windows may be observable but not controllable.
+- Desktop/Space switching and fullscreen Space behavior still need careful handling.
+
+## Development Workflow
+
+This is an ACP-managed project. Feature-oriented source changes follow:
+
+```text
+Request -> Plan -> Change
+```
+
+Project state lives in `src/.acp/`; `acp-protocol/` is treated as read-only.
+
+## ACP and Related Links
+
+- Protocol Name: **ACP — Agent Content Protocol**
+- ACP Handbook: [HANDBOOK.md](./HANDBOOK.md)
 - ProtoCodeBase: [protocodebase.com](https://protocodebase.com)
 - Agent Skills: [OhMyYuwan/ProtoCodeBase.Skill](https://github.com/OhMyYuwan/ProtoCodeBase.Skill)

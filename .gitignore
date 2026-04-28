@@ -17,6 +17,13 @@ __pycache__/
 *.pyo
 *.pyd
 
+# Skills
+.agents/
+
+# 缓存
+.claude/
+.vscode/
+
 # ACP protocol payload (local reference only, do not upload)
 acp-protocol/
 
@@ -25,3 +32,9 @@ src/.acp/kernel/
 
 # Planning documents (never upload)
 docs/
+
+# Runtime local state
+.window-manager/
+tools/window-manager/.window-manager/
+PRODUCT_SCOPE_TANGRID.md
+skills-lock.json

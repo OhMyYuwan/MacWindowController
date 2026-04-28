@@ -16,7 +16,22 @@ enum TilePosition: String, Codable, CaseIterable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "_", with: "-")
             .lowercased()
-        return TilePosition(rawValue: normalized)
+        if let direct = TilePosition(rawValue: normalized) {
+            return direct
+        }
+
+        // Friendly aliases for block-style naming.
+        switch normalized {
+        case "left-up", "left-top", "lu", "lt":
+            return .topLeft
+        case "left-down", "left-bottom", "ld", "lb":
+            return .bottomLeft
+        case "right-up", "right-top", "ru", "rt":
+            return .topRight
+        case "right-down", "right-bottom", "rd", "rb":
+            return .bottomRight
+        default:
+            return nil
+        }
     }
 }
-

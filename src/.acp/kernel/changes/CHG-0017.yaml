@@ -1,0 +1,17 @@
+id: CHG-0017
+request: REQ-0018
+plan: PLN-0017
+summary: |
+  Hardened DesktopContainerView rendering and split geometry handling so
+  rounded-rect drawing only receives finite, positive rects, preventing
+  EXC_BREAKPOINT crashes in drawTabs/drawSection paths.
+affected_modules:
+  - tools/window-manager/Sources/WindowManager/UI/DesktopWorkbenchWindow.swift
+  - src/.acp/kernel/requests/REQ-0018.yaml
+  - src/.acp/kernel/plans/PLN-0017.md
+status: done
+created_at: "2026-04-25T17:12:40Z"
+branch_name: "YuwanZ"
+notes: |
+  Added safe rect sanitization, split finite clamping, guarded divider/canvas
+  rendering, and tiny-area draw fallbacks in DesktopContainerView.

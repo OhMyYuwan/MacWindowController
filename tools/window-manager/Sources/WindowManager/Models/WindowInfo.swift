@@ -38,6 +38,8 @@ struct WindowIdentity: Codable, Hashable {
 }
 
 struct WindowInfo: Codable {
+    static let unknownBundleId = "unknown.bundle"
+
     var bundleId: String
     var appName: String
     var pid: Int32
@@ -45,5 +47,10 @@ struct WindowInfo: Codable {
     var title: String
     var frame: RectData
     var isOnScreen: Bool
-}
 
+    var isControllable: Bool {
+        !bundleId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && bundleId != Self.unknownBundleId
+            && windowNumber >= 0
+    }
+}
