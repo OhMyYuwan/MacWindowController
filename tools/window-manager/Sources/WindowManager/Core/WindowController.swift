@@ -119,22 +119,12 @@ final class WindowController {
 
     func raiseWindow(bundleId: String, windowIndex: Int = 0) throws {
         let targetWindow = try resolveAXWindow(bundleId: bundleId, windowIndex: windowIndex)
-        let result = AXUIElementPerformAction(targetWindow, kAXRaiseAction as CFString)
-        guard result == .success else {
-            throw WindowControllerError.axFailure("raise window", result)
-        }
-        let app = try runningApplication(bundleId: bundleId)
-        _ = app.activate(options: [.activateIgnoringOtherApps])
+        try raiseResolvedWindow(targetWindow, bundleId: bundleId)
     }
 
     func raiseWindow(bundleId: String, windowNumber: Int) throws {
         let targetWindow = try resolveAXWindow(bundleId: bundleId, windowNumber: windowNumber)
-        let result = AXUIElementPerformAction(targetWindow, kAXRaiseAction as CFString)
-        guard result == .success else {
-            throw WindowControllerError.axFailure("raise window", result)
-        }
-        let app = try runningApplication(bundleId: bundleId)
-        _ = app.activate(options: [.activateIgnoringOtherApps])
+        try raiseResolvedWindow(targetWindow, bundleId: bundleId)
     }
 
     func setWindowMinimized(bundleId: String, windowIndex: Int = 0, minimized: Bool) throws {
@@ -228,7 +218,12 @@ final class WindowController {
         let focused = focusedWindow as! AXUIElement
         let focusedTitle = title(for: focused)
         let number = windowNumber(for: focused, bundleId: bundleId, pid: app.processIdentifier, expectedTitle: focusedTitle)
-        return WindowIdentity(bundleId: bundleId, title: focusedTitle, windowNumber: number)
+        return WindowIdentity(
+            bundleId: bundleId,
+            title: focusedTitle,
+            windowNumber: number,
+            appName: app.localizedName
+        )
     }
 
     func windowIdentity(bundleId: String, windowIndex: Int = 0) throws -> WindowIdentity {
@@ -241,7 +236,12 @@ final class WindowController {
             pid: app.processIdentifier,
             expectedTitle: currentTitle
         )
-        return WindowIdentity(bundleId: bundleId, title: currentTitle, windowNumber: number)
+        return WindowIdentity(
+            bundleId: bundleId,
+            title: currentTitle,
+            windowNumber: number,
+            appName: app.localizedName
+        )
     }
 
     func findWindowIndex(bundleId: String, titleContains query: String) throws -> Int? {
@@ -345,6 +345,23 @@ final class WindowController {
             throw WindowControllerError.noWindows(bundleId)
         }
         return try resolveAXWindow(bundleId: bundleId, windowIndex: index)
+    }
+
+    private func raiseResolvedWindow(_ targetWindow: AXUIElement, bundleId: String) throws {
+        _ = AXUIElementPerformAction(targetWindow, kAXRaiseAction as CFString)
+
+        let app = try runningApplication(bundleId: bundleId)
+        _ = app.activate(options: [.activateIgnoringOtherApps])
+
+        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        _ = AXUIElementSetAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, targetWindow)
+        _ = AXUIElementSetAttributeValue(targetWindow, kAXMainAttribute as CFString, kCFBooleanTrue)
+        _ = AXUIElementSetAttributeValue(targetWindow, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+
+        let finalRaise = AXUIElementPerformAction(targetWindow, kAXRaiseAction as CFString)
+        guard finalRaise == .success else {
+            throw WindowControllerError.axFailure("raise focused window", finalRaise)
+        }
     }
 
     private func setPosition(window: AXUIElement, point: CGPoint) throws {

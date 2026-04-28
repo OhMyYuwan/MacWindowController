@@ -253,7 +253,8 @@ final class StackManager {
                         WindowIdentity(
                             bundleId: live.bundleId,
                             title: live.title,
-                            windowNumber: live.windowNumber
+                            windowNumber: live.windowNumber,
+                            appName: live.appName
                         )
                     )
                     usedNumbers.insert(number)
@@ -270,7 +271,8 @@ final class StackManager {
                         WindowIdentity(
                             bundleId: candidate.bundleId,
                             title: candidate.title,
-                            windowNumber: candidate.windowNumber
+                            windowNumber: candidate.windowNumber,
+                            appName: candidate.appName
                         )
                     )
                     usedNumbers.insert(candidate.windowNumber)
@@ -322,7 +324,7 @@ final class StackManager {
                 let iconPath = NSWorkspace.shared.urlForApplication(withBundleIdentifier: identity.bundleId)?.path
                 return LayoutWindow(
                     bundleId: identity.bundleId,
-                    appName: liveWindow?.appName ?? identity.bundleId,
+                    appName: liveWindow?.appName ?? identity.displayAppName,
                     title: liveWindow?.title ?? identity.title,
                     windowNumber: liveWindow?.windowNumber,
                     frame: liveWindow?.frame ?? stack.frame,

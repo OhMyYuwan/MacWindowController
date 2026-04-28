@@ -175,7 +175,7 @@ enum DesktopWorkbenchLauncher {
         )
         runtimeHolder = runtime
 
-        app.setActivationPolicy(.regular)
+        app.setActivationPolicy(.accessory)
         app.delegate = runtime
         app.activate(ignoringOtherApps: true)
         app.run()
@@ -274,6 +274,8 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     private var titleRuleListStackView: NSStackView?
     private var temporaryMatchListStackView: NSStackView?
     private var recordingShortcutAction: WorkbenchShortcutAction?
+    private var statusItem: NSStatusItem?
+    private var isQuitting = false
 
     init(
         windowController: WindowController,
@@ -306,6 +308,8 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        installStatusItem()
+
         let window = NSWindow(
             contentRect: NSRect(x: 100, y: 80, width: 1320, height: 900),
             styleMask: [.titled, .resizable, .closable, .miniaturizable],
@@ -419,7 +423,19 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         }
     }
 
-    func windowWillClose(_ notification: Notification) {
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard isQuitting else {
+            hideAppPanel()
+            return false
+        }
+        return true
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        cleanupRuntimeResources()
+    }
+
+    private func cleanupRuntimeResources() {
         for monitor in keyboardMonitors {
             NSEvent.removeMonitor(monitor)
         }
@@ -435,6 +451,75 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         displayWakePanel?.close()
         for panel in stackPanels.values { panel.close() }
         stackPanels.removeAll()
+        if let statusItem {
+            NSStatusBar.system.removeStatusItem(statusItem)
+        }
+        statusItem = nil
+    }
+
+    private func installStatusItem() {
+        let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        self.statusItem = statusItem
+
+        if let button = statusItem.button {
+            button.toolTip = "WinCtlManager"
+            if let image = NSImage(systemSymbolName: "rectangle.3.group", accessibilityDescription: "WinCtlManager") {
+                image.isTemplate = true
+                button.image = image
+            } else {
+                button.title = "WinCtl"
+            }
+        }
+
+        let menu = NSMenu(title: "WinCtlManager")
+        menu.autoenablesItems = false
+
+        let showItem = NSMenuItem(title: "显示 APP 面板", action: #selector(showAppPanel), keyEquivalent: "")
+        showItem.target = self
+        menu.addItem(showItem)
+
+        let hideItem = NSMenuItem(title: "隐藏 APP 面板", action: #selector(hideAppPanelFromMenu), keyEquivalent: "")
+        hideItem.target = self
+        menu.addItem(hideItem)
+
+        menu.addItem(.separator())
+
+        let quitItem = NSMenuItem(title: "退出程序", action: #selector(quitApplication), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
+
+        statusItem.menu = menu
+    }
+
+    @objc
+    private func showAppPanel() {
+        guard let window else { return }
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        if desktopOverlayEditingEnabled {
+            desktopPartitionPanel?.orderFrontRegardless()
+        }
+        refreshWorkbench()
+    }
+
+    @objc
+    private func hideAppPanelFromMenu() {
+        hideAppPanel()
+    }
+
+    private func hideAppPanel() {
+        window?.orderOut(nil)
+        settingsWindow?.orderOut(nil)
+        layoutOverlayPanel?.orderOut(nil)
+        displayWakePanel?.orderOut(nil)
+        desktopPartitionPanel?.orderOut(nil)
+        setStatus("已隐藏 APP 面板，可从菜单栏重新打开", error: false)
+    }
+
+    @objc
+    private func quitApplication() {
+        isQuitting = true
         NSApplication.shared.terminate(nil)
     }
 
@@ -3247,7 +3332,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         }
 
         for (index, identity) in stack.windows.prefix(8).enumerated() {
-            let label = "\(index + 1). \(identity.title.isEmpty ? identity.bundleId : identity.title)"
+            let label = "\(index + 1). \(identity.tabDisplayTitle())"
             let btn = StackTabButton(title: label, target: self, action: #selector(selectStackTab(_:)))
             btn.stackName = stack.name
             btn.tabIndex = index
@@ -3256,6 +3341,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             btn.isBordered = false
             btn.controlSize = .small
             btn.font = NSFont.systemFont(ofSize: 11, weight: index == stack.activeIndex ? .semibold : .regular)
+            btn.toolTip = identity.fullDisplayTitle
             tabsStack.addArrangedSubview(btn)
         }
         // Z-order is managed exclusively by updateAllPanelZOrder; don't touch it here.
@@ -3897,7 +3983,7 @@ private final class DesktopContainerView: NSView {
 
     private func drawDraggedWindowGhost() {
         guard let draggingWindow, let dragLocation else { return }
-        let label = draggingWindow.title.isEmpty ? draggingWindow.appName : "\(draggingWindow.appName) - \(draggingWindow.title)"
+        let label = draggingWindow.title.isEmpty ? draggingWindow.appName : "\(draggingWindow.title) - \(draggingWindow.appName)"
         let width = min(max(CGFloat(label.count) * 6.8 + 24, 140), 260)
         let rect = NSRect(x: dragLocation.x + 12, y: dragLocation.y - 12, width: width, height: 24)
         guard let safe = safeRect(rect, minWidth: 80, minHeight: 16) else { return }
@@ -4163,7 +4249,7 @@ private final class DesktopContainerView: NSView {
         ]
         var y = safeArea.maxY - 22
         for window in windows.prefix(8) {
-            let title = window.title.isEmpty ? window.appName : "\(window.appName) - \(window.title)"
+            let title = window.title.isEmpty ? window.appName : "\(window.title) - \(window.appName)"
             let rect = NSRect(x: safeArea.minX, y: y, width: safeArea.width - 4, height: 20)
             if let safeRect = safeRect(rect, minWidth: 40, minHeight: 12) {
                 let pill = NSBezierPath(roundedRect: safeRect, xRadius: 5, yRadius: 5)
