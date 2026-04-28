@@ -2422,6 +2422,12 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             trailingNote: "\(partitionState.stackThreshold) 阈值"
         ))
 
+        heroRows.append(makeActionRow(
+            title: "分区扫描",
+            detail: "重新计算窗口归属。",
+            controls: [makeButton("立即扫描", action: #selector(runAutoScan))]
+        ))
+
         let statusStack = NSStackView()
         statusStack.orientation = .horizontal
         statusStack.spacing = 12
@@ -2760,41 +2766,6 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             )]
         ), to: root)
 
-        let appBundleIdField = NSTextField(string: "com.google.Chrome")
-        appBundleIdField.placeholderString = "Bundle ID"
-        appBundleIdField.translatesAutoresizingMaskIntoConstraints = false
-        appBundleIdField.widthAnchor.constraint(greaterThanOrEqualToConstant: 320).isActive = true
-        self.appBundleIdField = appBundleIdField
-
-        let chromeCountField = NSTextField(string: "3")
-        chromeCountField.placeholderString = "窗口数"
-        chromeCountField.alignment = .right
-        chromeCountField.translatesAutoresizingMaskIntoConstraints = false
-        chromeCountField.widthAnchor.constraint(greaterThanOrEqualToConstant: 72).isActive = true
-        self.chromeWindowCountField = chromeCountField
-
-        addFullWidthArrangedSubview(makeSectionGroup(
-            title: "高级工具",
-            subtitle: "把开发与诊断入口收敛到同一组，减少零散设置项。",
-            views: [
-                makeActionRow(
-                    title: "打开 App",
-                    detail: "输入 Bundle ID 直接拉起指定应用。",
-                    controls: [appBundleIdField, makeButton("打开", action: #selector(launchAppFromInput))]
-                ),
-                makeActionRow(
-                    title: "多开 Chrome",
-                    detail: "快速生成开发测试窗口。",
-                    controls: [chromeCountField, makeButton("打开", action: #selector(openMultipleChromeWindows))]
-                ),
-                makeActionRow(
-                    title: "分区扫描",
-                    detail: "重新计算窗口归属。",
-                    controls: [makeButton("立即扫描", action: #selector(runAutoScan))]
-                )
-            ]
-        ), to: root)
-
         return root
     }
 
@@ -2827,14 +2798,30 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             statusButton.toolTip = "\(conflict.title)\(overridden)：点击处理"
         }
 
-        return makeActionRow(
-            title: action.title,
-            detail: nil,
-            controls: [
-                makeShortcutDisplay(for: shortcut, isRecording: isRecording),
-                statusButton
-            ]
-        )
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.spacing = 12
+        row.alignment = .centerY
+        applyFullWidthAlignment(to: row)
+
+        let titleLabel = NSTextField(labelWithString: action.title)
+        titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        titleLabel.textColor = .labelColor
+        titleLabel.alignment = .left
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(titleLabel)
+
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(spacer)
+
+        let shortcutDisplay = makeShortcutDisplay(for: shortcut, isRecording: isRecording)
+        row.addArrangedSubview(shortcutDisplay)
+        row.addArrangedSubview(statusButton)
+
+        return row
     }
 
     private func makeShortcutDisplay(for shortcut: DesktopConfig.Shortcut, isRecording: Bool) -> NSStackView {
@@ -2978,17 +2965,11 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
 
     private func makeAppRoutingRow(app: AppRoutingItem, popup: NSPopUpButton) -> NSView {
         let row = NSStackView()
-        row.orientation = .vertical
-        row.spacing = 8
-        row.alignment = .width
+        row.orientation = .horizontal
+        row.spacing = 14
+        row.alignment = .centerY
         applyFullWidthAlignment(to: row)
         row.alphaValue = app.isRoutingLocked ? 0.62 : 1.0
-
-        let titleRow = NSStackView()
-        titleRow.orientation = .horizontal
-        titleRow.spacing = 10
-        titleRow.alignment = .centerY
-        applyFullWidthAlignment(to: titleRow)
 
         let iconView = NSImageView()
         iconView.image = app.icon
@@ -3018,16 +2999,15 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         bundleLabel.lineBreakMode = .byTruncatingMiddle
         labels.addArrangedSubview(bundleLabel)
 
-        titleRow.addArrangedSubview(iconView)
-        titleRow.addArrangedSubview(labels)
-        row.addArrangedSubview(titleRow)
+        row.addArrangedSubview(iconView)
+        row.addArrangedSubview(labels)
 
-        let controlsRow = NSStackView()
-        controlsRow.orientation = .horizontal
-        controlsRow.spacing = 10
-        controlsRow.alignment = .centerY
-        applyFullWidthAlignment(to: controlsRow)
-        controlsRow.addArrangedSubview(popup)
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(spacer)
+
+        row.addArrangedSubview(popup)
 
         let note = app.isRoutingLocked ? "只读" : (app.windowCount > 0 ? "运行中 \(app.windowCount)" : "未打开")
         let noteLabel = NSTextField(labelWithString: note)
@@ -3035,8 +3015,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         noteLabel.textColor = app.isRoutingLocked || app.windowCount == 0 ? .tertiaryLabelColor : .secondaryLabelColor
         noteLabel.alignment = .left
         noteLabel.setContentHuggingPriority(.required, for: .horizontal)
-        controlsRow.addArrangedSubview(noteLabel)
-        row.addArrangedSubview(controlsRow)
+        row.addArrangedSubview(noteLabel)
 
         return row
     }
