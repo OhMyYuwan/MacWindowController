@@ -16,9 +16,11 @@ enum DesktopLayoutStoreError: LocalizedError {
 
 final class DesktopLayoutStore {
     private let fileManager: FileManager
+    private let supportDirectoryURL: URL
 
     init(fileManager: FileManager = .default) {
         self.fileManager = fileManager
+        self.supportDirectoryURL = DesktopLayoutStore.resolveSupportDirectory(fileManager: fileManager)
     }
 
     func save(_ layout: DesktopLayout) throws {
@@ -116,10 +118,27 @@ final class DesktopLayoutStore {
         supportDirectoryURL.appendingPathComponent("layouts", isDirectory: true)
     }
 
-    private var supportDirectoryURL: URL {
-        let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support", isDirectory: true)
-        return base.appendingPathComponent("WinCtlManager", isDirectory: true)
+    private static func resolveSupportDirectory(fileManager: FileManager) -> URL {
+        if let custom = ProcessInfo.processInfo.environment["WINDOW_MANAGER_LAYOUTS_DIR"] {
+            return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath, isDirectory: true)
+        }
+
+        let tempFallback = URL(fileURLWithPath: "/tmp/winctlmanager-layouts", isDirectory: true)
+        if canCreateDirectory(at: tempFallback, fileManager: fileManager) {
+            return tempFallback
+        }
+
+        let homeFallback = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+            .appendingPathComponent(".winctlmanager", isDirectory: true)
+        return homeFallback
+    }
+
+    private static func canCreateDirectory(at url: URL, fileManager: FileManager) -> Bool {
+        do {
+            try fileManager.createDirectory(at: url, withIntermediateDirectories: true)
+            return true
+        } catch {
+            return false
+        }
     }
 }
-

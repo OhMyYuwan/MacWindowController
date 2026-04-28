@@ -32,6 +32,28 @@ class WindowManager:
             return data
         raise WindowManagerError("Unexpected list-windows response format.")
 
+    def launch_app(self, bundle_id: str, *, background: bool = False) -> dict[str, Any]:
+        args = ["launch-app", "--bundle-id", bundle_id, "--json"]
+        if background:
+            args.append("--background")
+        data = self._run_json(args)
+        if isinstance(data, dict):
+            return data
+        raise WindowManagerError("Unexpected launch-app response format.")
+
+    def launch_chrome_windows(self, count: int = 3) -> dict[str, Any]:
+        data = self._run_json(
+            [
+                "launch-chrome-windows",
+                "--count",
+                str(count),
+                "--json",
+            ]
+        )
+        if isinstance(data, dict):
+            return data
+        raise WindowManagerError("Unexpected launch-chrome-windows response format.")
+
     def move_window(self, bundle_id: str, x: float, y: float, window_index: int = 0) -> dict[str, Any]:
         return self._run_json(
             [
@@ -86,6 +108,30 @@ class WindowManager:
             args.extend(["--display-index", str(display_index)])
         return self._run_json(args)
 
+    def place_window(
+        self,
+        bundle_id: str,
+        zone: str,
+        *,
+        window_index: int | None = None,
+        window_number: int | None = None,
+        window_title_contains: str | None = None,
+        display_index: int | None = None,
+    ) -> dict[str, Any]:
+        args = ["place-window", "--bundle-id", bundle_id, "--zone", zone, "--json"]
+        if window_index is not None:
+            args.extend(["--window-index", str(window_index)])
+        elif window_number is not None:
+            args.extend(["--window-number", str(window_number)])
+        elif window_title_contains:
+            args.extend(["--window-title-contains", window_title_contains])
+        if display_index is not None:
+            args.extend(["--display-index", str(display_index)])
+        data = self._run_json(args)
+        if isinstance(data, dict):
+            return data
+        raise WindowManagerError("Unexpected place-window response format.")
+
     def save_layout(self, name: str, description: str = "") -> dict[str, Any]:
         args = ["save-layout", "--name", name, "--json"]
         if description:
@@ -101,6 +147,78 @@ class WindowManager:
             return list(data["desktops"])
         raise WindowManagerError("Unexpected list-layouts response format.")
 
+    def apply_layout(self, name: str) -> dict[str, Any]:
+        data = self._run_json(["apply-desktop", "--name", name, "--json"])
+        if isinstance(data, dict):
+            return data
+        raise WindowManagerError("Unexpected apply-layout response format.")
+
+    def delete_layout(self, name: str) -> dict[str, Any]:
+        data = self._run_json(["delete-desktop", "--name", name, "--json"])
+        if isinstance(data, dict):
+            return data
+        raise WindowManagerError("Unexpected delete-layout response format.")
+
+    def export_layout(self, name: str, output_path: str) -> dict[str, Any]:
+        data = self._run_json(
+            ["export-desktop", "--name", name, "--output", output_path, "--json"]
+        )
+        if isinstance(data, dict):
+            return data
+        raise WindowManagerError("Unexpected export-layout response format.")
+
+    def create_stack(self, name: str, position: str, windows: list[str]) -> dict[str, Any]:
+        data = self._run_json(
+            [
+                "create-stack",
+                "--name",
+                name,
+                "--position",
+                position,
+                "--windows",
+                ",".join(windows),
+                "--json",
+            ]
+        )
+        if isinstance(data, dict):
+            return data
+        raise WindowManagerError("Unexpected create-stack response format.")
+
+    def switch_stack(self, name: str, index: int) -> str:
+        return self._run_text(["switch-stack", "--name", name, "--index", str(index)])
+
+    def list_stacks(self) -> list[dict[str, Any]]:
+        data = self._run_json(["list-stacks", "--json"])
+        if isinstance(data, list):
+            return list(data)
+        raise WindowManagerError("Unexpected list-stacks response format.")
+
+    def edit_layout(self, name: str, create_if_missing: bool = False, description: str = "") -> str:
+        args = ["edit-desktop", "--name", name]
+        if create_if_missing:
+            args.append("--create-if-missing")
+        if description:
+            args.extend(["--description", description])
+        return self._run_text(args)
+
+    def open_workbench(self, layout_name: str | None = None) -> str:
+        args = ["open-workbench"]
+        if layout_name:
+            args.extend(["--layout", layout_name])
+        return self._run_text(args)
+
+    def tile_frontmost(self, position: str) -> dict[str, Any]:
+        data = self._run_json(["tile-frontmost", "--position", position, "--json"])
+        if isinstance(data, dict):
+            return data
+        raise WindowManagerError("Unexpected tile-frontmost response format.")
+
+    def bucket_left_frontmost(self) -> dict[str, Any]:
+        data = self._run_json(["bucket-left-frontmost", "--json"])
+        if isinstance(data, dict):
+            return data
+        raise WindowManagerError("Unexpected bucket-left-frontmost response format.")
+
     def _run_json(self, args: list[str]) -> dict[str, Any] | list[Any]:
         output = self._run_text(args)
         try:
@@ -110,11 +228,17 @@ class WindowManager:
 
     def _run_text(self, args: list[str]) -> str:
         assert self.cli_path is not None
+        env = os.environ.copy()
+        env.setdefault(
+            "WINDOW_MANAGER_LAYOUTS_DIR",
+            "/tmp/winctlmanager-layouts",
+        )
         process = subprocess.run(
             [self.cli_path, *args],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=env,
             check=False,
         )
         if process.returncode != 0:
@@ -133,4 +257,3 @@ class WindowManager:
             return str(debug_binary)
 
         return "window-manager"
-

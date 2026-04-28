@@ -27,25 +27,30 @@ capabilities:
       - applying desktop layouts containing stack records
 
   - id: desktop_layouts
-    summary: Persist desktop snapshots, import/export layouts, and restore layouts.
+    summary: Persist desktop snapshots, import/export layouts, restore layouts, and store forced partition distributions.
     slices:
       - id: layout_modeling
         owns:
           - tools/window-manager/Sources/WindowManager/Models/DesktopLayout.swift
+          - tools/window-manager/Sources/WindowManager/Models/DesktopPartitionState.swift
       - id: layout_persistence
         owns:
           - tools/window-manager/Sources/WindowManager/Core/DesktopLayoutStore.swift
+          - tools/window-manager/Sources/WindowManager/Core/DesktopConfig.swift
       - id: layout_execution
         owns:
           - tools/window-manager/Sources/WindowManager/Core/DesktopLayoutCoordinator.swift
+          - tools/window-manager/Sources/WindowManager/Core/DesktopZoneManager.swift
     route_here_when:
       - user asks to save/list/apply/delete desktop layouts
       - user asks to import/export desktop layout JSON
+      - user asks to persist or restore partition geometry / zone assignments
     bridge_when:
       - request touches both stack state and raw window placement
+      - request changes both saved partition topology and runtime zone enforcement
 
   - id: visual_editor
-    summary: AppKit-based visual editor for drag/resize layout previews.
+    summary: AppKit-based workbench with sidebar navigation, forced-zone desktop overlay with draggable handles, and zone-transfer glow animations.
     slices:
       - id: editor_shell
         owns:
@@ -54,10 +59,15 @@ capabilities:
         owns:
           - tools/window-manager/Sources/WindowManager/UI/LayoutCanvas.swift
           - tools/window-manager/Sources/WindowManager/UI/RoundedRectView.swift
+      - id: workbench
+        owns:
+          - tools/window-manager/Sources/WindowManager/UI/DesktopWorkbenchWindow.swift
     route_here_when:
       - user asks to visualize and edit saved desktop layouts
+      - user asks about the workbench UI, sidebar, or desktop overlay handles
     bridge_when:
       - editor save operation writes DesktopLayout persistence
+      - workbench zone-transfer overlay interacts with DesktopZoneManager
 
   - id: cli_surface
     summary: CLI command contract for all operations and JSON output.
