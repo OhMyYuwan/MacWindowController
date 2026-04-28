@@ -23,6 +23,31 @@ struct DesktopConfig: Codable {
         }
     }
 
+    enum StackTabGlassStyle: String, Codable, CaseIterable {
+        case crystalClear
+        case softFrost
+        case milkyTitanium
+        case graphiteSmoke
+
+        var title: String {
+            switch self {
+            case .crystalClear: return "清透玻璃"
+            case .softFrost: return "标准磨砂"
+            case .milkyTitanium: return "乳白钛"
+            case .graphiteSmoke: return "深烟灰"
+            }
+        }
+
+        var subtitle: String {
+            switch self {
+            case .crystalClear: return "最高透明度，适合背景干净的桌面"
+            case .softFrost: return "接近 Apple 示例里的常规 Liquid Glass 控件"
+            case .milkyTitanium: return "更强磨砂和钛色反光，适合浅色桌面"
+            case .graphiteSmoke: return "深色烟灰玻璃，适合复杂或深色桌面"
+            }
+        }
+    }
+
     /// 超过此数量的窗口重叠时自动创建堆栈组
     var stackThreshold: Int = 3
 
@@ -37,6 +62,9 @@ struct DesktopConfig: Codable {
 
     /// Workbench visual appearance.
     var workbenchAppearance: WorkbenchAppearance = .system
+
+    /// Desktop stack tab bar Liquid Glass variant.
+    var stackTabGlassStyle: StackTabGlassStyle = .softFrost
 
     /// User-recorded shortcuts keyed by Workbench shortcut action id.
     var shortcutBindings: [String: Shortcut] = [:]
@@ -54,6 +82,7 @@ struct DesktopConfig: Codable {
         case autoScanInterval
         case layoutHUDShortcut
         case workbenchAppearance
+        case stackTabGlassStyle
         case shortcutBindings
         case shortcutConflictOverrides
     }
@@ -65,6 +94,7 @@ struct DesktopConfig: Codable {
         autoScanInterval = try values.decodeIfPresent(TimeInterval.self, forKey: .autoScanInterval) ?? 1.5
         layoutHUDShortcut = try values.decodeIfPresent(Shortcut.self, forKey: .layoutHUDShortcut) ?? .init()
         workbenchAppearance = try values.decodeIfPresent(WorkbenchAppearance.self, forKey: .workbenchAppearance) ?? .system
+        stackTabGlassStyle = try values.decodeIfPresent(StackTabGlassStyle.self, forKey: .stackTabGlassStyle) ?? .softFrost
         shortcutBindings = try values.decodeIfPresent([String: Shortcut].self, forKey: .shortcutBindings) ?? [:]
         shortcutConflictOverrides = try values.decodeIfPresent([String: Bool].self, forKey: .shortcutConflictOverrides) ?? [:]
     }
@@ -76,6 +106,7 @@ struct DesktopConfig: Codable {
         try values.encode(autoScanInterval, forKey: .autoScanInterval)
         try values.encode(layoutHUDShortcut, forKey: .layoutHUDShortcut)
         try values.encode(workbenchAppearance, forKey: .workbenchAppearance)
+        try values.encode(stackTabGlassStyle, forKey: .stackTabGlassStyle)
         try values.encode(shortcutBindings, forKey: .shortcutBindings)
         try values.encode(shortcutConflictOverrides, forKey: .shortcutConflictOverrides)
     }

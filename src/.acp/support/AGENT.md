@@ -10,7 +10,7 @@ quick_entry:
     - cli_surface
   active_request_id: null
   status: ready
-  next_step: manually verify saved layout wake/delete card actions in the workbench
+  next_step: await next user-directed ACP request
 ```
 
 # WinCtlManager Agent Guide
@@ -74,7 +74,7 @@ desktop snapshot persistence, and a visual desktop layout editor.
 
 ## Active Direction
 
-- Last completed request: `REQ-0039`
-- Last completed plan: `PLN-0038`
-- Last completed change: `CHG-0038`
-- Immediate objective: manually verify saved layout wake/delete card actions in the workbench.
+- Last completed request: `REQ-0045`
+- Last completed plan: `PLN-0044`
+- Last completed change: `CHG-0044`
+- Immediate objective: await next user-directed ACP request.

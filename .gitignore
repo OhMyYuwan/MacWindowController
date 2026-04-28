@@ -36,3 +36,5 @@ docs/
 # Runtime local state
 .window-manager/
 tools/window-manager/.window-manager/
+PRODUCT_SCOPE_TANGRID.md
+skills-lock.json

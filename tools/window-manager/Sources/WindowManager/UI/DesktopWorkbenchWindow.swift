@@ -35,6 +35,7 @@ private enum WorkbenchSection: Int, CaseIterable {
     case stacks
     case quickDrop
     case unconstrained
+    case liquidGlass
     case settings
 
     var title: String {
@@ -43,6 +44,7 @@ private enum WorkbenchSection: Int, CaseIterable {
         case .stacks: return "堆叠"
         case .quickDrop: return "快捷键"
         case .unconstrained: return "临时窗口"
+        case .liquidGlass: return "液态玻璃"
         case .settings: return "设置"
         }
     }
@@ -53,6 +55,7 @@ private enum WorkbenchSection: Int, CaseIterable {
         case .stacks: return "square.3.layers.3d.top.filled"
         case .quickDrop: return "keyboard.fill"
         case .unconstrained: return "sparkles.rectangle.stack.fill"
+        case .liquidGlass: return "circle.hexagongrid.fill"
         case .settings: return "gearshape.fill"
         }
     }
@@ -118,6 +121,16 @@ private enum WorkbenchShortcutAction: String, CaseIterable {
             return .init(keyCode: 125, command: true, option: true, shift: false, control: false)
         }
     }
+}
+
+private enum WorkbenchChrome {
+    static let sidebarWidth: CGFloat = 244
+    static let pageInsets = NSEdgeInsets(top: 20, left: 20, bottom: 24, right: 20)
+    static let sectionSpacing: CGFloat = 14
+    static let groupSpacing: CGFloat = 12
+    static let cardInsets = NSEdgeInsets(top: 14, left: 16, bottom: 14, right: 16)
+    static let compactCardInsets = NSEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
+    static let cardCornerRadius: CGFloat = 14
 }
 
 private struct ShortcutConflict {
@@ -241,6 +254,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     private var shortcutControlToggle: NSButton?
     private var shortcutCurrentLabel: NSTextField?
     private var appearancePopup: NSPopUpButton?
+    private var desktopViewAspectConstraint: NSLayoutConstraint?
     private var splitApplyWorkItem: DispatchWorkItem?
     private let interactiveSplitApplyInterval: TimeInterval = 0.04
     private var lastInteractiveSplitApplyTime: TimeInterval = 0
@@ -335,9 +349,9 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         splitView.addArrangedSubview(contentContainer)
 
         // Sidebar fixed at 220 pt
-        sidebar.widthAnchor.constraint(equalToConstant: 220).isActive = true
+        sidebar.widthAnchor.constraint(equalToConstant: WorkbenchChrome.sidebarWidth).isActive = true
         splitView.setHoldingPriority(.defaultHigh, forSubviewAt: 0)
-        splitView.setPosition(220, ofDividerAt: 0)
+        splitView.setPosition(WorkbenchChrome.sidebarWidth, ofDividerAt: 0)
         splitView.adjustSubviews()
 
         let mergeControl = NSSegmentedControl(
@@ -1405,7 +1419,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             if apps.isEmpty {
                 let emptyLabel = NSTextField(labelWithString: "未扫描到可管理的系统 App")
                 emptyLabel.textColor = .tertiaryLabelColor
-                appStack.addArrangedSubview(emptyLabel)
+                addFullWidthArrangedSubview(emptyLabel, to: appStack)
             } else {
                 for app in apps {
                     let popup = BundleRoutingTypePopupButton(frame: .zero, pullsDown: false)
@@ -1424,7 +1438,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
                     popup.action = #selector(changeAppRoutingType(_:))
                     popup.translatesAutoresizingMaskIntoConstraints = false
                     popup.widthAnchor.constraint(equalToConstant: 120).isActive = true
-                    appStack.addArrangedSubview(makeAppRoutingRow(app: app, popup: popup))
+                    addFullWidthArrangedSubview(makeAppRoutingRow(app: app, popup: popup), to: appStack)
                 }
             }
         }
@@ -1438,7 +1452,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             if partitionState.titleRoutingRules.isEmpty {
                 let emptyLabel = NSTextField(labelWithString: "暂无窗口标题规则")
                 emptyLabel.textColor = .tertiaryLabelColor
-                titleRuleStack.addArrangedSubview(emptyLabel)
+                addFullWidthArrangedSubview(emptyLabel, to: titleRuleStack)
             } else {
                 for rule in partitionState.titleRoutingRules {
                     let popup = TitleRuleRoutingTypePopupButton(frame: .zero, pullsDown: false)
@@ -1455,11 +1469,11 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
                     let removeButton = RoutingRuleRemoveButton(title: "删除", target: self, action: #selector(removeTitleRoutingRule(_:)))
                     removeButton.ruleId = rule.id
                     removeButton.controlSize = .small
-                    titleRuleStack.addArrangedSubview(makeActionRow(
+                    addFullWidthArrangedSubview(makeActionRow(
                         title: rule.title,
                         detail: rule.appName,
                         controls: [popup, removeButton]
-                    ))
+                    ), to: titleRuleStack)
                 }
             }
         }
@@ -1482,7 +1496,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             if matchedNonManagedWindows.isEmpty {
                 let emptyLabel = NSTextField(labelWithString: "当前没有命中非管理规则的窗口")
                 emptyLabel.textColor = .tertiaryLabelColor
-                temporaryStack.addArrangedSubview(emptyLabel)
+                addFullWidthArrangedSubview(emptyLabel, to: temporaryStack)
             } else {
                 for window in matchedNonManagedWindows {
                     let routingType = windowRoutingType(for: window)
@@ -1496,13 +1510,13 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
                     }
 
                     let title = window.title.isEmpty ? window.bundleId : window.title
-                    temporaryStack.addArrangedSubview(makeActionRow(
+                    addFullWidthArrangedSubview(makeActionRow(
                         title: title,
                         detail: window.appName,
                         controls: [],
                         trailingNote: "\(routingType.title) · \(reason)",
                         muted: !window.isControllable
-                    ))
+                    ), to: temporaryStack)
                 }
             }
         }
@@ -2276,15 +2290,18 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
 
     private func makeSidebarView() -> NSView {
         let sidebar = NSVisualEffectView()
-        sidebar.material = .hudWindow
-        sidebar.blendingMode = .behindWindow
+        sidebar.material = .sidebar
+        sidebar.blendingMode = .withinWindow
         sidebar.state = .active
+        sidebar.wantsLayer = true
+        sidebar.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.10).cgColor
+        sidebar.layer?.borderWidth = 0.5
         sidebar.translatesAutoresizingMaskIntoConstraints = false
 
         let container = NSStackView()
         container.orientation = .vertical
         container.spacing = 0
-        container.edgeInsets = NSEdgeInsets(top: 24, left: 0, bottom: 20, right: 0)
+        container.edgeInsets = NSEdgeInsets(top: 26, left: 0, bottom: 20, right: 0)
         container.translatesAutoresizingMaskIntoConstraints = false
         sidebar.addSubview(container)
         NSLayoutConstraint.activate([
@@ -2295,24 +2312,31 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         ])
 
         let appTitle = NSTextField(labelWithString: "WinCtlManager")
-        appTitle.font = NSFont.systemFont(ofSize: 18, weight: .semibold)
+        appTitle.font = NSFont.systemFont(ofSize: 19, weight: .semibold)
         appTitle.alignment = .left
         appTitle.textColor = .labelColor
         let titleRow = NSStackView()
-        titleRow.orientation = .horizontal
-        titleRow.edgeInsets = NSEdgeInsets(top: 0, left: 18, bottom: 0, right: 18)
+        titleRow.orientation = .vertical
+        titleRow.spacing = 4
+        titleRow.edgeInsets = NSEdgeInsets(top: 0, left: 22, bottom: 0, right: 20)
         titleRow.addArrangedSubview(appTitle)
+
+        let subtitle = NSTextField(labelWithString: "Desktop workbench")
+        subtitle.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        subtitle.textColor = .secondaryLabelColor
+        subtitle.alignment = .left
+        titleRow.addArrangedSubview(subtitle)
         container.addArrangedSubview(titleRow)
 
         let spacer1 = NSView()
         spacer1.translatesAutoresizingMaskIntoConstraints = false
-        spacer1.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        spacer1.heightAnchor.constraint(equalToConstant: 22).isActive = true
         container.addArrangedSubview(spacer1)
 
         let navStack = NSStackView()
         navStack.orientation = .vertical
-        navStack.spacing = 4
-        navStack.edgeInsets = NSEdgeInsets(top: 0, left: 12, bottom: 0, right: 12)
+        navStack.spacing = 6
+        navStack.edgeInsets = NSEdgeInsets(top: 0, left: 14, bottom: 0, right: 14)
         container.addArrangedSubview(navStack)
 
         for section in WorkbenchSection.allCases {
@@ -2343,6 +2367,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         case .stacks: newPanel = makeStacksPanel()
         case .quickDrop: newPanel = makeQuickDropPanel()
         case .unconstrained: newPanel = makeUnconstrainedWindowsPanel()
+        case .liquidGlass: newPanel = makeLiquidGlassPanel()
         case .settings: newPanel = makeSettingsPanel()
         }
 
@@ -2355,7 +2380,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             newPanel.leadingAnchor.constraint(equalTo: contentContainer!.leadingAnchor),
             newPanel.trailingAnchor.constraint(equalTo: contentContainer!.trailingAnchor),
             newPanel.topAnchor.constraint(equalTo: contentContainer!.topAnchor),
-            newPanel.bottomAnchor.constraint(equalTo: contentContainer!.bottomAnchor)
+            newPanel.bottomAnchor.constraint(lessThanOrEqualTo: contentContainer!.bottomAnchor)
         ])
 
         if animated {
@@ -2369,63 +2394,76 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
 
     private func makeLayoutsPanel() -> NSView {
         let root = makePanelRoot()
-        root.addArrangedSubview(makeSectionTitle("布局", subtitle: "保存、切换与调整当前桌面分区。"))
+        addFullWidthArrangedSubview(makeSectionTitle("布局", subtitle: "保存、切换与调整当前桌面分区。"), to: root)
 
-        var saveControls: [NSView] = []
+        var heroRows: [NSView] = []
         if let nameField = layoutNameField {
             nameField.translatesAutoresizingMaskIntoConstraints = false
-            nameField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
-            saveControls.append(nameField)
+            nameField.widthAnchor.constraint(greaterThanOrEqualToConstant: 260).isActive = true
+            let saveBtn = makeButton("保存当前布局", action: #selector(saveCurrentLayout))
+            saveBtn.contentTintColor = .controlAccentColor
+            let saveControls = [nameField, saveBtn]
+            heroRows.append(makeActionRow(
+                title: "项目名称",
+                detail: selectedLayoutName ?? "当前工作区快照",
+                controls: saveControls
+            ))
         }
-        let saveBtn = makeButton("保存当前布局", action: #selector(saveCurrentLayout))
-        saveBtn.contentTintColor = .controlAccentColor
-        saveControls.append(saveBtn)
-        let shortcutHintLabel = NSTextField(labelWithString: "")
-        shortcutHintLabel.textColor = .secondaryLabelColor
-        shortcutHintLabel.font = NSFont.systemFont(ofSize: 11)
-        self.shortcutHintLabel = shortcutHintLabel
-        saveControls.append(shortcutHintLabel)
-        updateShortcutHintLabel()
-        root.addArrangedSubview(makeGlassCard(containing: makeActionRow(
-            title: "项目名称",
-            detail: selectedLayoutName ?? "当前工作区快照",
-            controls: saveControls
-        )))
 
         var modeControls: [NSView] = []
         if let mergeControl { modeControls.append(mergeControl) }
         let overlayToggle = makeButton("桌面分区柄：显示", action: #selector(toggleDesktopOverlayEditing))
         desktopOverlayToggleButton = overlayToggle
         modeControls.append(overlayToggle)
-        root.addArrangedSubview(makeGlassCard(containing: makeActionRow(
+        heroRows.append(makeActionRow(
             title: "布局模式",
             detail: mergeMode.title,
             controls: modeControls,
             trailingNote: "\(partitionState.stackThreshold) 阈值"
-        )))
+        ))
 
-        // Canvas card
-        if let desktopView {
-            root.addArrangedSubview(makeGlassCard(
-                containing: desktopView,
-                insets: NSEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
-            ))
-        }
-
-        // Status
+        let statusStack = NSStackView()
+        statusStack.orientation = .horizontal
+        statusStack.spacing = 12
+        statusStack.alignment = .centerY
+        applyFullWidthAlignment(to: statusStack)
         if let statusLabel {
-            root.addArrangedSubview(makeGlassCard(
-                containing: statusLabel,
-                insets: NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 10)
-            ))
+            statusLabel.lineBreakMode = .byTruncatingTail
+            statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            statusStack.addArrangedSubview(statusLabel)
+        }
+        let shortcutHintLabel = NSTextField(labelWithString: "")
+        shortcutHintLabel.textColor = .secondaryLabelColor
+        shortcutHintLabel.font = NSFont.systemFont(ofSize: 11)
+        self.shortcutHintLabel = shortcutHintLabel
+        updateShortcutHintLabel()
+        statusStack.addArrangedSubview(shortcutHintLabel)
+        heroRows.append(statusStack)
+
+        addFullWidthArrangedSubview(makeSectionGroup(
+            title: "当前桌面",
+            subtitle: "把当前布局的保存、模式切换和状态信息集中到同一组，减少零碎面板。",
+            views: heroRows
+        ), to: root)
+
+        if let desktopView {
+            desktopViewAspectConstraint?.isActive = false
+            let aspectConstraint = desktopView.heightAnchor.constraint(equalTo: desktopView.widthAnchor, multiplier: desktopView.heightToWidthRatio)
+            aspectConstraint.priority = .required
+            aspectConstraint.isActive = true
+            desktopViewAspectConstraint = aspectConstraint
+
+            addFullWidthArrangedSubview(makeGlassCard(
+                containing: desktopView,
+                insets: WorkbenchChrome.compactCardInsets
+            ), to: root)
         }
 
-        // Snapshots scroll
         if let noteScrollView {
-            root.addArrangedSubview(makeGlassCard(
+            addFullWidthArrangedSubview(makeGlassCard(
                 containing: noteScrollView,
-                insets: NSEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
-            ))
+                insets: WorkbenchChrome.compactCardInsets
+            ), to: root)
         }
 
         return root
@@ -2433,7 +2471,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
 
     private func makeStacksPanel() -> NSView {
         let root = makePanelRoot()
-        root.addArrangedSubview(makeSectionTitle("堆叠", subtitle: "把前台窗口收纳到固定区域或标签桶。"))
+        addFullWidthArrangedSubview(makeSectionTitle("堆叠", subtitle: "把前台窗口收纳到固定区域或标签桶。"), to: root)
 
         let tileControls = [
             makeButton("左半屏", action: #selector(tileFrontmostLeft)),
@@ -2441,51 +2479,59 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             makeButton("上半屏", action: #selector(tileFrontmostTop)),
             makeButton("下半屏", action: #selector(tileFrontmostBottom))
         ]
-        root.addArrangedSubview(makeGlassCard(containing: makeActionRow(
+        addFullWidthArrangedSubview(makeSectionGroup(
             title: "快捷平铺",
-            detail: "Command + Option + 方向键",
-            controls: tileControls
-        )))
+            subtitle: "保留桌面窗口管理的方向键直觉，把常用动作合并在同一组。",
+            views: [makeActionRow(
+                title: "窗口平铺",
+                detail: "Command + Option + 方向键",
+                controls: tileControls
+            )]
+        ), to: root)
 
         let bucketToggle = NSButton(checkboxWithTitle: "左半屏使用桶堆叠", target: self, action: #selector(toggleLeftBucket))
         bucketToggle.state = leftBucketEnabled ? .on : .off
-        root.addArrangedSubview(makeGlassCard(containing: makeActionRow(
+        addFullWidthArrangedSubview(makeSectionGroup(
             title: "左侧标签桶",
-            detail: leftBucketEnabled ? "当前开启" : "当前关闭",
-            controls: [makeButton("加入左桶", action: #selector(addFrontmostToLeftBucket)), bucketToggle]
-        )))
-
-        root.addArrangedSubview(makeSectionTitle("活跃堆叠"))
+            subtitle: "把左半屏从普通平铺切换为可切换标签桶。",
+            views: [makeActionRow(
+                title: "左侧标签桶",
+                detail: leftBucketEnabled ? "当前开启" : "当前关闭",
+                controls: [makeButton("加入左桶", action: #selector(addFrontmostToLeftBucket)), bucketToggle]
+            )]
+        ), to: root)
 
         let stacks = stackManager.listStacks()
+        let activeViews: [NSView]
         if stacks.isEmpty {
             let emptyLabel = NSTextField(labelWithString: "暂无活跃堆叠")
             emptyLabel.textColor = .tertiaryLabelColor
-            root.addArrangedSubview(makeGlassCard(containing: emptyLabel))
+            activeViews = [emptyLabel]
         } else {
-            for stack in stacks {
-                root.addArrangedSubview(makeGlassCard(containing: makeActionRow(
+            activeViews = stacks.map { stack in
+                makeActionRow(
                     title: stack.name,
                     detail: stack.windows.first?.title ?? "窗口堆叠",
                     controls: [],
                     trailingNote: "\(stack.windows.count) 窗口"
-                )))
+                )
             }
         }
-
-        let spacer = NSView()
-        spacer.translatesAutoresizingMaskIntoConstraints = false
-        root.addArrangedSubview(spacer)
+        addFullWidthArrangedSubview(makeSectionGroup(
+            title: "活跃堆叠",
+            subtitle: "用连续列表显示当前堆叠状态，避免每条记录单独漂浮。",
+            views: activeViews
+        ), to: root)
 
         return root
     }
 
     private func makeQuickDropPanel() -> NSView {
         let root = makePanelRoot()
-        root.addArrangedSubview(makeSectionTitle(
+        addFullWidthArrangedSubview(makeSectionTitle(
             "快捷键",
             subtitle: "点击右侧 ↻ 重新录入；检测到本机或内部冲突时显示 ❗️，可选择覆盖使用或重新设置。"
-        ))
+        ), to: root)
 
         let groups: [(title: String, note: String, actions: [WorkbenchShortcutAction])] = [
             ("窗口投放", "次块默认上半；按住 Shift 执行动作时会改投下半区。", [
@@ -2506,73 +2552,24 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         ]
 
         for group in groups {
-            let groupStack = NSStackView()
-            groupStack.orientation = .vertical
-            groupStack.spacing = 8
-            groupStack.alignment = .width
-            applyFullWidthAlignment(to: groupStack)
-
-            let groupTitle = NSTextField(labelWithString: group.title)
-            groupTitle.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
-            groupTitle.textColor = .labelColor
-            groupTitle.alignment = .left
-            groupStack.addArrangedSubview(groupTitle)
-
-            let groupNote = NSTextField(labelWithString: group.note)
-            groupNote.font = NSFont.systemFont(ofSize: 11)
-            groupNote.textColor = .secondaryLabelColor
-            groupNote.alignment = .left
-            groupNote.lineBreakMode = .byWordWrapping
-            groupNote.maximumNumberOfLines = 2
-            groupStack.addArrangedSubview(groupNote)
-
-            for action in group.actions {
-                groupStack.addArrangedSubview(makeShortcutActionRow(for: action))
-            }
-
-            root.addArrangedSubview(makeGlassCard(
-                containing: groupStack,
-                insets: NSEdgeInsets(top: 12, left: 14, bottom: 12, right: 14)
-            ))
+            let rows: [NSView] = group.actions.map { makeShortcutActionRow(for: $0) }
+            addFullWidthArrangedSubview(makeSectionGroup(
+                title: group.title,
+                subtitle: group.note,
+                views: rows
+            ), to: root)
         }
 
         if let statusLabel {
-            root.addArrangedSubview(makeGlassCard(
-                containing: statusLabel,
-                insets: NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 10)
-            ))
+            addFullWidthArrangedSubview(statusLabel, to: root)
         }
 
-        let spacer = NSView()
-        spacer.translatesAutoresizingMaskIntoConstraints = false
-        root.addArrangedSubview(spacer)
         return root
     }
 
     private func makeUnconstrainedWindowsPanel() -> NSView {
         let root = makePanelRoot()
-        root.addArrangedSubview(makeSectionTitle("窗口类型策略", subtitle: "App 是基础规则，窗口标题规则优先级更高；不可控窗口会自动排除出布局管理。"))
-        root.addArrangedSubview(makeActionRow(
-            title: "App 基础规则",
-            detail: "扫描系统中的 App 并设置默认窗口类型",
-            controls: [
-                makeButton("刷新扫描", action: #selector(refreshWindowRoutingRules)),
-                makeButton("重置 App 类型", action: #selector(resetAllAppRoutingTypes))
-            ]
-        ))
-
-        let appRoutingStack = NSStackView()
-        appRoutingStack.orientation = .vertical
-        appRoutingStack.spacing = 8
-        appRoutingStack.alignment = .width
-        applyFullWidthAlignment(to: appRoutingStack)
-        appRoutingListStackView = appRoutingStack
-        root.addArrangedSubview(makeGlassCard(
-            containing: makeBoundedScrollView(containing: appRoutingStack, height: 320),
-            insets: NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 6)
-        ))
-
-        root.addArrangedSubview(makeSectionTitle("窗口覆盖规则", subtitle: "匹配 App + 窗口标题，覆盖 App 基础规则。"))
+        addFullWidthArrangedSubview(makeSectionTitle("窗口类型策略", subtitle: "App 是基础规则，窗口标题规则优先级更高；不可控窗口会自动排除出布局管理。"), to: root)
 
         let frontmostLabel = NSTextField(labelWithString: "-")
         frontmostLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
@@ -2582,17 +2579,45 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         let focusedButton = makeButton("添加当前聚焦窗口：-  【添加为临时窗口】", action: #selector(addFrontmostToUnconstrained))
         focusedButton.lineBreakMode = .byTruncatingMiddle
         addFocusedWindowRuleButton = focusedButton
-        root.addArrangedSubview(makeGlassCard(containing: makeActionRow(
-            title: "当前聚焦窗口",
-            detail: "取 WinCtlManager 操作窗口之外的最顶层窗口；点击右侧添加标题覆盖规则",
-            controls: [frontmostLabel, focusedButton]
-        )))
 
-        root.addArrangedSubview(makeActionRow(
+        addFullWidthArrangedSubview(makeSectionGroup(
+            title: "基础操作",
+            subtitle: "先扫描 App 规则，再用当前聚焦窗口快速追加更高优先级的标题覆盖规则。",
+            views: [
+                makeActionRow(
+                    title: "App 基础规则",
+                    detail: "扫描系统中的 App 并设置默认窗口类型",
+                    controls: [
+                        makeButton("刷新扫描", action: #selector(refreshWindowRoutingRules)),
+                        makeButton("重置 App 类型", action: #selector(resetAllAppRoutingTypes))
+                    ]
+                ),
+                makeActionRow(
+                    title: "当前聚焦窗口",
+                    detail: "取 WinCtlManager 操作窗口之外的最顶层窗口；点击后添加标题覆盖规则",
+                    controls: [frontmostLabel, focusedButton]
+                )
+            ]
+        ), to: root)
+
+        let appRoutingStack = NSStackView()
+        appRoutingStack.orientation = .vertical
+        appRoutingStack.spacing = 8
+        appRoutingStack.alignment = .width
+        applyFullWidthAlignment(to: appRoutingStack)
+        appRoutingListStackView = appRoutingStack
+        addFullWidthArrangedSubview(makeSectionGroup(
+            title: "App 基础规则",
+            subtitle: "用连续列表管理每个 App 的默认窗口类型。",
+            views: [makeBoundedScrollView(containing: appRoutingStack, height: 320)],
+            insets: WorkbenchChrome.compactCardInsets
+        ), to: root)
+
+        addFullWidthArrangedSubview(makeActionRow(
             title: "窗口标题规则",
             detail: "标题规则优先于 App 规则",
             controls: [makeButton("清空标题规则", action: #selector(clearUnconstrainedWindows))]
-        ))
+        ), to: root)
 
         let titleRuleStack = NSStackView()
         titleRuleStack.orientation = .vertical
@@ -2600,9 +2625,11 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         titleRuleStack.alignment = .width
         applyFullWidthAlignment(to: titleRuleStack)
         titleRuleListStackView = titleRuleStack
-        root.addArrangedSubview(makeGlassCard(containing: titleRuleStack))
-
-        root.addArrangedSubview(makeSectionTitle("命中非管理规则的当前窗口"))
+        addFullWidthArrangedSubview(makeSectionGroup(
+            title: "窗口标题规则",
+            subtitle: "匹配 App 与窗口标题，对单个窗口做更精细覆盖。",
+            views: [titleRuleStack]
+        ), to: root)
 
         let temporaryMatchStack = NSStackView()
         temporaryMatchStack.orientation = .vertical
@@ -2610,19 +2637,98 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         temporaryMatchStack.alignment = .width
         applyFullWidthAlignment(to: temporaryMatchStack)
         temporaryMatchListStackView = temporaryMatchStack
-        root.addArrangedSubview(makeGlassCard(containing: temporaryMatchStack))
+        addFullWidthArrangedSubview(makeSectionGroup(
+            title: "当前命中非管理规则的窗口",
+            subtitle: "实时查看哪些窗口被 App 规则或标题规则排除出布局管理。",
+            views: [temporaryMatchStack]
+        ), to: root)
 
         refreshUnconstrainedWindowList(with: windowController.listWindows(onScreenOnly: true))
-
-        let spacer = NSView()
-        spacer.translatesAutoresizingMaskIntoConstraints = false
-        root.addArrangedSubview(spacer)
         return root
+    }
+
+    private func makeLiquidGlassPanel() -> NSView {
+        let root = makePanelRoot()
+        addFullWidthArrangedSubview(makeSectionTitle(
+            "液态玻璃",
+            subtitle: "选择桌面堆叠标签栏的 GlassStyle；只影响桌面 stack 标签栏，不改变操作页面布局。"
+        ), to: root)
+
+        addFullWidthArrangedSubview(makeSectionGroup(
+            title: "使用说明",
+            views: [
+                makeActionRow(title: "控制层限定", detail: "GlassStyle 只用于浮在窗口上方的标签栏控制层。", controls: []),
+                makeActionRow(title: "即时预览", detail: "点击样式卡后立即保存，并刷新当前桌面上的 stack 标签栏。", controls: []),
+                makeActionRow(title: "可读优先", detail: "复杂桌面建议用标准磨砂或深烟灰，干净背景可以用清透玻璃。", controls: [])
+            ]
+        ), to: root)
+
+        let grid = NSGridView()
+        grid.translatesAutoresizingMaskIntoConstraints = false
+        grid.rowSpacing = 12
+        grid.columnSpacing = 12
+        applyFullWidthAlignment(to: grid)
+
+        let styles = DesktopConfig.StackTabGlassStyle.allCases
+        for rowIndex in stride(from: 0, to: styles.count, by: 2) {
+            let leftStyle = styles[rowIndex]
+            let left = StackTabGlassStylePreviewCard(
+                style: leftStyle,
+                selected: leftStyle == appConfig.stackTabGlassStyle
+            )
+            left.onSelect = { [weak self] style in
+                self?.selectStackTabGlassStyle(style)
+            }
+
+            let right: NSView
+            if rowIndex + 1 < styles.count {
+                let rightStyle = styles[rowIndex + 1]
+                let card = StackTabGlassStylePreviewCard(
+                    style: rightStyle,
+                    selected: rightStyle == appConfig.stackTabGlassStyle
+                )
+                card.onSelect = { [weak self] style in
+                    self?.selectStackTabGlassStyle(style)
+                }
+                right = card
+            } else {
+                right = NSView()
+            }
+
+            let row = grid.addRow(with: [left, right])
+            row.height = 148
+        }
+        for columnIndex in 0..<grid.numberOfColumns {
+            grid.column(at: columnIndex).width = 320
+        }
+
+        addFullWidthArrangedSubview(makeSectionGroup(
+            title: "GlassStyle 选择",
+            views: [grid]
+        ), to: root)
+
+        if let statusLabel {
+            addFullWidthArrangedSubview(statusLabel, to: root)
+        }
+
+        return root
+    }
+
+    private func selectStackTabGlassStyle(_ style: DesktopConfig.StackTabGlassStyle) {
+        appConfig.stackTabGlassStyle = style
+        do {
+            try appConfig.save()
+            refreshAllStackPanels()
+            switchSection(.liquidGlass, animated: false)
+            setStatus("GlassStyle 已切换：\(style.title)", error: false)
+        } catch {
+            setStatus("保存 GlassStyle 失败：\(error.localizedDescription)", error: true)
+        }
     }
 
     private func makeSettingsPanel() -> NSView {
         let root = makePanelRoot()
-        root.addArrangedSubview(makeSectionTitle("设置", subtitle: "外观、快捷键和高级工具。"))
+        addFullWidthArrangedSubview(makeSectionTitle("设置", subtitle: "外观、快捷键和高级工具。"), to: root)
 
         let appearancePopup = NSPopUpButton(frame: .zero, pullsDown: false)
         appearancePopup.addItems(withTitles: DesktopConfig.WorkbenchAppearance.allCases.map(\.title))
@@ -2632,69 +2738,62 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         appearancePopup.target = self
         appearancePopup.action = #selector(changeWorkbenchAppearance(_:))
         appearancePopup.translatesAutoresizingMaskIntoConstraints = false
-        appearancePopup.widthAnchor.constraint(equalToConstant: 140).isActive = true
+        appearancePopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 160).isActive = true
         self.appearancePopup = appearancePopup
-        root.addArrangedSubview(makeSettingRow(
+        addFullWidthArrangedSubview(makeSectionGroup(
             title: "外观",
-            detail: "钛金属浅色 / 深色 / 跟随系统",
-            control: appearancePopup
-        ))
+            subtitle: "钛金属浅色 / 深色 / 跟随系统。",
+            views: [makeActionRow(
+                title: "Workbench 外观",
+                detail: "切换主工作台的整体 chrome 与钛金属底色。",
+                controls: [appearancePopup]
+            )]
+        ), to: root)
 
-        root.addArrangedSubview(makeSectionTitle("快捷键"))
-        root.addArrangedSubview(makeGlassCard(containing: makeActionRow(
-            title: "统一快捷键配置",
-            detail: "HUD、窗口投放和平铺快捷键已移到侧边栏「快捷键」页面",
-            controls: [makeButton("打开快捷键", action: #selector(showShortcutSection))]
-        )))
+        addFullWidthArrangedSubview(makeSectionGroup(
+            title: "快捷键",
+            subtitle: "HUD、窗口投放和平铺快捷键已移到单独页面统一配置。",
+            views: [makeActionRow(
+                title: "统一快捷键配置",
+                detail: "集中在侧边栏\"快捷键\"页面中维护。",
+                controls: [makeButton("打开快捷键", action: #selector(showShortcutSection))]
+            )]
+        ), to: root)
 
-        root.addArrangedSubview(makeSectionTitle("高级工具"))
-
-        let advRow = NSStackView()
-        advRow.orientation = .vertical
-        advRow.spacing = 8
-        advRow.alignment = .width
-        applyFullWidthAlignment(to: advRow)
-        let bundleRow = NSStackView()
-        bundleRow.orientation = .horizontal
-        bundleRow.spacing = 8
-        bundleRow.alignment = .centerY
         let appBundleIdField = NSTextField(string: "com.google.Chrome")
         appBundleIdField.placeholderString = "Bundle ID"
         appBundleIdField.translatesAutoresizingMaskIntoConstraints = false
-        appBundleIdField.widthAnchor.constraint(equalToConstant: 280).isActive = true
+        appBundleIdField.widthAnchor.constraint(greaterThanOrEqualToConstant: 320).isActive = true
         self.appBundleIdField = appBundleIdField
-        advRow.addArrangedSubview(makeActionRow(
-            title: "打开 App",
-            detail: "Bundle ID",
-            controls: [appBundleIdField, makeButton("打开", action: #selector(launchAppFromInput))]
-        ))
 
-        let chromeRow = NSStackView()
-        chromeRow.orientation = .horizontal
-        chromeRow.spacing = 8
-        chromeRow.alignment = .centerY
         let chromeCountField = NSTextField(string: "3")
         chromeCountField.placeholderString = "窗口数"
         chromeCountField.alignment = .right
         chromeCountField.translatesAutoresizingMaskIntoConstraints = false
-        chromeCountField.widthAnchor.constraint(equalToConstant: 60).isActive = true
+        chromeCountField.widthAnchor.constraint(greaterThanOrEqualToConstant: 72).isActive = true
         self.chromeWindowCountField = chromeCountField
-        advRow.addArrangedSubview(makeActionRow(
-            title: "多开 Chrome",
-            detail: "开发测试窗口",
-            controls: [chromeCountField, makeButton("打开", action: #selector(openMultipleChromeWindows))]
-        ))
 
-        advRow.addArrangedSubview(makeActionRow(
-            title: "分区扫描",
-            detail: "重新计算窗口归属",
-            controls: [makeButton("立即扫描", action: #selector(runAutoScan))]
-        ))
-        root.addArrangedSubview(makeGlassCard(containing: advRow))
-
-        let spacer = NSView()
-        spacer.translatesAutoresizingMaskIntoConstraints = false
-        root.addArrangedSubview(spacer)
+        addFullWidthArrangedSubview(makeSectionGroup(
+            title: "高级工具",
+            subtitle: "把开发与诊断入口收敛到同一组，减少零散设置项。",
+            views: [
+                makeActionRow(
+                    title: "打开 App",
+                    detail: "输入 Bundle ID 直接拉起指定应用。",
+                    controls: [appBundleIdField, makeButton("打开", action: #selector(launchAppFromInput))]
+                ),
+                makeActionRow(
+                    title: "多开 Chrome",
+                    detail: "快速生成开发测试窗口。",
+                    controls: [chromeCountField, makeButton("打开", action: #selector(openMultipleChromeWindows))]
+                ),
+                makeActionRow(
+                    title: "分区扫描",
+                    detail: "重新计算窗口归属。",
+                    controls: [makeButton("立即扫描", action: #selector(runAutoScan))]
+                )
+            ]
+        ), to: root)
 
         return root
     }
@@ -2777,26 +2876,82 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     private func makePanelRoot() -> NSStackView {
         let root = NSStackView()
         root.orientation = .vertical
-        root.spacing = 10
-        root.alignment = .width
+        root.spacing = WorkbenchChrome.sectionSpacing
+        root.alignment = .leading
         root.distribution = .fill
-        root.edgeInsets = NSEdgeInsets(top: 24, left: 28, bottom: 24, right: 28)
+        root.edgeInsets = WorkbenchChrome.pageInsets
         applyFullWidthAlignment(to: root)
         return root
+    }
+
+    private func addFullWidthArrangedSubview(_ subview: NSView, to stack: NSStackView) {
+        stack.addArrangedSubview(subview)
+        subview.translatesAutoresizingMaskIntoConstraints = false
+        let horizontalInset = stack.edgeInsets.left + stack.edgeInsets.right
+        if stack.orientation == .vertical {
+            subview.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -horizontalInset).isActive = true
+        } else {
+            subview.heightAnchor.constraint(equalTo: stack.heightAnchor, constant: -(stack.edgeInsets.top + stack.edgeInsets.bottom)).isActive = true
+        }
+    }
+
+    private func makeSectionGroup(title: String? = nil, subtitle: String? = nil, views: [NSView], insets: NSEdgeInsets = WorkbenchChrome.cardInsets) -> NSVisualEffectView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.spacing = WorkbenchChrome.groupSpacing
+        stack.alignment = .leading
+        stack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+        applyFullWidthAlignment(to: stack)
+
+        if title != nil || subtitle != nil {
+            addFullWidthArrangedSubview(makeGroupHeader(title: title, subtitle: subtitle), to: stack)
+        }
+        views.forEach { addFullWidthArrangedSubview($0, to: stack) }
+        return makeGlassCard(containing: stack, insets: insets)
+    }
+
+    private func makeGroupHeader(title: String? = nil, subtitle: String? = nil) -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.spacing = 4
+        stack.alignment = .leading
+        stack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+        applyFullWidthAlignment(to: stack)
+
+        if let title {
+            let titleLabel = NSTextField(labelWithString: title)
+            titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+            titleLabel.textColor = .labelColor
+            titleLabel.alignment = .left
+            addFullWidthArrangedSubview(titleLabel, to: stack)
+        }
+
+        if let subtitle {
+            let subtitleLabel = NSTextField(labelWithString: subtitle)
+            subtitleLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
+            subtitleLabel.textColor = .secondaryLabelColor
+            subtitleLabel.alignment = .left
+            subtitleLabel.lineBreakMode = .byWordWrapping
+            subtitleLabel.maximumNumberOfLines = 3
+            addFullWidthArrangedSubview(subtitleLabel, to: stack)
+        }
+
+        return stack
     }
 
     private func makeSectionTitle(_ title: String, subtitle: String? = nil) -> NSStackView {
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.spacing = 3
-        stack.alignment = .width
+        stack.alignment = .leading
+        stack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
         applyFullWidthAlignment(to: stack)
 
         let titleLabel = NSTextField(labelWithString: title)
         titleLabel.font = NSFont.systemFont(ofSize: 18, weight: .semibold)
         titleLabel.textColor = .labelColor
         titleLabel.alignment = .left
-        stack.addArrangedSubview(titleLabel)
+        addFullWidthArrangedSubview(titleLabel, to: stack)
 
         if let subtitle {
             let subtitleLabel = NSTextField(labelWithString: subtitle)
@@ -2805,7 +2960,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             subtitleLabel.alignment = .left
             subtitleLabel.lineBreakMode = .byWordWrapping
             subtitleLabel.maximumNumberOfLines = 2
-            stack.addArrangedSubview(subtitleLabel)
+            addFullWidthArrangedSubview(subtitleLabel, to: stack)
         }
 
         return stack
@@ -2823,11 +2978,17 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
 
     private func makeAppRoutingRow(app: AppRoutingItem, popup: NSPopUpButton) -> NSView {
         let row = NSStackView()
-        row.orientation = .horizontal
-        row.spacing = 14
-        row.alignment = .centerY
+        row.orientation = .vertical
+        row.spacing = 8
+        row.alignment = .width
         applyFullWidthAlignment(to: row)
         row.alphaValue = app.isRoutingLocked ? 0.62 : 1.0
+
+        let titleRow = NSStackView()
+        titleRow.orientation = .horizontal
+        titleRow.spacing = 10
+        titleRow.alignment = .centerY
+        applyFullWidthAlignment(to: titleRow)
 
         let iconView = NSImageView()
         iconView.image = app.icon
@@ -2836,36 +2997,46 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         iconView.widthAnchor.constraint(equalToConstant: 26).isActive = true
         iconView.heightAnchor.constraint(equalToConstant: 26).isActive = true
 
+        let labels = NSStackView()
+        labels.orientation = .vertical
+        labels.spacing = 2
+        labels.alignment = .leading
+        labels.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
         let titleLabel = NSTextField(labelWithString: app.appName)
         titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
         titleLabel.textColor = app.isRoutingLocked ? .tertiaryLabelColor : .labelColor
         titleLabel.alignment = .left
         titleLabel.lineBreakMode = .byTruncatingTail
         titleLabel.toolTip = app.bundleId
-        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        labels.addArrangedSubview(titleLabel)
 
-        let titleStack = NSStackView()
-        titleStack.orientation = .horizontal
-        titleStack.spacing = 10
-        titleStack.alignment = .centerY
-        titleStack.addArrangedSubview(iconView)
-        titleStack.addArrangedSubview(titleLabel)
-        titleStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        row.addArrangedSubview(titleStack)
+        let bundleLabel = NSTextField(labelWithString: app.bundleId)
+        bundleLabel.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+        bundleLabel.textColor = .tertiaryLabelColor
+        bundleLabel.alignment = .left
+        bundleLabel.lineBreakMode = .byTruncatingMiddle
+        labels.addArrangedSubview(bundleLabel)
 
-        let spacer = NSView()
-        spacer.translatesAutoresizingMaskIntoConstraints = false
-        row.addArrangedSubview(spacer)
+        titleRow.addArrangedSubview(iconView)
+        titleRow.addArrangedSubview(labels)
+        row.addArrangedSubview(titleRow)
 
-        row.addArrangedSubview(makeControlCluster([popup]))
+        let controlsRow = NSStackView()
+        controlsRow.orientation = .horizontal
+        controlsRow.spacing = 10
+        controlsRow.alignment = .centerY
+        applyFullWidthAlignment(to: controlsRow)
+        controlsRow.addArrangedSubview(popup)
 
         let note = app.isRoutingLocked ? "只读" : (app.windowCount > 0 ? "运行中 \(app.windowCount)" : "未打开")
         let noteLabel = NSTextField(labelWithString: note)
         noteLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
         noteLabel.textColor = app.isRoutingLocked || app.windowCount == 0 ? .tertiaryLabelColor : .secondaryLabelColor
-        noteLabel.alignment = .right
+        noteLabel.alignment = .left
         noteLabel.setContentHuggingPriority(.required, for: .horizontal)
-        row.addArrangedSubview(noteLabel)
+        controlsRow.addArrangedSubview(noteLabel)
+        row.addArrangedSubview(controlsRow)
 
         return row
     }
@@ -2878,49 +3049,51 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         muted: Bool = false
     ) -> NSView {
         let row = NSStackView()
-        row.orientation = .horizontal
-        row.spacing = 14
-        row.alignment = .centerY
+        row.orientation = .vertical
+        row.spacing = controls.isEmpty ? 4 : 8
+        row.alignment = .width
         applyFullWidthAlignment(to: row)
         row.alphaValue = muted ? 0.62 : 1.0
 
         let textStack = NSStackView()
         textStack.orientation = .vertical
-        textStack.spacing = 2
+        textStack.spacing = 3
         textStack.alignment = .leading
-        textStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        applyFullWidthAlignment(to: textStack)
 
         let titleLabel = NSTextField(labelWithString: title)
         titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
         titleLabel.textColor = muted ? .tertiaryLabelColor : .labelColor
         titleLabel.alignment = .left
         titleLabel.lineBreakMode = .byTruncatingTail
-        textStack.addArrangedSubview(titleLabel)
+        addFullWidthArrangedSubview(titleLabel, to: textStack)
 
         if let detail {
             let detailLabel = NSTextField(labelWithString: detail)
             detailLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
             detailLabel.textColor = muted ? .tertiaryLabelColor : .secondaryLabelColor
             detailLabel.alignment = .left
-            detailLabel.lineBreakMode = .byTruncatingTail
-            textStack.addArrangedSubview(detailLabel)
+            detailLabel.lineBreakMode = .byWordWrapping
+            detailLabel.maximumNumberOfLines = 2
+            addFullWidthArrangedSubview(detailLabel, to: textStack)
         }
-
-        row.addArrangedSubview(textStack)
-
-        let spacer = NSView()
-        spacer.translatesAutoresizingMaskIntoConstraints = false
-        row.addArrangedSubview(spacer)
-
-        row.addArrangedSubview(makeControlCluster(controls))
 
         if let trailingNote {
             let noteLabel = NSTextField(labelWithString: trailingNote)
             noteLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
             noteLabel.textColor = .tertiaryLabelColor
-            noteLabel.alignment = .right
-            noteLabel.setContentHuggingPriority(.required, for: .horizontal)
-            row.addArrangedSubview(noteLabel)
+            noteLabel.alignment = .left
+            noteLabel.lineBreakMode = .byWordWrapping
+            noteLabel.maximumNumberOfLines = 2
+            addFullWidthArrangedSubview(noteLabel, to: textStack)
+        }
+
+        addFullWidthArrangedSubview(textStack, to: row)
+
+        if !controls.isEmpty {
+            let controlsRow = makeControlCluster(controls)
+            controlsRow.alignment = .leading
+            addFullWidthArrangedSubview(controlsRow, to: row)
         }
 
         return row
@@ -2958,16 +3131,17 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         return scrollView
     }
 
-    private func makeGlassCard(containing content: NSView, insets: NSEdgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 10)) -> NSVisualEffectView {
+    private func makeGlassCard(containing content: NSView, insets: NSEdgeInsets = WorkbenchChrome.cardInsets) -> NSVisualEffectView {
         let card = NSVisualEffectView()
         card.material = .contentBackground
         card.blendingMode = .withinWindow
         card.state = .active
         card.wantsLayer = true
-        card.layer?.cornerRadius = 8
+        card.layer?.cornerRadius = WorkbenchChrome.cardCornerRadius
+        card.layer?.cornerCurve = .continuous
         card.layer?.masksToBounds = true
-        card.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.18).cgColor
-        card.layer?.borderWidth = 1
+        card.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.12).cgColor
+        card.layer?.borderWidth = 0.5
         card.translatesAutoresizingMaskIntoConstraints = false
         applyFullWidthAlignment(to: card)
 
@@ -3077,6 +3251,10 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             stackPanelTabStacks[stack.name] = tabsStack
         }
 
+        if let effect = panel.contentView as? NSVisualEffectView {
+            effect.material = appConfig.stackTabGlassStyle.material
+            effect.layer?.borderColor = appConfig.stackTabGlassStyle.borderColor.cgColor
+        }
         panel.setFrame(panelFrame, display: true)
 
         tabsStack.arrangedSubviews.forEach {
@@ -3094,7 +3272,9 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             let btn = StackTabButton(title: label, target: self, action: #selector(selectStackTab(_:)))
             btn.stackName = stack.name
             btn.tabIndex = index
-            btn.bezelStyle = .rounded
+            btn.glassStyle = appConfig.stackTabGlassStyle
+            btn.isActiveTab = index == stack.activeIndex
+            btn.isBordered = false
             btn.controlSize = .small
             btn.font = NSFont.systemFont(ofSize: 11, weight: index == stack.activeIndex ? .semibold : .regular)
             tabsStack.addArrangedSubview(btn)
@@ -3123,8 +3303,11 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         effect.blendingMode = .withinWindow
         effect.state = .active
         effect.wantsLayer = true
-        effect.layer?.cornerRadius = 8
+        effect.layer?.cornerRadius = 16
+        effect.layer?.cornerCurve = .continuous
         effect.layer?.masksToBounds = true
+        effect.layer?.borderColor = NSColor.white.withAlphaComponent(0.22).cgColor
+        effect.layer?.borderWidth = 1
         effect.autoresizingMask = [.width, .height]
         panel.contentView = effect
 
@@ -3632,6 +3815,15 @@ private final class DesktopContainerView: NSView {
         super.init(frame: .zero)
         wantsLayer = true
         layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.95).cgColor
+    }
+
+    var heightToWidthRatio: CGFloat {
+        guard displayFrame.width > 0 else { return 0.5625 }
+        return displayFrame.height / displayFrame.width
+    }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
     }
 
     @available(*, unavailable)
@@ -4310,9 +4502,249 @@ private final class DesktopContainerView: NSView {
     }
 }
 
+private extension DesktopConfig.StackTabGlassStyle {
+    var material: NSVisualEffectView.Material {
+        switch self {
+        case .crystalClear: return .underWindowBackground
+        case .softFrost: return .sidebar
+        case .milkyTitanium: return .menu
+        case .graphiteSmoke: return .hudWindow
+        }
+    }
+
+    var tintColor: NSColor {
+        switch self {
+        case .crystalClear:
+            return NSColor(calibratedRed: 0.62, green: 0.80, blue: 0.98, alpha: 1)
+        case .softFrost:
+            return NSColor(calibratedRed: 0.55, green: 0.66, blue: 0.82, alpha: 1)
+        case .milkyTitanium:
+            return NSColor(calibratedRed: 0.70, green: 0.74, blue: 0.80, alpha: 1)
+        case .graphiteSmoke:
+            return NSColor(calibratedRed: 0.56, green: 0.64, blue: 0.74, alpha: 1)
+        }
+    }
+
+    var containerFillColor: NSColor {
+        switch self {
+        case .crystalClear: return NSColor.white.withAlphaComponent(0.08)
+        case .softFrost: return NSColor(calibratedWhite: 0.92, alpha: 0.10)
+        case .milkyTitanium: return NSColor(calibratedRed: 0.86, green: 0.89, blue: 0.93, alpha: 0.18)
+        case .graphiteSmoke: return NSColor.black.withAlphaComponent(0.24)
+        }
+    }
+
+    var tabFillColor: NSColor {
+        switch self {
+        case .crystalClear: return NSColor.white.withAlphaComponent(0.11)
+        case .softFrost: return NSColor(calibratedWhite: 0.96, alpha: 0.10)
+        case .milkyTitanium: return NSColor(calibratedRed: 0.91, green: 0.93, blue: 0.96, alpha: 0.20)
+        case .graphiteSmoke: return NSColor.white.withAlphaComponent(0.08)
+        }
+    }
+
+    var activeFillColor: NSColor {
+        tintColor.withAlphaComponent(self == .graphiteSmoke ? 0.28 : 0.20)
+    }
+
+    var borderColor: NSColor {
+        switch self {
+        case .crystalClear: return NSColor.white.withAlphaComponent(0.34)
+        case .softFrost: return NSColor.white.withAlphaComponent(0.22)
+        case .milkyTitanium: return NSColor.white.withAlphaComponent(0.26)
+        case .graphiteSmoke: return NSColor.white.withAlphaComponent(0.18)
+        }
+    }
+
+    var textColor: NSColor {
+        self == .graphiteSmoke ? .white : .labelColor
+    }
+
+    var secondaryTextColor: NSColor {
+        self == .graphiteSmoke ? NSColor.white.withAlphaComponent(0.72) : .secondaryLabelColor
+    }
+}
+
 private final class StackTabButton: NSButton {
     var stackName: String = ""
     var tabIndex: Int = 0
+    var glassStyle: DesktopConfig.StackTabGlassStyle = .softFrost {
+        didSet { needsDisplay = true }
+    }
+    var isActiveTab: Bool = false {
+        didSet { needsDisplay = true }
+    }
+    private var isHovered = false
+
+    override var intrinsicContentSize: NSSize {
+        let base = super.intrinsicContentSize
+        return NSSize(width: min(max(base.width + 18, 58), 180), height: 22)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        ))
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let rect = bounds.insetBy(dx: 1, dy: 1)
+        let path = NSBezierPath(roundedRect: rect, xRadius: 10, yRadius: 10)
+        (isActiveTab ? glassStyle.activeFillColor : glassStyle.tabFillColor).setFill()
+        path.fill()
+
+        if isHovered && !isActiveTab {
+            NSColor.white.withAlphaComponent(0.08).setFill()
+            path.fill()
+        }
+
+        (isActiveTab ? glassStyle.tintColor.withAlphaComponent(0.62) : glassStyle.borderColor).setStroke()
+        path.lineWidth = isActiveTab ? 1.2 : 1
+        path.stroke()
+
+        let glint = NSBezierPath()
+        glint.move(to: NSPoint(x: rect.minX + 10, y: rect.maxY - 1))
+        glint.line(to: NSPoint(x: rect.maxX - 10, y: rect.maxY - 1))
+        NSColor.white.withAlphaComponent(isActiveTab ? 0.22 : 0.12).setStroke()
+        glint.lineWidth = 1
+        glint.stroke()
+
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font ?? NSFont.systemFont(ofSize: 11, weight: isActiveTab ? .semibold : .regular),
+            .foregroundColor: isActiveTab ? glassStyle.textColor : glassStyle.secondaryTextColor,
+            .paragraphStyle: {
+                let paragraph = NSMutableParagraphStyle()
+                paragraph.alignment = .center
+                paragraph.lineBreakMode = .byTruncatingTail
+                return paragraph
+            }()
+        ]
+        title.draw(in: rect.insetBy(dx: 8, dy: 4), withAttributes: attrs)
+    }
+}
+
+private final class StackTabGlassStylePreviewCard: NSView {
+    let style: DesktopConfig.StackTabGlassStyle
+    var selected: Bool {
+        didSet { needsDisplay = true }
+    }
+    var onSelect: ((DesktopConfig.StackTabGlassStyle) -> Void)?
+    private var isHovered = false
+
+    init(style: DesktopConfig.StackTabGlassStyle, selected: Bool) {
+        self.style = style
+        self.selected = selected
+        super.init(frame: NSRect(x: 0, y: 0, width: 320, height: 148))
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(greaterThanOrEqualToConstant: 280).isActive = true
+        heightAnchor.constraint(equalToConstant: 148).isActive = true
+        addTrackingArea(NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        ))
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { nil }
+
+    override func mouseDown(with event: NSEvent) {
+        onSelect?(style)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let rect = bounds.insetBy(dx: 1, dy: 1)
+        let path = NSBezierPath(roundedRect: rect, xRadius: 16, yRadius: 16)
+        style.containerFillColor.setFill()
+        path.fill()
+        if isHovered {
+            NSColor.white.withAlphaComponent(0.055).setFill()
+            path.fill()
+        }
+        (selected ? style.tintColor.withAlphaComponent(0.68) : style.borderColor).setStroke()
+        path.lineWidth = selected ? 1.4 : 1
+        path.stroke()
+
+        let titleAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
+            .foregroundColor: style.textColor
+        ]
+        let subtitleAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: style.secondaryTextColor
+        ]
+        style.title.draw(in: NSRect(x: 16, y: bounds.height - 34, width: bounds.width - 96, height: 18), withAttributes: titleAttrs)
+        style.subtitle.draw(in: NSRect(x: 16, y: bounds.height - 54, width: bounds.width - 32, height: 16), withAttributes: subtitleAttrs)
+
+        if selected {
+            "已选择".draw(
+                in: NSRect(x: bounds.width - 66, y: bounds.height - 34, width: 50, height: 18),
+                withAttributes: [
+                    .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                    .foregroundColor: style.tintColor
+                ]
+            )
+        }
+
+        drawSampleTabBar(in: NSRect(x: 16, y: 20, width: bounds.width - 32, height: 42))
+    }
+
+    private func drawSampleTabBar(in rect: NSRect) {
+        let shell = NSBezierPath(roundedRect: rect, xRadius: 16, yRadius: 16)
+        style.containerFillColor.setFill()
+        shell.fill()
+        style.borderColor.setStroke()
+        shell.lineWidth = 1
+        shell.stroke()
+
+        let labels = ["1. 文稿", "2. 浏览器", "3. 终端"]
+        let widths: [CGFloat] = [74, 88, 76]
+        var x = rect.minX + 8
+        for index in labels.indices {
+            let tab = NSRect(x: x, y: rect.minY + 8, width: widths[index], height: 26)
+            let tabPath = NSBezierPath(roundedRect: tab, xRadius: 13, yRadius: 13)
+            (index == 1 ? style.activeFillColor : style.tabFillColor).setFill()
+            tabPath.fill()
+            (index == 1 ? style.tintColor.withAlphaComponent(0.64) : style.borderColor).setStroke()
+            tabPath.lineWidth = index == 1 ? 1.2 : 1
+            tabPath.stroke()
+            labels[index].draw(
+                in: tab.insetBy(dx: 9, dy: 6),
+                withAttributes: [
+                    .font: NSFont.systemFont(ofSize: 10, weight: index == 1 ? .semibold : .medium),
+                    .foregroundColor: index == 1 ? style.textColor : style.secondaryTextColor
+                ]
+            )
+            x += widths[index] + 8
+        }
+    }
 }
 
 private final class TitaniumBackgroundView: NSView {
@@ -4335,16 +4767,16 @@ private final class TitaniumBackgroundView: NSView {
         }
 
         let top = isDark
-            ? NSColor(calibratedRed: 0.075, green: 0.078, blue: 0.083, alpha: 1)
-            : NSColor(calibratedRed: 0.87, green: 0.86, blue: 0.835, alpha: 1)
+            ? NSColor(calibratedRed: 0.085, green: 0.092, blue: 0.106, alpha: 1)
+            : NSColor(calibratedRed: 0.84, green: 0.87, blue: 0.91, alpha: 1)
         let bottom = isDark
-            ? NSColor(calibratedRed: 0.032, green: 0.034, blue: 0.038, alpha: 1)
-            : NSColor(calibratedRed: 0.965, green: 0.956, blue: 0.93, alpha: 1)
-        NSGradient(starting: top, ending: bottom)?.draw(in: bounds, angle: 88)
+            ? NSColor(calibratedRed: 0.038, green: 0.043, blue: 0.052, alpha: 1)
+            : NSColor(calibratedRed: 0.94, green: 0.955, blue: 0.972, alpha: 1)
+        NSGradient(starting: top, ending: bottom)?.draw(in: bounds, angle: 90)
 
         let lineColor = isDark
-            ? NSColor.white.withAlphaComponent(0.025)
-            : NSColor.black.withAlphaComponent(0.035)
+            ? NSColor.white.withAlphaComponent(0.022)
+            : NSColor.black.withAlphaComponent(0.024)
         lineColor.setStroke()
         let path = NSBezierPath()
         path.lineWidth = 1
@@ -4352,12 +4784,24 @@ private final class TitaniumBackgroundView: NSView {
         while y < bounds.maxY {
             path.move(to: NSPoint(x: bounds.minX, y: y.rounded()))
             path.line(to: NSPoint(x: bounds.maxX, y: y.rounded()))
-            y += 5
+            y += 6
         }
         path.stroke()
 
+        let glossRect = bounds.insetBy(dx: 0, dy: bounds.height * 0.45)
+        if let gloss = NSGradient(
+            colors: [
+                NSColor.white.withAlphaComponent(isDark ? 0.02 : 0.10),
+                NSColor.white.withAlphaComponent(0)
+            ],
+            atLocations: [0, 1],
+            colorSpace: .deviceRGB
+        ) {
+            gloss.draw(in: glossRect, angle: 270)
+        }
+
         let vignette = NSBezierPath(rect: bounds)
-        (isDark ? NSColor.black.withAlphaComponent(0.18) : NSColor.white.withAlphaComponent(0.18)).setFill()
+        (isDark ? NSColor.black.withAlphaComponent(0.16) : NSColor.white.withAlphaComponent(0.12)).setFill()
         vignette.fill()
     }
 }
@@ -5056,9 +5500,9 @@ private final class SidebarItemView: NSView {
 
     init(section: WorkbenchSection) {
         self.section = section
-        super.init(frame: NSRect(x: 0, y: 0, width: 196, height: 36))
+        super.init(frame: NSRect(x: 0, y: 0, width: 216, height: 38))
         translatesAutoresizingMaskIntoConstraints = false
-        heightAnchor.constraint(equalToConstant: 36).isActive = true
+        heightAnchor.constraint(equalToConstant: 38).isActive = true
         wantsLayer = true
         addTrackingArea(NSTrackingArea(
             rect: .zero,
@@ -5075,19 +5519,19 @@ private final class SidebarItemView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        let pillRect = bounds.insetBy(dx: 4, dy: 2)
-        let pill = NSBezierPath(roundedRect: pillRect, xRadius: 8, yRadius: 8)
+        let pillRect = bounds.insetBy(dx: 4, dy: 3)
+        let pill = NSBezierPath(roundedRect: pillRect, xRadius: 10, yRadius: 10)
 
         if isSelected {
-            NSColor.controlAccentColor.withAlphaComponent(0.18).setFill()
+            NSColor.controlAccentColor.withAlphaComponent(0.14).setFill()
             pill.fill()
         } else if isHovered {
-            NSColor.labelColor.withAlphaComponent(0.06).setFill()
+            NSColor.labelColor.withAlphaComponent(0.05).setFill()
             pill.fill()
         }
 
         let iconSize: CGFloat = 18
-        let iconX: CGFloat = 16
+        let iconX: CGFloat = 18
         let iconY = (bounds.height - iconSize) / 2
         if let image = NSImage(systemSymbolName: section.symbolName, accessibilityDescription: section.title) {
             let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
@@ -5105,7 +5549,7 @@ private final class SidebarItemView: NSView {
             .foregroundColor: isSelected ? NSColor.controlAccentColor : NSColor.labelColor
         ]
         section.title.draw(
-            in: NSRect(x: 42, y: (bounds.height - 16) / 2, width: bounds.width - 54, height: 16),
+            in: NSRect(x: 44, y: (bounds.height - 16) / 2, width: bounds.width - 56, height: 16),
             withAttributes: textAttrs
         )
     }
