@@ -353,10 +353,16 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     private var dockPreviewHideWorkItem: DispatchWorkItem?
     private var windowSwitcherPanel: NSPanel?
     private var windowSwitcherSearchField: WindowSwitcherSearchField?
+    private var windowSwitcherScrollView: NSScrollView?
     private var windowSwitcherResultsStackView: NSStackView?
+    private var windowSwitcherResultRows: [WindowSwitcherResultRowView] = []
     private var windowSwitcherAllResults: [WindowSwitcherResult] = []
     private var windowSwitcherVisibleResults: [WindowSwitcherResult] = []
     private var windowSwitcherSelectedIndex = 0
+    private var windowSwitcherVirtualSelectedIndex = 0
+    private let windowSwitcherVirtualRepetition = 9
+    private var windowSwitcherLoadGeneration = 0
+    private var windowSwitcherRootView: WindowSwitcherRootView?
     private var isQuitting = false
 
     init(
@@ -3541,7 +3547,6 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     @objc
     private func showWindowSwitcher() {
         hideDockPreviewPanel()
-        windowSwitcherAllResults = buildWindowSwitcherResults()
         windowSwitcherSelectedIndex = 0
 
         let panel = windowSwitcherPanel ?? makeWindowSwitcherPanel()
@@ -3554,9 +3559,26 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         panel.makeKeyAndOrderFront(nil)
         panel.level = .floating
         if let field = windowSwitcherSearchField {
+            field.stringValue = ""
             panel.makeFirstResponder(field)
         }
-        applyWindowSwitcherFilter()
+
+        windowSwitcherAllResults = []
+        windowSwitcherVisibleResults = []
+        showWindowSwitcherLoadingState()
+
+        windowSwitcherLoadGeneration += 1
+        let loadGeneration = windowSwitcherLoadGeneration
+        DispatchQueue.main.async { [weak self, weak panel] in
+            guard let self,
+                  let panel,
+                  panel.isVisible,
+                  loadGeneration == self.windowSwitcherLoadGeneration else {
+                return
+            }
+            self.windowSwitcherAllResults = self.buildWindowSwitcherResults()
+            self.applyWindowSwitcherFilter()
+        }
         setStatus("窗口搜索已打开：输入 App、标题、URL 或窗口编号", error: false)
     }
 
@@ -3571,7 +3593,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
         panel.isFloatingPanel = true
-        panel.hidesOnDeactivate = false
+        panel.hidesOnDeactivate = true
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
@@ -3591,23 +3613,20 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     }
 
     private func makeWindowSwitcherContent() -> NSView {
-        let root = NSVisualEffectView()
-        root.material = .menu
-        root.blendingMode = .withinWindow
-        root.state = .active
+        let root = WindowSwitcherRootView()
         root.wantsLayer = true
-        root.layer?.cornerRadius = 26
-        root.layer?.cornerCurve = .continuous
-        root.layer?.masksToBounds = true
-        root.layer?.borderColor = NSColor.white.withAlphaComponent(0.20).cgColor
-        root.layer?.borderWidth = 0.8
-        root.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.05).cgColor
-        root.translatesAutoresizingMaskIntoConstraints = false
+        root.layer?.backgroundColor = NSColor.clear.cgColor
+        root.translatesAutoresizingMaskIntoConstraints = true
+        root.autoresizingMask = [.width, .height]
+        root.onBackgroundClick = { [weak self] in
+            self?.windowSwitcherPanel?.orderOut(nil)
+        }
+        windowSwitcherRootView = root
 
         let stack = NSStackView()
         stack.orientation = .vertical
-        stack.spacing = 14
-        stack.edgeInsets = NSEdgeInsets(top: 22, left: 22, bottom: 22, right: 22)
+        stack.spacing = 12
+        stack.edgeInsets = NSEdgeInsets(top: 16, left: 18, bottom: 16, right: 18)
         stack.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -3621,12 +3640,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         searchField.placeholderString = "搜索窗口、App、URL 或 #编号"
         searchField.font = NSFont.systemFont(ofSize: 18, weight: .medium)
         searchField.controlSize = .large
-        searchField.wantsLayer = true
-        searchField.layer?.cornerRadius = 14
-        searchField.layer?.cornerCurve = .continuous
         searchField.delegate = self
-        searchField.translatesAutoresizingMaskIntoConstraints = false
-        searchField.heightAnchor.constraint(equalToConstant: 46).isActive = true
         searchField.onMoveSelection = { [weak self] delta in
             self?.moveWindowSwitcherSelection(delta)
         }
@@ -3637,14 +3651,27 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             self?.windowSwitcherPanel?.orderOut(nil)
         }
         windowSwitcherSearchField = searchField
-        stack.addArrangedSubview(searchField)
-
-        let hint = NSTextField(labelWithString: "↑↓ 选择 · Return 聚焦 · Esc 关闭 · 当前仅索引窗口和浏览器 active tab")
-        hint.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        hint.textColor = .secondaryLabelColor
-        hint.alignment = .left
-        hint.lineBreakMode = .byTruncatingTail
-        stack.addArrangedSubview(hint)
+        let searchGlass = NSVisualEffectView()
+        searchGlass.material = .hudWindow
+        searchGlass.blendingMode = .withinWindow
+        searchGlass.state = .active
+        searchGlass.wantsLayer = true
+        searchGlass.layer?.cornerRadius = 16
+        searchGlass.layer?.cornerCurve = .continuous
+        searchGlass.layer?.masksToBounds = true
+        searchGlass.layer?.borderColor = NSColor.white.withAlphaComponent(0.24).cgColor
+        searchGlass.layer?.borderWidth = 0.8
+        searchGlass.translatesAutoresizingMaskIntoConstraints = false
+        searchGlass.heightAnchor.constraint(equalToConstant: 52).isActive = true
+        searchGlass.addSubview(searchField)
+        searchField.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            searchField.leadingAnchor.constraint(equalTo: searchGlass.leadingAnchor, constant: 10),
+            searchField.trailingAnchor.constraint(equalTo: searchGlass.trailingAnchor, constant: -10),
+            searchField.centerYAnchor.constraint(equalTo: searchGlass.centerYAnchor),
+            searchField.heightAnchor.constraint(equalToConstant: 46)
+        ])
+        stack.addArrangedSubview(searchGlass)
 
         let resultsStack = NSStackView()
         resultsStack.orientation = .vertical
@@ -3663,17 +3690,91 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             resultsStack.bottomAnchor.constraint(equalTo: documentContainer.bottomAnchor)
         ])
 
-        let scrollView = NSScrollView()
-        scrollView.hasVerticalScroller = true
+        let scrollView = WindowSwitcherRollerScrollView()
+        scrollView.hasVerticalScroller = false
         scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
         scrollView.documentView = documentContainer
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.heightAnchor.constraint(equalToConstant: 440).isActive = true
-        stack.addArrangedSubview(scrollView)
+        scrollView.wantsLayer = true
+        scrollView.layer?.cornerRadius = 22
+        scrollView.layer?.cornerCurve = .continuous
+        scrollView.layer?.masksToBounds = true
+        scrollView.layer?.backgroundColor = NSColor.clear.cgColor
+        scrollView.onStepSelection = { [weak self] delta in
+            self?.moveWindowSwitcherSelection(delta)
+        }
+        windowSwitcherScrollView = scrollView
         documentContainer.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor).isActive = true
 
+        let resultsContainer = NSVisualEffectView()
+        resultsContainer.material = .hudWindow
+        resultsContainer.blendingMode = .withinWindow
+        resultsContainer.state = .active
+        resultsContainer.wantsLayer = true
+        resultsContainer.layer?.cornerRadius = 22
+        resultsContainer.layer?.cornerCurve = .continuous
+        resultsContainer.layer?.masksToBounds = true
+        resultsContainer.layer?.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor
+        resultsContainer.layer?.borderWidth = 0.8
+        resultsContainer.translatesAutoresizingMaskIntoConstraints = false
+        resultsContainer.addSubview(scrollView)
+        let topFade = WindowSwitcherEdgeFadeView(edge: .top)
+        let bottomFade = WindowSwitcherEdgeFadeView(edge: .bottom)
+        topFade.translatesAutoresizingMaskIntoConstraints = false
+        bottomFade.translatesAutoresizingMaskIntoConstraints = false
+        resultsContainer.addSubview(topFade)
+        resultsContainer.addSubview(bottomFade)
+        NSLayoutConstraint.activate([
+            scrollView.leadingAnchor.constraint(equalTo: resultsContainer.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: resultsContainer.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: resultsContainer.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: resultsContainer.bottomAnchor),
+            topFade.leadingAnchor.constraint(equalTo: resultsContainer.leadingAnchor),
+            topFade.trailingAnchor.constraint(equalTo: resultsContainer.trailingAnchor),
+            topFade.topAnchor.constraint(equalTo: resultsContainer.topAnchor),
+            topFade.heightAnchor.constraint(equalToConstant: 34),
+            bottomFade.leadingAnchor.constraint(equalTo: resultsContainer.leadingAnchor),
+            bottomFade.trailingAnchor.constraint(equalTo: resultsContainer.trailingAnchor),
+            bottomFade.bottomAnchor.constraint(equalTo: resultsContainer.bottomAnchor),
+            bottomFade.heightAnchor.constraint(equalToConstant: 34)
+        ])
+        stack.addArrangedSubview(resultsContainer)
+
         return root
+    }
+
+    private func showWindowSwitcherLoadingState() {
+        guard let stack = windowSwitcherResultsStackView else { return }
+        windowSwitcherResultRows.removeAll()
+        stack.arrangedSubviews.forEach {
+            stack.removeArrangedSubview($0)
+            $0.removeFromSuperview()
+        }
+
+        let loading = NSProgressIndicator()
+        loading.style = .spinning
+        loading.controlSize = .regular
+        loading.startAnimation(nil)
+        loading.translatesAutoresizingMaskIntoConstraints = false
+        loading.widthAnchor.constraint(equalToConstant: 26).isActive = true
+        loading.heightAnchor.constraint(equalToConstant: 26).isActive = true
+
+        let loadingLabel = NSTextField(labelWithString: "正在加载窗口…")
+        loadingLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        loadingLabel.textColor = .secondaryLabelColor
+
+        let row = NSStackView(views: [loading, loadingLabel])
+        row.orientation = .horizontal
+        row.spacing = 10
+        row.alignment = .centerY
+        row.edgeInsets = NSEdgeInsets(top: 18, left: 18, bottom: 18, right: 18)
+        row.wantsLayer = true
+        row.layer?.cornerRadius = 14
+        row.layer?.cornerCurve = .continuous
+        row.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.08).cgColor
+        stack.addArrangedSubview(row)
     }
 
     func controlTextDidChange(_ obj: Notification) {
@@ -3738,12 +3839,14 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
 
     private func reloadWindowSwitcherRows() {
         guard let stack = windowSwitcherResultsStackView else { return }
+        windowSwitcherResultRows.removeAll()
         stack.arrangedSubviews.forEach {
             stack.removeArrangedSubview($0)
             $0.removeFromSuperview()
         }
 
         guard !windowSwitcherVisibleResults.isEmpty else {
+            windowSwitcherVirtualSelectedIndex = 0
             let empty = NSTextField(labelWithString: "没有匹配的窗口。")
             empty.font = NSFont.systemFont(ofSize: 13, weight: .medium)
             empty.textColor = .secondaryLabelColor
@@ -3754,22 +3857,115 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             return
         }
 
-        for (index, result) in windowSwitcherVisibleResults.enumerated() {
+        let logicalCount = windowSwitcherVisibleResults.count
+        let repetition = max(windowSwitcherVirtualRepetition, 5)
+        let virtualCount = logicalCount * repetition
+        let centerBlockIndex = repetition / 2
+        windowSwitcherVirtualSelectedIndex = centerBlockIndex * logicalCount + windowSwitcherSelectedIndex
+
+        for virtualIndex in 0..<virtualCount {
+            let result = windowSwitcherVisibleResults[virtualIndex % logicalCount]
             let row = WindowSwitcherResultRowView(result: result)
-            row.isSelected = index == windowSwitcherSelectedIndex
+            row.isSelected = virtualIndex == windowSwitcherVirtualSelectedIndex
             row.onSelect = { [weak self] in
-                self?.windowSwitcherSelectedIndex = index
-                self?.focusSelectedWindowSwitcherResult()
+                guard let self else { return }
+                self.windowSwitcherVirtualSelectedIndex = virtualIndex
+                self.windowSwitcherSelectedIndex = virtualIndex % logicalCount
+                self.updateWindowSwitcherRollerAppearance(animated: false)
+                self.focusSelectedWindowSwitcherResult()
             }
+            windowSwitcherResultRows.append(row)
             stack.addArrangedSubview(row)
         }
+
+        updateWindowSwitcherRollerAppearance(animated: false)
     }
 
     private func moveWindowSwitcherSelection(_ delta: Int) {
         guard !windowSwitcherVisibleResults.isEmpty else { return }
-        let count = windowSwitcherVisibleResults.count
-        windowSwitcherSelectedIndex = (windowSwitcherSelectedIndex + delta + count) % count
-        reloadWindowSwitcherRows()
+        let logicalCount = windowSwitcherVisibleResults.count
+        windowSwitcherSelectedIndex = (windowSwitcherSelectedIndex + delta + logicalCount) % logicalCount
+        windowSwitcherVirtualSelectedIndex += delta
+        normalizeWindowSwitcherVirtualSelection()
+        updateWindowSwitcherRollerAppearance(animated: false)
+    }
+
+    private func updateWindowSwitcherRollerAppearance(animated: Bool) {
+        guard !windowSwitcherResultRows.isEmpty else { return }
+        normalizeWindowSwitcherVirtualSelection()
+
+        for (index, row) in windowSwitcherResultRows.enumerated() {
+            let signedDistance = index - windowSwitcherVirtualSelectedIndex
+            let distance = abs(signedDistance)
+            row.isSelected = index == windowSwitcherVirtualSelectedIndex
+            row.rollDistance = distance
+            row.alphaValue = max(0.14, 1.0 - CGFloat(distance) * 0.14)
+            row.applyRollerTransform(signedDistance: signedDistance)
+        }
+
+        centerSelectedWindowSwitcherRow(animated: animated)
+    }
+
+    private func centerSelectedWindowSwitcherRow(animated: Bool) {
+        guard let scrollView = windowSwitcherScrollView,
+              let documentView = scrollView.documentView,
+              windowSwitcherVirtualSelectedIndex >= 0,
+              windowSwitcherVirtualSelectedIndex < windowSwitcherResultRows.count
+        else {
+            return
+        }
+
+        // Ensure row frames are up to date before calculating target offset.
+        documentView.layoutSubtreeIfNeeded()
+        let selectedRow = windowSwitcherResultRows[windowSwitcherVirtualSelectedIndex]
+        let viewportHeight = scrollView.contentView.bounds.height
+        let documentHeight = documentView.bounds.height
+        let maxY = max(0, documentHeight - viewportHeight)
+        let targetY = min(max(0, selectedRow.frame.midY - viewportHeight / 2), maxY)
+        let targetOrigin = NSPoint(x: 0, y: targetY)
+
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.12
+                scrollView.contentView.animator().setBoundsOrigin(targetOrigin)
+            }
+        } else {
+            scrollView.contentView.setBoundsOrigin(targetOrigin)
+        }
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+    }
+
+    private func normalizeWindowSwitcherVirtualSelection() {
+        guard !windowSwitcherResultRows.isEmpty,
+              !windowSwitcherVisibleResults.isEmpty else {
+            windowSwitcherVirtualSelectedIndex = 0
+            return
+        }
+
+        let logicalCount = windowSwitcherVisibleResults.count
+        let total = windowSwitcherResultRows.count
+        if total <= logicalCount {
+            windowSwitcherVirtualSelectedIndex = windowSwitcherSelectedIndex % logicalCount
+            return
+        }
+
+        while windowSwitcherVirtualSelectedIndex < 0 {
+            windowSwitcherVirtualSelectedIndex += total
+        }
+        while windowSwitcherVirtualSelectedIndex >= total {
+            windowSwitcherVirtualSelectedIndex -= total
+        }
+
+        // Keep selection in center blocks to avoid visible top/bottom boundaries.
+        let lowerBound = logicalCount * 2
+        let upperBound = total - logicalCount * 3
+        let recenterStride = logicalCount * 3
+
+        if windowSwitcherVirtualSelectedIndex < lowerBound {
+            windowSwitcherVirtualSelectedIndex += recenterStride
+        } else if windowSwitcherVirtualSelectedIndex > upperBound {
+            windowSwitcherVirtualSelectedIndex -= recenterStride
+        }
     }
 
     private func focusSelectedWindowSwitcherResult() {
@@ -6713,6 +6909,27 @@ private final class DesktopHandleOverlayView: NSView {
     }
 }
 
+private final class WindowSwitcherRootView: NSView {
+    var onBackgroundClick: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        guard let hitView = hitTest(point) else {
+            onBackgroundClick?()
+            return
+        }
+
+        if hitView is NSButton ||
+            hitView is WindowSwitcherSearchField ||
+            hitView.ancestor(matching: { $0 is WindowSwitcherResultRowView }) != nil {
+            super.mouseDown(with: event)
+            return
+        }
+
+        onBackgroundClick?()
+    }
+}
+
 private final class WindowSwitcherSearchField: NSSearchField {
     var onMoveSelection: ((Int) -> Void)?
     var onCommit: (() -> Void)?
@@ -6734,11 +6951,69 @@ private final class WindowSwitcherSearchField: NSSearchField {
     }
 }
 
+private extension NSView {
+    func ancestor(matching predicate: (NSView) -> Bool) -> NSView? {
+        var current: NSView? = self
+        while let view = current {
+            if predicate(view) {
+                return view
+            }
+            current = view.superview
+        }
+        return nil
+    }
+}
+
+private final class WindowSwitcherRollerScrollView: NSScrollView {
+    var onStepSelection: ((Int) -> Void)?
+    private var accumulatedDeltaY: CGFloat = 0
+    private var lastStepTimestamp: TimeInterval = 0
+    private let preciseStepThreshold: CGFloat = 14
+    private let coarseStepThreshold: CGFloat = 0.9
+    private let minStepInterval: TimeInterval = 0.06
+
+    override func scrollWheel(with event: NSEvent) {
+        guard let onStepSelection else {
+            super.scrollWheel(with: event)
+            return
+        }
+
+        // Ignore inertial momentum so one physical wheel action maps to bounded selection steps.
+        if event.momentumPhase != [] {
+            return
+        }
+
+        let deltaY = event.scrollingDeltaY
+        guard deltaY != 0 else { return }
+
+        if event.phase == .began {
+            accumulatedDeltaY = 0
+        }
+
+        accumulatedDeltaY += deltaY
+        let threshold = event.hasPreciseScrollingDeltas ? preciseStepThreshold : coarseStepThreshold
+        guard abs(accumulatedDeltaY) >= threshold else { return }
+
+        let now = event.timestamp
+        guard now - lastStepTimestamp >= minStepInterval else {
+            return
+        }
+
+        let direction = accumulatedDeltaY > 0 ? -1 : 1
+        accumulatedDeltaY = 0
+        lastStepTimestamp = now
+        onStepSelection(direction)
+    }
+}
+
 @MainActor
 private final class WindowSwitcherResultRowView: NSView {
     let result: WindowSwitcherResult
     var onSelect: (() -> Void)?
     var isSelected = false {
+        didSet { needsDisplay = true }
+    }
+    var rollDistance: Int = 0 {
         didSet { needsDisplay = true }
     }
     private var isHovered = false
@@ -6775,24 +7050,46 @@ private final class WindowSwitcherResultRowView: NSView {
         onSelect?()
     }
 
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
+    func applyRollerTransform(signedDistance: Int) {
+        let clamped = CGFloat(max(-6, min(6, signedDistance)))
+        let distance = abs(clamped)
+        let scale = max(0.82, 1.0 - distance * 0.045)
+        let yShift = clamped * 6.0
+        let tilt = clamped * 0.055
+
+        var transform = CATransform3DIdentity
+        transform.m34 = -1.0 / 950.0
+        transform = CATransform3DTranslate(transform, 0, yShift, 0)
+        transform = CATransform3DRotate(transform, tilt, 1, 0, 0)
+        transform = CATransform3DScale(transform, scale, scale, 1)
+        layer?.transform = transform
+        layer?.zPosition = isSelected ? 10 : -distance
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
 
         let rowRect = bounds.insetBy(dx: 1, dy: 2)
         let path = NSBezierPath(roundedRect: rowRect, xRadius: 16, yRadius: 16)
+        let clampedDistance = min(max(rollDistance, 0), 6)
+        let distanceFalloff = CGFloat(clampedDistance) * 0.06
         let fill: NSColor
         if isSelected {
             fill = NSColor.controlAccentColor.withAlphaComponent(0.20)
         } else if isHovered {
-            fill = NSColor.white.withAlphaComponent(0.14)
+            fill = NSColor.white.withAlphaComponent(max(0.09, 0.14 - distanceFalloff * 0.5))
         } else {
-            fill = NSColor.white.withAlphaComponent(0.08)
+            fill = NSColor.white.withAlphaComponent(max(0.04, 0.10 - distanceFalloff))
         }
         fill.setFill()
         path.fill()
 
         let highlight = NSBezierPath(roundedRect: rowRect.insetBy(dx: 1, dy: 1), xRadius: 15, yRadius: 15)
-        NSColor.white.withAlphaComponent(isSelected ? 0.22 : 0.12).setStroke()
+        NSColor.white.withAlphaComponent(isSelected ? 0.24 : max(0.06, 0.12 - distanceFalloff)).setStroke()
         highlight.lineWidth = 0.6
         highlight.stroke()
 
@@ -6847,7 +7144,10 @@ private final class WindowSwitcherResultRowView: NSView {
         let tag = result.browserURL == nil ? "Window" : "Active Tab"
         let tagRect = NSRect(x: bounds.width - 102, y: bounds.midY - 12, width: 86, height: 24)
         let tagPath = NSBezierPath(roundedRect: tagRect, xRadius: 12, yRadius: 12)
-        (isSelected ? NSColor.controlAccentColor.withAlphaComponent(0.14) : NSColor.white.withAlphaComponent(0.10)).setFill()
+        (isSelected
+            ? NSColor.controlAccentColor.withAlphaComponent(0.16)
+            : NSColor.white.withAlphaComponent(max(0.04, 0.10 - distanceFalloff))
+        ).setFill()
         tagPath.fill()
         tag.draw(
             in: tagRect.insetBy(dx: 8, dy: 5),
@@ -6871,6 +7171,52 @@ private final class WindowSwitcherResultRowView: NSView {
         paragraph.alignment = .center
         paragraph.lineBreakMode = .byTruncatingTail
         return paragraph
+    }
+}
+
+private final class WindowSwitcherEdgeFadeView: NSView {
+    enum Edge {
+        case top
+        case bottom
+    }
+
+    private let edge: Edge
+
+    init(edge: Edge) {
+        self.edge = edge
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer = CAGradientLayer()
+        layer?.masksToBounds = false
+        updateGradient()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { nil }
+
+    override func layout() {
+        super.layout()
+        layer?.frame = bounds
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    private func updateGradient() {
+        guard let gradient = layer as? CAGradientLayer else { return }
+        let panelBase = NSColor.windowBackgroundColor.withAlphaComponent(0.56).cgColor
+        let transparent = NSColor.windowBackgroundColor.withAlphaComponent(0.0).cgColor
+        if edge == .top {
+            gradient.colors = [panelBase, transparent]
+            gradient.startPoint = CGPoint(x: 0.5, y: 1.0)
+            gradient.endPoint = CGPoint(x: 0.5, y: 0.0)
+        } else {
+            gradient.colors = [transparent, panelBase]
+            gradient.startPoint = CGPoint(x: 0.5, y: 1.0)
+            gradient.endPoint = CGPoint(x: 0.5, y: 0.0)
+        }
+        gradient.locations = [0.0, 1.0]
     }
 }
 
