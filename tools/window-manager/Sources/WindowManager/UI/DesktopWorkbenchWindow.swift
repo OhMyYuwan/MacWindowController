@@ -36,6 +36,7 @@ private enum WorkbenchSection: Int, CaseIterable {
     case stacks
     case quickDrop
     case unconstrained
+    case previews
     case liquidGlass
     case settings
 
@@ -45,6 +46,7 @@ private enum WorkbenchSection: Int, CaseIterable {
         case .stacks: return "堆叠"
         case .quickDrop: return "快捷键"
         case .unconstrained: return "临时窗口"
+        case .previews: return "预览"
         case .liquidGlass: return "液态玻璃"
         case .settings: return "设置"
         }
@@ -56,6 +58,7 @@ private enum WorkbenchSection: Int, CaseIterable {
         case .stacks: return "square.3.layers.3d.top.filled"
         case .quickDrop: return "keyboard.fill"
         case .unconstrained: return "sparkles.rectangle.stack.fill"
+        case .previews: return "rectangle.stack.fill"
         case .liquidGlass: return "circle.hexagongrid.fill"
         case .settings: return "gearshape.fill"
         }
@@ -200,6 +203,8 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     }
 
     private let windowController: WindowController
+    private let previewProvider = WindowPreviewProvider()
+    private let dockPreviewResolver = DockPreviewResolver()
     private let stackManager: StackManager
     private let layoutCoordinator: DesktopLayoutCoordinator
     private let layoutStore: DesktopLayoutStore
@@ -276,8 +281,19 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     private var temporaryMatchListStackView: NSStackView?
     private var recordingShortcutAction: WorkbenchShortcutAction?
     private var accessibilityPermissionStatusLabel: NSTextField?
+    private var screenRecordingPermissionStatusLabel: NSTextField?
+    private var dockPreviewStatusLabel: NSTextField?
+    private var dockPreviewMenuItem: NSMenuItem?
     private var launchAtLoginStatusLabel: NSTextField?
     private var statusItem: NSStatusItem?
+    private var dockPreviewPanel: NSPanel?
+    private var dockPreviewCurrentBundleId: String?
+    private var dockPreviewCurrentItemFrame: CGRect?
+    private var dockPreviewLastRefresh = Date.distantPast
+    private var dockPreviewCachedWindows: [WindowInfo] = []
+    private var dockPreviewLastWindowScan = Date.distantPast
+    private var dockPreviewLastHoverCheck = Date.distantPast
+    private var dockPreviewHideWorkItem: DispatchWorkItem?
     private var isQuitting = false
 
     init(
@@ -425,6 +441,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             selectedLayoutName = focusedLayoutName
         }
         refreshPermissionStatus()
+        refreshDockPreviewStatus()
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -450,9 +467,11 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         refreshTimer?.invalidate()
         mousePollingTimer?.invalidate()
         splitApplyWorkItem?.cancel()
+        dockPreviewHideWorkItem?.cancel()
         layoutOverlayPanel?.close()
         desktopPartitionPanel?.close()
         displayWakePanel?.close()
+        dockPreviewPanel?.close()
         for panel in stackPanels.values { panel.close() }
         stackPanels.removeAll()
         if let statusItem {
@@ -485,6 +504,11 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         let hideItem = NSMenuItem(title: "隐藏 APP 面板", action: #selector(hideAppPanelFromMenu), keyEquivalent: "")
         hideItem.target = self
         menu.addItem(hideItem)
+
+        let dockPreviewItem = NSMenuItem(title: dockPreviewMenuTitle(), action: #selector(toggleDockPreviewFromMenu), keyEquivalent: "")
+        dockPreviewItem.target = self
+        dockPreviewMenuItem = dockPreviewItem
+        menu.addItem(dockPreviewItem)
 
         menu.addItem(.separator())
 
@@ -519,6 +543,15 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         displayWakePanel?.orderOut(nil)
         desktopPartitionPanel?.orderOut(nil)
         setStatus("已隐藏 APP 面板，可从菜单栏重新打开", error: false)
+    }
+
+    private func dockPreviewMenuTitle() -> String {
+        appConfig.dockPreviewEnabled ? "关闭 Dock Preview" : "开启 Dock Preview"
+    }
+
+    @objc
+    private func toggleDockPreviewFromMenu() {
+        setDockPreviewEnabled(!appConfig.dockPreviewEnabled)
     }
 
     @objc
@@ -754,7 +787,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
 
     private func startMousePollingTimer() {
         mousePollingTimer?.invalidate()
-        mousePollingTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+        mousePollingTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.updatePanelEventMode()
             }
@@ -775,6 +808,227 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         if panel.ignoresMouseEvents == shouldReceiveEvents {
             panel.ignoresMouseEvents = !shouldReceiveEvents
         }
+
+        updateDockPreviewHover(at: screenPoint)
+    }
+
+    private func updateDockPreviewHover(at screenPoint: CGPoint) {
+        guard appConfig.dockPreviewEnabled else {
+            hideDockPreviewPanel()
+            return
+        }
+
+        let now = Date()
+        if now.timeIntervalSince(dockPreviewLastHoverCheck) < 0.08 {
+            return
+        }
+        dockPreviewLastHoverCheck = now
+
+        if isPointInsideDockPreviewPanel(screenPoint) {
+            dockPreviewHideWorkItem?.cancel()
+            return
+        }
+
+        let windows = dockPreviewVisibleWindows()
+        guard let match = dockPreviewResolver.matchHover(at: screenPoint, windows: windows) else {
+            scheduleDockPreviewHide()
+            return
+        }
+        dockPreviewHideWorkItem?.cancel()
+        dockPreviewCurrentItemFrame = match.itemFrame
+
+        let matchingWindows = windows
+            .filter { $0.bundleId == match.bundleId }
+            .sorted { lhs, rhs in
+                let leftTitle = lhs.title.isEmpty ? lhs.appName : lhs.title
+                let rightTitle = rhs.title.isEmpty ? rhs.appName : rhs.title
+                if leftTitle == rightTitle {
+                    return lhs.windowNumber < rhs.windowNumber
+                }
+                return leftTitle.localizedCaseInsensitiveCompare(rightTitle) == .orderedAscending
+            }
+
+        guard !matchingWindows.isEmpty else {
+            scheduleDockPreviewHide()
+            return
+        }
+
+        let shouldRebuild = dockPreviewCurrentBundleId != match.bundleId
+            || Date().timeIntervalSince(dockPreviewLastRefresh) > 2.0
+        if shouldRebuild {
+            showDockPreviewPanel(for: match, windows: matchingWindows)
+        } else {
+            positionDockPreviewPanel(for: match)
+        }
+    }
+
+    private func dockPreviewVisibleWindows() -> [WindowInfo] {
+        let now = Date()
+        if now.timeIntervalSince(dockPreviewLastWindowScan) < 0.20 {
+            return dockPreviewCachedWindows
+        }
+        dockPreviewLastWindowScan = now
+        dockPreviewCachedWindows = windowController.listWindows(onScreenOnly: true).filter(\.isControllable)
+        return dockPreviewCachedWindows
+    }
+
+    private func showDockPreviewPanel(for match: DockHoverMatch, windows: [WindowInfo]) {
+        dockPreviewHideWorkItem?.cancel()
+        dockPreviewCurrentBundleId = match.bundleId
+        dockPreviewLastRefresh = Date()
+
+        let snapshots = previewProvider.snapshots(for: Array(windows.prefix(6)))
+        guard !snapshots.isEmpty else {
+            hideDockPreviewPanel()
+            return
+        }
+
+        let panel = dockPreviewPanel ?? makeDockPreviewPanel()
+        let content = makeDockPreviewContent(match: match, snapshots: snapshots, totalWindowCount: windows.count)
+        panel.contentView = content
+        panel.setContentSize(content.fittingSize)
+        dockPreviewPanel = panel
+        positionDockPreviewPanel(for: match)
+        panel.orderFrontRegardless()
+    }
+
+    private func makeDockPreviewPanel() -> NSPanel {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 210),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.level = .statusBar
+        panel.isFloatingPanel = true
+        panel.hidesOnDeactivate = false
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        return panel
+    }
+
+    private func makeDockPreviewContent(match: DockHoverMatch, snapshots: [WindowPreviewSnapshot], totalWindowCount: Int) -> NSView {
+        let effect = NSVisualEffectView()
+        effect.material = .hudWindow
+        effect.blendingMode = .behindWindow
+        effect.state = .active
+        effect.wantsLayer = true
+        effect.layer?.cornerRadius = 16
+        effect.layer?.masksToBounds = true
+        effect.translatesAutoresizingMaskIntoConstraints = false
+
+        let root = NSStackView()
+        root.orientation = .vertical
+        root.spacing = 10
+        root.edgeInsets = NSEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
+        root.translatesAutoresizingMaskIntoConstraints = false
+        effect.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
+            root.topAnchor.constraint(equalTo: effect.topAnchor),
+            root.bottomAnchor.constraint(equalTo: effect.bottomAnchor)
+        ])
+
+        let title = NSTextField(labelWithString: totalWindowCount > snapshots.count ? "\(match.appName) · \(totalWindowCount) 个窗口" : match.appName)
+        title.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        title.textColor = .labelColor
+        title.lineBreakMode = .byTruncatingTail
+        root.addArrangedSubview(title)
+
+        let cards = NSStackView()
+        cards.orientation = .horizontal
+        cards.spacing = 10
+        cards.alignment = .centerY
+        for snapshot in snapshots {
+            let card = DockWindowPreviewCardView(snapshot: snapshot)
+            card.onFocus = { [weak self] window in
+                self?.hideDockPreviewPanel()
+                self?.focusPreviewWindow(window)
+            }
+            cards.addArrangedSubview(card)
+        }
+        root.addArrangedSubview(cards)
+
+        let width = cards.arrangedSubviews.reduce(CGFloat(0)) { $0 + $1.fittingSize.width }
+            + CGFloat(max(0, snapshots.count - 1)) * 10
+            + 24
+        let height = DockWindowPreviewCardView.cardHeight + 58
+        NSLayoutConstraint.activate([
+            effect.widthAnchor.constraint(equalToConstant: max(240, width)),
+            effect.heightAnchor.constraint(equalToConstant: height)
+        ])
+
+        return effect
+    }
+
+    private func positionDockPreviewPanel(for match: DockHoverMatch) {
+        guard let panel = dockPreviewPanel else { return }
+        let size = panel.frame.size
+        let screenFrame = (NSScreen.screens.first { $0.frame.intersects(match.dockFrame) } ?? NSScreen.main)?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let padding: CGFloat = 12
+        let origin: CGPoint
+
+        switch match.edge {
+        case .bottom:
+            let x = clamp(match.itemFrame.midX - size.width / 2, min: screenFrame.minX + padding, max: screenFrame.maxX - size.width - padding)
+            let y = clamp(match.itemFrame.maxY + padding, min: screenFrame.minY + padding, max: screenFrame.maxY - size.height - padding)
+            origin = CGPoint(x: x, y: y)
+        case .left:
+            let x = clamp(match.itemFrame.maxX + padding, min: screenFrame.minX + padding, max: screenFrame.maxX - size.width - padding)
+            let y = clamp(match.itemFrame.midY - size.height / 2, min: screenFrame.minY + padding, max: screenFrame.maxY - size.height - padding)
+            origin = CGPoint(x: x, y: y)
+        case .right:
+            let x = clamp(match.itemFrame.minX - size.width - padding, min: screenFrame.minX + padding, max: screenFrame.maxX - size.width - padding)
+            let y = clamp(match.itemFrame.midY - size.height / 2, min: screenFrame.minY + padding, max: screenFrame.maxY - size.height - padding)
+            origin = CGPoint(x: x, y: y)
+        }
+
+        panel.setFrameOrigin(origin)
+    }
+
+    private func scheduleDockPreviewHide() {
+        guard dockPreviewPanel?.isVisible == true else { return }
+        dockPreviewHideWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self,
+                      !self.isPointInsideDockPreviewPanel(NSEvent.mouseLocation),
+                      !self.isPointInsideCurrentDockTarget(NSEvent.mouseLocation)
+                else {
+                    return
+                }
+                self.hideDockPreviewPanel()
+            }
+        }
+        dockPreviewHideWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: workItem)
+    }
+
+    private func hideDockPreviewPanel() {
+        dockPreviewHideWorkItem?.cancel()
+        dockPreviewPanel?.orderOut(nil)
+        dockPreviewCurrentBundleId = nil
+        dockPreviewCurrentItemFrame = nil
+    }
+
+    private func isPointInsideDockPreviewPanel(_ screenPoint: CGPoint) -> Bool {
+        guard let panel = dockPreviewPanel, panel.isVisible else { return false }
+        return panel.frame.insetBy(dx: -10, dy: -10).contains(screenPoint)
+    }
+
+    private func isPointInsideCurrentDockTarget(_ screenPoint: CGPoint) -> Bool {
+        guard let frame = dockPreviewCurrentItemFrame else { return false }
+        return frame.insetBy(dx: -8, dy: -8).contains(screenPoint)
+    }
+
+    private func clamp(_ value: CGFloat, min minValue: CGFloat, max maxValue: CGFloat) -> CGFloat {
+        guard maxValue >= minValue else { return minValue }
+        return Swift.min(Swift.max(value, minValue), maxValue)
     }
 
     private func updateDesktopOverlayPanelFrame() {
@@ -2456,6 +2710,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         case .stacks: newPanel = makeStacksPanel()
         case .quickDrop: newPanel = makeQuickDropPanel()
         case .unconstrained: newPanel = makeUnconstrainedWindowsPanel()
+        case .previews: newPanel = makeWindowPreviewsPanel()
         case .liquidGlass: newPanel = makeLiquidGlassPanel()
         case .settings: newPanel = makeSettingsPanel()
         }
@@ -2742,6 +2997,91 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         return root
     }
 
+    private func makeWindowPreviewsPanel() -> NSView {
+        let root = makePanelRoot()
+        addFullWidthArrangedSubview(makeSectionTitle("窗口预览", subtitle: "Dock Preview 的底层预览管线：先在 Workbench 中检查当前窗口缩略图。"), to: root)
+
+        let screenStatus = NSTextField(labelWithString: screenRecordingPermissionStatusText())
+        screenStatus.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        screenStatus.textColor = screenRecordingPermissionStatusColor()
+        screenStatus.alignment = .left
+        screenStatus.lineBreakMode = .byWordWrapping
+        screenStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        screenRecordingPermissionStatusLabel = screenStatus
+
+        addFullWidthArrangedSubview(makeSectionGroup(
+            title: "预览权限",
+            subtitle: "窗口缩略图依赖屏幕录制权限；未授权时只能显示窗口标题和 App 名。",
+            views: [makeActionRow(
+                title: "屏幕录制权限",
+                detail: "用于生成窗口缩略图，不会保存截图到磁盘。",
+                controls: [
+                    screenStatus,
+                    makeButton("请求权限", action: #selector(requestScreenRecordingPermission)),
+                    makeButton("刷新预览", action: #selector(refreshWindowPreviews))
+                ]
+            )]
+        ), to: root)
+
+        let windows = windowController.listWindows(onScreenOnly: true)
+            .filter(\.isControllable)
+            .sorted { lhs, rhs in
+                if lhs.appName == rhs.appName {
+                    return lhs.windowNumber < rhs.windowNumber
+                }
+                return lhs.appName.localizedCaseInsensitiveCompare(rhs.appName) == .orderedAscending
+            }
+        let snapshots = previewProvider.snapshots(for: windows)
+
+        if snapshots.isEmpty {
+            addFullWidthArrangedSubview(makeSectionGroup(
+                title: "当前窗口",
+                views: [makeEmptyStateLabel("没有找到可预览的窗口。")]
+            ), to: root)
+            return root
+        }
+
+        let grid = NSGridView()
+        grid.translatesAutoresizingMaskIntoConstraints = false
+        grid.rowSpacing = 14
+        grid.columnSpacing = 14
+        grid.xPlacement = .fill
+        grid.yPlacement = .fill
+
+        for pairStart in stride(from: 0, to: snapshots.count, by: 2) {
+            let left = WindowPreviewCardView(snapshot: snapshots[pairStart])
+            left.onFocus = { [weak self] window in
+                self?.focusPreviewWindow(window)
+            }
+
+            let right: NSView
+            if pairStart + 1 < snapshots.count {
+                let card = WindowPreviewCardView(snapshot: snapshots[pairStart + 1])
+                card.onFocus = { [weak self] window in
+                    self?.focusPreviewWindow(window)
+                }
+                right = card
+            } else {
+                right = NSView()
+            }
+
+            let row = grid.addRow(with: [left, right])
+            row.height = 210
+        }
+
+        for columnIndex in 0..<grid.numberOfColumns {
+            grid.column(at: columnIndex).width = 360
+        }
+
+        addFullWidthArrangedSubview(makeSectionGroup(
+            title: "当前窗口",
+            subtitle: "点击预览卡片可聚焦对应窗口；这一步后续会接入 Switcher 和 Dock hover。",
+            views: [grid]
+        ), to: root)
+
+        return root
+    }
+
     private func makeLiquidGlassPanel() -> NSView {
         let root = makePanelRoot()
         addFullWidthArrangedSubview(makeSectionTitle(
@@ -2833,6 +3173,21 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         permissionStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         accessibilityPermissionStatusLabel = permissionStatus
 
+        let dockPreviewStatus = NSTextField(labelWithString: dockPreviewStatusText())
+        dockPreviewStatus.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        dockPreviewStatus.textColor = dockPreviewStatusColor()
+        dockPreviewStatus.alignment = .left
+        dockPreviewStatus.lineBreakMode = .byWordWrapping
+        dockPreviewStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        dockPreviewStatusLabel = dockPreviewStatus
+
+        let dockPreviewToggle = NSButton(
+            checkboxWithTitle: "启用 Dock Preview",
+            target: self,
+            action: #selector(toggleDockPreviewFromCheckbox(_:))
+        )
+        dockPreviewToggle.state = appConfig.dockPreviewEnabled ? .on : .off
+
         addFullWidthArrangedSubview(makeSectionGroup(
             title: "权限健康",
             subtitle: "窗口管理依赖 macOS 辅助功能权限；屏幕录制权限会在预览管线阶段启用。",
@@ -2848,8 +3203,20 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
                 ),
                 makeActionRow(
                     title: "屏幕录制权限",
-                    detail: "为后续窗口缩略图和 Dock Preview 预留；当前版本暂不需要。",
-                    controls: [NSTextField(labelWithString: "稍后启用")]
+                    detail: "用于窗口缩略图、Switcher 和未来 Dock Preview。",
+                    controls: [
+                        NSTextField(labelWithString: screenRecordingPermissionStatusText()),
+                        makeButton("打开预览", action: #selector(showWindowPreviewsSection)),
+                        makeButton("请求权限", action: #selector(requestScreenRecordingPermission))
+                    ]
+                ),
+                makeActionRow(
+                    title: "Dock Preview",
+                    detail: "鼠标悬停在 macOS Dock 区域时，显示对应 App 的窗口缩略图。",
+                    controls: [
+                        dockPreviewStatus,
+                        dockPreviewToggle
+                    ]
                 )
             ]
         ), to: root)
@@ -3011,12 +3378,97 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         launchAtLoginStatusLabel?.textColor = launchAtLoginStatusColor()
     }
 
+    private func screenRecordingPermissionStatusText() -> String {
+        previewProvider.hasScreenRecordingPermission() ? "已授权" : "未授权"
+    }
+
+    private func screenRecordingPermissionStatusColor() -> NSColor {
+        previewProvider.hasScreenRecordingPermission() ? .systemGreen : .systemOrange
+    }
+
+    private func dockPreviewStatusText() -> String {
+        appConfig.dockPreviewEnabled ? "已开启" : "已关闭"
+    }
+
+    private func dockPreviewStatusColor() -> NSColor {
+        appConfig.dockPreviewEnabled ? .systemGreen : .secondaryLabelColor
+    }
+
+    @objc
+    private func toggleDockPreviewFromCheckbox(_ sender: NSButton) {
+        setDockPreviewEnabled(sender.state == .on)
+    }
+
+    private func setDockPreviewEnabled(_ enabled: Bool) {
+        appConfig.dockPreviewEnabled = enabled
+        do {
+            try appConfig.save()
+            refreshDockPreviewStatus()
+            if !enabled {
+                hideDockPreviewPanel()
+            }
+            setStatus(enabled ? "Dock Preview 已开启；移动到 Dock 上方即可预览窗口" : "Dock Preview 已关闭", error: false)
+        } catch {
+            setStatus("保存 Dock Preview 设置失败：\(error.localizedDescription)", error: true)
+        }
+    }
+
+    private func refreshDockPreviewStatus() {
+        dockPreviewStatusLabel?.stringValue = dockPreviewStatusText()
+        dockPreviewStatusLabel?.textColor = dockPreviewStatusColor()
+        dockPreviewMenuItem?.title = dockPreviewMenuTitle()
+    }
+
+    @objc
+    private func requestScreenRecordingPermission() {
+        _ = previewProvider.requestScreenRecordingPermission()
+        refreshScreenRecordingPermissionStatus()
+        setStatus("已请求屏幕录制权限；如刚授权，请重新打开 App 以刷新系统授权状态", error: !previewProvider.hasScreenRecordingPermission())
+    }
+
+    private func refreshScreenRecordingPermissionStatus() {
+        screenRecordingPermissionStatusLabel?.stringValue = screenRecordingPermissionStatusText()
+        screenRecordingPermissionStatusLabel?.textColor = screenRecordingPermissionStatusColor()
+    }
+
+    @objc
+    private func refreshWindowPreviews() {
+        refreshScreenRecordingPermissionStatus()
+        switchSection(.previews, animated: false)
+        setStatus("已刷新窗口预览", error: false)
+    }
+
+    @objc
+    private func showWindowPreviewsSection() {
+        switchSection(.previews, animated: true)
+    }
+
+    private func focusPreviewWindow(_ window: WindowInfo) {
+        do {
+            try windowController.raiseWindow(bundleId: window.bundleId, windowNumber: window.windowNumber)
+            try? stackManager.syncActiveStackWindow(windowNumber: window.windowNumber)
+            setStatus("已聚焦 \(window.title.isEmpty ? window.appName : window.title)", error: false)
+            refreshWorkbench()
+        } catch {
+            setStatus("聚焦预览窗口失败：\(error.localizedDescription)", error: true)
+        }
+    }
+
     private func makeButton(_ title: String, action: Selector) -> NSButton {
         let button = NSButton(title: title, target: self, action: action)
         button.bezelStyle = .rounded
         button.controlSize = .regular
         button.font = NSFont.systemFont(ofSize: 12, weight: .medium)
         return button
+    }
+
+    private func makeEmptyStateLabel(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        label.textColor = .secondaryLabelColor
+        label.alignment = .left
+        label.lineBreakMode = .byWordWrapping
+        return label
     }
 
     private func makeShortcutActionRow(for action: WorkbenchShortcutAction) -> NSView {
@@ -3489,7 +3941,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         }
 
         for (index, identity) in stack.windows.prefix(8).enumerated() {
-            let label = "\(index + 1). \(identity.tabDisplayTitle())"
+            let label = identity.tabDisplayTitle()
             let btn = StackTabButton(title: label, target: self, action: #selector(selectStackTab(_:)))
             btn.stackName = stack.name
             btn.tabIndex = index
@@ -3592,6 +4044,241 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         let formatter = DateFormatter()
         formatter.dateFormat = "MMdd_HHmm"
         return formatter.string(from: Date())
+    }
+}
+
+@MainActor
+private final class WindowPreviewCardView: NSView {
+    let snapshot: WindowPreviewSnapshot
+    var onFocus: ((WindowInfo) -> Void)?
+    private var isHovered = false
+
+    init(snapshot: WindowPreviewSnapshot) {
+        self.snapshot = snapshot
+        super.init(frame: NSRect(x: 0, y: 0, width: 360, height: 210))
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: 360).isActive = true
+        heightAnchor.constraint(equalToConstant: 210).isActive = true
+        wantsLayer = true
+        toolTip = snapshot.window.title.isEmpty
+            ? snapshot.window.appName
+            : "\(snapshot.window.title) - \(snapshot.window.appName)"
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        ))
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+        needsDisplay = true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onFocus?(snapshot.window)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        let card = bounds.insetBy(dx: 1, dy: 1)
+        let path = NSBezierPath(roundedRect: card, xRadius: 12, yRadius: 12)
+        (isHovered ? NSColor.controlAccentColor.withAlphaComponent(0.10) : NSColor.labelColor.withAlphaComponent(0.045)).setFill()
+        path.fill()
+        (isHovered ? NSColor.controlAccentColor.withAlphaComponent(0.42) : NSColor.separatorColor.withAlphaComponent(0.22)).setStroke()
+        path.lineWidth = isHovered ? 1.4 : 1
+        path.stroke()
+
+        let imageRect = NSRect(x: 12, y: 48, width: bounds.width - 24, height: bounds.height - 64)
+        let imagePath = NSBezierPath(roundedRect: imageRect, xRadius: 8, yRadius: 8)
+        NSColor.black.withAlphaComponent(0.08).setFill()
+        imagePath.fill()
+
+        if let image = snapshot.image {
+            image.draw(in: imageRect.insetBy(dx: 1, dy: 1), from: .zero, operation: .sourceOver, fraction: 1.0, respectFlipped: true, hints: nil)
+        } else {
+            let placeholder = "需要屏幕录制权限"
+            placeholder.draw(
+                in: imageRect.insetBy(dx: 16, dy: imageRect.height / 2 - 10),
+                withAttributes: [
+                    .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                    .paragraphStyle: centeredParagraph()
+                ]
+            )
+        }
+
+        let title = snapshot.window.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayTitle = title.isEmpty ? snapshot.window.appName : title
+        displayTitle.draw(
+            in: NSRect(x: 14, y: 26, width: bounds.width - 28, height: 16),
+            withAttributes: [
+                .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+                .foregroundColor: NSColor.labelColor,
+                .paragraphStyle: truncatingParagraph()
+            ]
+        )
+
+        "\(snapshot.window.appName) · #\(snapshot.window.windowNumber)".draw(
+            in: NSRect(x: 14, y: 10, width: bounds.width - 28, height: 13),
+            withAttributes: [
+                .font: NSFont.systemFont(ofSize: 10, weight: .medium),
+                .foregroundColor: NSColor.secondaryLabelColor,
+                .paragraphStyle: truncatingParagraph()
+            ]
+        )
+    }
+
+    private func centeredParagraph() -> NSMutableParagraphStyle {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        paragraph.lineBreakMode = .byTruncatingTail
+        return paragraph
+    }
+
+    private func truncatingParagraph() -> NSMutableParagraphStyle {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .left
+        paragraph.lineBreakMode = .byTruncatingTail
+        return paragraph
+    }
+}
+
+@MainActor
+private final class DockWindowPreviewCardView: NSView {
+    static let cardHeight: CGFloat = 142
+    private static let minCardWidth: CGFloat = 160
+    private static let maxCardWidth: CGFloat = 260
+
+    let snapshot: WindowPreviewSnapshot
+    var onFocus: ((WindowInfo) -> Void)?
+    private var isHovered = false
+    private let cardWidth: CGFloat
+
+    init(snapshot: WindowPreviewSnapshot) {
+        self.snapshot = snapshot
+        let imageSize = snapshot.image?.size ?? snapshot.window.frame.cgRect.size
+        let imageRatio = imageSize.height > 0 ? imageSize.width / imageSize.height : 16 / 10
+        self.cardWidth = Swift.min(Self.maxCardWidth, Swift.max(Self.minCardWidth, imageRatio * 96 + 20))
+        super.init(frame: NSRect(x: 0, y: 0, width: cardWidth, height: Self.cardHeight))
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: cardWidth).isActive = true
+        heightAnchor.constraint(equalToConstant: Self.cardHeight).isActive = true
+        wantsLayer = true
+        toolTip = snapshot.window.title.isEmpty
+            ? snapshot.window.appName
+            : "\(snapshot.window.title) - \(snapshot.window.appName)"
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        ))
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+        needsDisplay = true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onFocus?(snapshot.window)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        let card = bounds.insetBy(dx: 1, dy: 1)
+        let path = NSBezierPath(roundedRect: card, xRadius: 10, yRadius: 10)
+        (isHovered ? NSColor.controlAccentColor.withAlphaComponent(0.16) : NSColor.labelColor.withAlphaComponent(0.08)).setFill()
+        path.fill()
+        (isHovered ? NSColor.controlAccentColor.withAlphaComponent(0.50) : NSColor.separatorColor.withAlphaComponent(0.32)).setStroke()
+        path.lineWidth = isHovered ? 1.4 : 1
+        path.stroke()
+
+        let imageRect = NSRect(x: 10, y: 34, width: bounds.width - 20, height: 96)
+        let imagePath = NSBezierPath(roundedRect: imageRect, xRadius: 7, yRadius: 7)
+        NSColor.black.withAlphaComponent(0.14).setFill()
+        imagePath.fill()
+
+        if let image = snapshot.image {
+            image.draw(in: imageRect.insetBy(dx: 1, dy: 1), from: .zero, operation: .sourceOver, fraction: 1.0, respectFlipped: true, hints: nil)
+        } else {
+            "需要屏幕录制权限".draw(
+                in: imageRect.insetBy(dx: 12, dy: imageRect.height / 2 - 9),
+                withAttributes: [
+                    .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                    .paragraphStyle: centeredParagraph()
+                ]
+            )
+        }
+
+        let title = snapshot.window.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayTitle = title.isEmpty ? snapshot.window.appName : title
+        displayTitle.draw(
+            in: NSRect(x: 12, y: 17, width: bounds.width - 24, height: 14),
+            withAttributes: [
+                .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                .foregroundColor: NSColor.labelColor,
+                .paragraphStyle: truncatingParagraph()
+            ]
+        )
+
+        snapshot.window.appName.draw(
+            in: NSRect(x: 12, y: 5, width: bounds.width - 24, height: 12),
+            withAttributes: [
+                .font: NSFont.systemFont(ofSize: 9, weight: .medium),
+                .foregroundColor: NSColor.secondaryLabelColor,
+                .paragraphStyle: truncatingParagraph()
+            ]
+        )
+    }
+
+    private func centeredParagraph() -> NSMutableParagraphStyle {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        paragraph.lineBreakMode = .byTruncatingTail
+        return paragraph
+    }
+
+    private func truncatingParagraph() -> NSMutableParagraphStyle {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .left
+        paragraph.lineBreakMode = .byTruncatingTail
+        return paragraph
     }
 }
 

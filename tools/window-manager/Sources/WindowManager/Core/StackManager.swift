@@ -108,7 +108,7 @@ final class StackManager {
 
     @discardableResult
     func putWindowInStack(name: String, frame: CGRect, bundleId: String) throws -> WindowStack {
-        let identity = (try? windowController.windowIdentity(bundleId: bundleId, windowIndex: 0))
+            let identity = (try? windowController.windowIdentity(bundleId: bundleId, windowIndex: 0))
             ?? WindowIdentity(bundleId: bundleId, title: "", windowNumber: nil)
         return try putWindowInStack(name: name, frame: frame, window: identity)
     }
@@ -176,23 +176,33 @@ final class StackManager {
             throw StackManagerError.invalidActiveIndex
         }
 
-        let previousIndex = stack.activeIndex
-        if previousIndex == index {
-            return
-        }
-
-        let contentFrame = stackContentFrame(from: stack.frame.cgRect)
         let nextOccurrence = occurrenceIndex(for: index, in: stack.windows)
 
-        // 确保目标窗口在正确的位置和大小
-        try setWindowFrame(identity: stack.windows[index], fallbackWindowIndex: nextOccurrence, frame: contentFrame)
-
-        // 直接置顶目标窗口，不最小化其他窗口
         try raiseWindow(identity: stack.windows[index], fallbackWindowIndex: nextOccurrence)
 
         stack.activeIndex = index
         stacks[name] = stack
         try save()
+    }
+
+    func syncActiveStackWindow(windowNumber: Int) throws {
+        var changed = false
+
+        for (name, var stack) in stacks {
+            guard let matchIndex = stack.windows.firstIndex(where: { $0.windowNumber == windowNumber }) else {
+                continue
+            }
+            guard stack.activeIndex != matchIndex else {
+                continue
+            }
+            stack.activeIndex = matchIndex
+            stacks[name] = stack
+            changed = true
+        }
+
+        if changed {
+            try save()
+        }
     }
 
     func deleteStack(name: String) throws {
@@ -254,7 +264,9 @@ final class StackManager {
                             bundleId: live.bundleId,
                             title: live.title,
                             windowNumber: live.windowNumber,
-                            appName: live.appName
+                            appName: live.appName,
+                            windowIndexHint: (try? windowController.findWindowIndex(bundleId: live.bundleId, windowNumber: live.windowNumber)),
+                            frameHint: live.frame
                         )
                     )
                     usedNumbers.insert(number)
@@ -272,7 +284,9 @@ final class StackManager {
                             bundleId: candidate.bundleId,
                             title: candidate.title,
                             windowNumber: candidate.windowNumber,
-                            appName: candidate.appName
+                            appName: candidate.appName,
+                            windowIndexHint: (try? windowController.findWindowIndex(bundleId: candidate.bundleId, windowNumber: candidate.windowNumber)),
+                            frameHint: candidate.frame
                         )
                     )
                     usedNumbers.insert(candidate.windowNumber)
@@ -383,6 +397,13 @@ final class StackManager {
     private func setWindowFrame(identity: WindowIdentity, fallbackWindowIndex: Int, frame: CGRect) throws {
         if let windowNumber = identity.windowNumber {
             try windowController.setWindowFrame(bundleId: identity.bundleId, windowNumber: windowNumber, frame: frame)
+        } else if let exactTitleIndex = try windowController.findWindowIndex(
+            bundleId: identity.bundleId,
+            exactTitle: identity.title,
+            windowIndexHint: identity.windowIndexHint ?? fallbackWindowIndex,
+            nearFrame: identity.frameHint?.cgRect
+        ) {
+            try windowController.setWindowFrame(bundleId: identity.bundleId, windowIndex: exactTitleIndex, frame: frame)
         } else {
             try windowController.setWindowFrame(bundleId: identity.bundleId, windowIndex: fallbackWindowIndex, frame: frame)
         }
@@ -391,6 +412,13 @@ final class StackManager {
     private func raiseWindow(identity: WindowIdentity, fallbackWindowIndex: Int) throws {
         if let windowNumber = identity.windowNumber {
             try windowController.raiseWindow(bundleId: identity.bundleId, windowNumber: windowNumber)
+        } else if let exactTitleIndex = try windowController.findWindowIndex(
+            bundleId: identity.bundleId,
+            exactTitle: identity.title,
+            windowIndexHint: identity.windowIndexHint ?? fallbackWindowIndex,
+            nearFrame: identity.frameHint?.cgRect
+        ) {
+            try windowController.raiseWindow(bundleId: identity.bundleId, windowIndex: exactTitleIndex)
         } else {
             try windowController.raiseWindow(bundleId: identity.bundleId, windowIndex: fallbackWindowIndex)
         }

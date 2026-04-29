@@ -36,6 +36,8 @@ struct WindowIdentity: Codable, Hashable {
     var title: String
     var windowNumber: Int?
     var appName: String? = nil
+    var windowIndexHint: Int? = nil
+    var frameHint: RectData? = nil
 
     var displayAppName: String {
         let trimmed = (appName ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
