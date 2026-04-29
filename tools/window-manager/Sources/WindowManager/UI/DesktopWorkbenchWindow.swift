@@ -67,6 +67,7 @@ private enum WorkbenchSection: Int, CaseIterable {
 
 private enum WorkbenchShortcutAction: String, CaseIterable {
     case layoutHUD
+    case windowSwitcher
     case quickDropLeftPrimary
     case quickDropRightPrimary
     case quickDropLeftSecondary
@@ -79,6 +80,7 @@ private enum WorkbenchShortcutAction: String, CaseIterable {
     var title: String {
         switch self {
         case .layoutHUD: return "布局九宫格 HUD"
+        case .windowSwitcher: return "窗口搜索 / Switcher"
         case .quickDropLeftPrimary: return "移到左侧主块"
         case .quickDropRightPrimary: return "移到右侧主块"
         case .quickDropLeftSecondary: return "移到左侧次块"
@@ -94,6 +96,8 @@ private enum WorkbenchShortcutAction: String, CaseIterable {
         switch self {
         case .layoutHUD:
             return "按住时显示九宫格，松开隐藏"
+        case .windowSwitcher:
+            return "打开全局窗口搜索，回车聚焦选中窗口"
         case .quickDropLeftPrimary, .quickDropRightPrimary:
             return "把当前聚焦窗口送入左右两侧最大候选块"
         case .quickDropLeftSecondary, .quickDropRightSecondary:
@@ -107,6 +111,8 @@ private enum WorkbenchShortcutAction: String, CaseIterable {
         switch self {
         case .layoutHUD:
             return .init(keyCode: 37, command: true, option: true, shift: false, control: false)
+        case .windowSwitcher:
+            return .init(keyCode: 49, command: true, option: true, shift: false, control: false)
         case .quickDropLeftPrimary:
             return .init(keyCode: 123, command: true, option: false, shift: false, control: true)
         case .quickDropRightPrimary:
@@ -158,6 +164,56 @@ private struct AppRoutingItem {
     let isRoutingLocked: Bool
 }
 
+private struct WindowSwitcherResult {
+    let window: WindowInfo
+    let browserURL: String?
+    let browserKind: String?
+    let icon: NSImage?
+
+    var primaryTitle: String {
+        let title = window.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return title.isEmpty ? window.appName : title
+    }
+
+    var windowTitle: String {
+        let title = window.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return title.isEmpty ? "Untitled Window" : title
+    }
+
+    var appTitle: String {
+        let app = window.appName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return app.isEmpty ? window.bundleId : app
+    }
+
+    var detailText: String {
+        var parts = ["\(appTitle) #\(window.windowNumber)"]
+        if let browserURL, !browserURL.isEmpty {
+            if let host = URL(string: browserURL)?.host {
+                parts.append(host)
+            } else {
+                parts.append(browserURL)
+            }
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    func matches(_ query: String) -> Bool {
+        let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return true }
+        return [
+            window.appName,
+            window.bundleId,
+            window.title,
+            String(window.windowNumber),
+            "#\(window.windowNumber)",
+            browserURL ?? "",
+            browserKind ?? ""
+        ]
+        .map { $0.lowercased() }
+        .contains { $0.contains(normalized) }
+    }
+}
+
 @MainActor
 enum DesktopWorkbenchLauncher {
     private static var runtimeHolder: DesktopWorkbenchRuntime?
@@ -189,7 +245,7 @@ enum DesktopWorkbenchLauncher {
 }
 
 @MainActor
-private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NSWindowDelegate {
+private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSearchFieldDelegate {
     private let leftBucketName = "left"
     private struct ShortcutKeyOption {
         let title: String
@@ -205,6 +261,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     private let windowController: WindowController
     private let previewProvider = WindowPreviewProvider()
     private let dockPreviewResolver = DockPreviewResolver()
+    private let browserRestorer = BrowserPageRestorer()
     private let stackManager: StackManager
     private let layoutCoordinator: DesktopLayoutCoordinator
     private let layoutStore: DesktopLayoutStore
@@ -294,6 +351,12 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     private var dockPreviewLastWindowScan = Date.distantPast
     private var dockPreviewLastHoverCheck = Date.distantPast
     private var dockPreviewHideWorkItem: DispatchWorkItem?
+    private var windowSwitcherPanel: NSPanel?
+    private var windowSwitcherSearchField: WindowSwitcherSearchField?
+    private var windowSwitcherResultsStackView: NSStackView?
+    private var windowSwitcherAllResults: [WindowSwitcherResult] = []
+    private var windowSwitcherVisibleResults: [WindowSwitcherResult] = []
+    private var windowSwitcherSelectedIndex = 0
     private var isQuitting = false
 
     init(
@@ -472,6 +535,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         desktopPartitionPanel?.close()
         displayWakePanel?.close()
         dockPreviewPanel?.close()
+        windowSwitcherPanel?.close()
         for panel in stackPanels.values { panel.close() }
         stackPanels.removeAll()
         if let statusItem {
@@ -500,6 +564,10 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         let showItem = NSMenuItem(title: "显示 APP 面板", action: #selector(showAppPanel), keyEquivalent: "")
         showItem.target = self
         menu.addItem(showItem)
+
+        let switcherItem = NSMenuItem(title: "窗口搜索 / Switcher", action: #selector(showWindowSwitcher), keyEquivalent: "")
+        switcherItem.target = self
+        menu.addItem(switcherItem)
 
         let hideItem = NSMenuItem(title: "隐藏 APP 面板", action: #selector(hideAppPanelFromMenu), keyEquivalent: "")
         hideItem.target = self
@@ -623,6 +691,17 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             return nil
         }
 
+        let globalKeyDownMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return }
+            let flags = event.modifierFlags.intersection([.command, .option, .shift, .control])
+            guard let action = self.shortcutAction(matching: flags, keyCode: event.keyCode),
+                  action == .windowSwitcher
+            else {
+                return
+            }
+            self.performShortcutAction(action, event: event)
+        }
+
         let keyUpMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyUp) { [weak self] event in
             guard let self else { return event }
             if event.keyCode == self.shortcut(for: .layoutHUD).keyCode {
@@ -646,7 +725,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             self?.handleFlagsChanged(event.modifierFlags)
         }
 
-        keyboardMonitors = [keyDownMonitor, keyUpMonitor, flagsChangedMonitor, flagsChangedGlobalMonitor].compactMap { $0 }
+        keyboardMonitors = [keyDownMonitor, globalKeyDownMonitor, keyUpMonitor, flagsChangedMonitor, flagsChangedGlobalMonitor].compactMap { $0 }
     }
 
     private func handleFlagsChanged(_ modifierFlags: NSEvent.ModifierFlags) {
@@ -1993,6 +2072,8 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         switch action {
         case .layoutHUD:
             showLayoutModeOverlay()
+        case .windowSwitcher:
+            showWindowSwitcher()
         case .quickDropLeftPrimary:
             quickDropFrontmost(to: .leftPrimary)
         case .quickDropRightPrimary:
@@ -2884,6 +2965,9 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         ), to: root)
 
         let groups: [(title: String, note: String, actions: [WorkbenchShortcutAction])] = [
+            ("窗口搜索", "打开全局 Switcher，搜索当前可控窗口并用 Return 聚焦。", [
+                .windowSwitcher
+            ]),
             ("窗口投放", "次块默认上半；按住 Shift 执行动作时会改投下半区。", [
                 .quickDropLeftPrimary,
                 .quickDropRightPrimary,
@@ -3452,6 +3536,251 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         } catch {
             setStatus("聚焦预览窗口失败：\(error.localizedDescription)", error: true)
         }
+    }
+
+    @objc
+    private func showWindowSwitcher() {
+        hideDockPreviewPanel()
+        windowSwitcherAllResults = buildWindowSwitcherResults()
+        windowSwitcherSelectedIndex = 0
+
+        let panel = windowSwitcherPanel ?? makeWindowSwitcherPanel()
+        windowSwitcherPanel = panel
+        panel.contentView = makeWindowSwitcherContent()
+        panel.setContentSize(NSSize(width: 720, height: 560))
+        centerWindowSwitcherPanel(panel)
+
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        panel.level = .floating
+        if let field = windowSwitcherSearchField {
+            panel.makeFirstResponder(field)
+        }
+        applyWindowSwitcherFilter()
+        setStatus("窗口搜索已打开：输入 App、标题、URL 或窗口编号", error: false)
+    }
+
+    private func makeWindowSwitcherPanel() -> NSPanel {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 560),
+            styleMask: [.titled, .closable, .fullSizeContentView, .utilityWindow],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "Window Switcher"
+        panel.titleVisibility = .hidden
+        panel.titlebarAppearsTransparent = true
+        panel.isFloatingPanel = true
+        panel.hidesOnDeactivate = false
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.isReleasedWhenClosed = false
+        return panel
+    }
+
+    private func centerWindowSwitcherPanel(_ panel: NSPanel) {
+        let screenFrame = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1200, height: 800)
+        let size = panel.frame.size
+        let origin = NSPoint(
+            x: screenFrame.midX - size.width / 2,
+            y: screenFrame.midY - size.height / 2
+        )
+        panel.setFrameOrigin(origin)
+    }
+
+    private func makeWindowSwitcherContent() -> NSView {
+        let root = NSVisualEffectView()
+        root.material = .menu
+        root.blendingMode = .withinWindow
+        root.state = .active
+        root.wantsLayer = true
+        root.layer?.cornerRadius = 26
+        root.layer?.cornerCurve = .continuous
+        root.layer?.masksToBounds = true
+        root.layer?.borderColor = NSColor.white.withAlphaComponent(0.20).cgColor
+        root.layer?.borderWidth = 0.8
+        root.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.05).cgColor
+        root.translatesAutoresizingMaskIntoConstraints = false
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.spacing = 14
+        stack.edgeInsets = NSEdgeInsets(top: 22, left: 22, bottom: 22, right: 22)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: root.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: root.bottomAnchor)
+        ])
+
+        let searchField = WindowSwitcherSearchField()
+        searchField.placeholderString = "搜索窗口、App、URL 或 #编号"
+        searchField.font = NSFont.systemFont(ofSize: 18, weight: .medium)
+        searchField.controlSize = .large
+        searchField.wantsLayer = true
+        searchField.layer?.cornerRadius = 14
+        searchField.layer?.cornerCurve = .continuous
+        searchField.delegate = self
+        searchField.translatesAutoresizingMaskIntoConstraints = false
+        searchField.heightAnchor.constraint(equalToConstant: 46).isActive = true
+        searchField.onMoveSelection = { [weak self] delta in
+            self?.moveWindowSwitcherSelection(delta)
+        }
+        searchField.onCommit = { [weak self] in
+            self?.focusSelectedWindowSwitcherResult()
+        }
+        searchField.onCancel = { [weak self] in
+            self?.windowSwitcherPanel?.orderOut(nil)
+        }
+        windowSwitcherSearchField = searchField
+        stack.addArrangedSubview(searchField)
+
+        let hint = NSTextField(labelWithString: "↑↓ 选择 · Return 聚焦 · Esc 关闭 · 当前仅索引窗口和浏览器 active tab")
+        hint.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        hint.textColor = .secondaryLabelColor
+        hint.alignment = .left
+        hint.lineBreakMode = .byTruncatingTail
+        stack.addArrangedSubview(hint)
+
+        let resultsStack = NSStackView()
+        resultsStack.orientation = .vertical
+        resultsStack.spacing = 6
+        resultsStack.edgeInsets = NSEdgeInsets(top: 2, left: 0, bottom: 2, right: 0)
+        resultsStack.translatesAutoresizingMaskIntoConstraints = false
+        windowSwitcherResultsStackView = resultsStack
+
+        let documentContainer = NSView()
+        documentContainer.translatesAutoresizingMaskIntoConstraints = false
+        documentContainer.addSubview(resultsStack)
+        NSLayoutConstraint.activate([
+            resultsStack.leadingAnchor.constraint(equalTo: documentContainer.leadingAnchor),
+            resultsStack.trailingAnchor.constraint(equalTo: documentContainer.trailingAnchor),
+            resultsStack.topAnchor.constraint(equalTo: documentContainer.topAnchor),
+            resultsStack.bottomAnchor.constraint(equalTo: documentContainer.bottomAnchor)
+        ])
+
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+        scrollView.documentView = documentContainer
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.heightAnchor.constraint(equalToConstant: 440).isActive = true
+        stack.addArrangedSubview(scrollView)
+        documentContainer.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor).isActive = true
+
+        return root
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        guard let field = obj.object as? NSTextField, field === windowSwitcherSearchField else { return }
+        applyWindowSwitcherFilter()
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        guard control === windowSwitcherSearchField else { return false }
+        if commandSelector == #selector(NSResponder.moveUp(_:)) {
+            moveWindowSwitcherSelection(-1)
+            return true
+        }
+        if commandSelector == #selector(NSResponder.moveDown(_:)) {
+            moveWindowSwitcherSelection(1)
+            return true
+        }
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+            focusSelectedWindowSwitcherResult()
+            return true
+        }
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            windowSwitcherPanel?.orderOut(nil)
+            return true
+        }
+        return false
+    }
+
+    private func buildWindowSwitcherResults() -> [WindowSwitcherResult] {
+        windowController.listWindows(onScreenOnly: true)
+            .filter(\.isControllable)
+            .map { window in
+                let page = browserRestorer.browserKind(for: window.bundleId).flatMap { _ in
+                    browserRestorer.capturedPage(for: window.bundleId, windowTitle: window.title)
+                }
+                return WindowSwitcherResult(
+                    window: window,
+                    browserURL: page?.url,
+                    browserKind: page?.kind,
+                    icon: iconForBundleId(window.bundleId)
+                )
+            }
+    }
+
+    private func iconForBundleId(_ bundleId: String) -> NSImage? {
+        guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) else {
+            return nil
+        }
+        let icon = NSWorkspace.shared.icon(forFile: appURL.path)
+        icon.size = NSSize(width: 34, height: 34)
+        return icon
+    }
+
+    private func applyWindowSwitcherFilter() {
+        let query = windowSwitcherSearchField?.stringValue ?? ""
+        windowSwitcherVisibleResults = windowSwitcherAllResults.filter { $0.matches(query) }
+        if windowSwitcherSelectedIndex >= windowSwitcherVisibleResults.count {
+            windowSwitcherSelectedIndex = max(0, windowSwitcherVisibleResults.count - 1)
+        }
+        reloadWindowSwitcherRows()
+    }
+
+    private func reloadWindowSwitcherRows() {
+        guard let stack = windowSwitcherResultsStackView else { return }
+        stack.arrangedSubviews.forEach {
+            stack.removeArrangedSubview($0)
+            $0.removeFromSuperview()
+        }
+
+        guard !windowSwitcherVisibleResults.isEmpty else {
+            let empty = NSTextField(labelWithString: "没有匹配的窗口。")
+            empty.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+            empty.textColor = .secondaryLabelColor
+            empty.alignment = .center
+            empty.translatesAutoresizingMaskIntoConstraints = false
+            empty.heightAnchor.constraint(equalToConstant: 84).isActive = true
+            stack.addArrangedSubview(empty)
+            return
+        }
+
+        for (index, result) in windowSwitcherVisibleResults.enumerated() {
+            let row = WindowSwitcherResultRowView(result: result)
+            row.isSelected = index == windowSwitcherSelectedIndex
+            row.onSelect = { [weak self] in
+                self?.windowSwitcherSelectedIndex = index
+                self?.focusSelectedWindowSwitcherResult()
+            }
+            stack.addArrangedSubview(row)
+        }
+    }
+
+    private func moveWindowSwitcherSelection(_ delta: Int) {
+        guard !windowSwitcherVisibleResults.isEmpty else { return }
+        let count = windowSwitcherVisibleResults.count
+        windowSwitcherSelectedIndex = (windowSwitcherSelectedIndex + delta + count) % count
+        reloadWindowSwitcherRows()
+    }
+
+    private func focusSelectedWindowSwitcherResult() {
+        guard windowSwitcherSelectedIndex >= 0,
+              windowSwitcherSelectedIndex < windowSwitcherVisibleResults.count
+        else {
+            return
+        }
+        let result = windowSwitcherVisibleResults[windowSwitcherSelectedIndex]
+        windowSwitcherPanel?.orderOut(nil)
+        focusPreviewWindow(result.window)
     }
 
     private func makeButton(_ title: String, action: Selector) -> NSButton {
@@ -6381,6 +6710,167 @@ private final class DesktopHandleOverlayView: NSView {
             return nil
         }
         return standardized
+    }
+}
+
+private final class WindowSwitcherSearchField: NSSearchField {
+    var onMoveSelection: ((Int) -> Void)?
+    var onCommit: (() -> Void)?
+    var onCancel: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        switch event.keyCode {
+        case 125:
+            onMoveSelection?(1)
+        case 126:
+            onMoveSelection?(-1)
+        case 36, 76:
+            onCommit?()
+        case 53:
+            onCancel?()
+        default:
+            super.keyDown(with: event)
+        }
+    }
+}
+
+@MainActor
+private final class WindowSwitcherResultRowView: NSView {
+    let result: WindowSwitcherResult
+    var onSelect: (() -> Void)?
+    var isSelected = false {
+        didSet { needsDisplay = true }
+    }
+    private var isHovered = false
+
+    init(result: WindowSwitcherResult) {
+        self.result = result
+        super.init(frame: NSRect(x: 0, y: 0, width: 660, height: 76))
+        translatesAutoresizingMaskIntoConstraints = false
+        heightAnchor.constraint(equalToConstant: 76).isActive = true
+        wantsLayer = true
+        toolTip = result.browserURL ?? result.window.title
+        addTrackingArea(NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        ))
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { nil }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+        needsDisplay = true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onSelect?()
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        let rowRect = bounds.insetBy(dx: 1, dy: 2)
+        let path = NSBezierPath(roundedRect: rowRect, xRadius: 16, yRadius: 16)
+        let fill: NSColor
+        if isSelected {
+            fill = NSColor.controlAccentColor.withAlphaComponent(0.20)
+        } else if isHovered {
+            fill = NSColor.white.withAlphaComponent(0.14)
+        } else {
+            fill = NSColor.white.withAlphaComponent(0.08)
+        }
+        fill.setFill()
+        path.fill()
+
+        let highlight = NSBezierPath(roundedRect: rowRect.insetBy(dx: 1, dy: 1), xRadius: 15, yRadius: 15)
+        NSColor.white.withAlphaComponent(isSelected ? 0.22 : 0.12).setStroke()
+        highlight.lineWidth = 0.6
+        highlight.stroke()
+
+        if isSelected {
+            NSColor.controlAccentColor.withAlphaComponent(0.55).setStroke()
+            path.lineWidth = 1.4
+            path.stroke()
+        }
+
+        let iconBackRect = NSRect(x: 14, y: bounds.midY - 22, width: 44, height: 44)
+        NSColor.white.withAlphaComponent(0.16).setFill()
+        NSBezierPath(roundedRect: iconBackRect, xRadius: 12, yRadius: 12).fill()
+
+        let iconRect = iconBackRect.insetBy(dx: 5, dy: 5)
+        if let icon = result.icon {
+            icon.draw(in: iconRect)
+        } else {
+            NSColor.secondaryLabelColor.withAlphaComponent(0.20).setFill()
+            NSBezierPath(roundedRect: iconRect, xRadius: 9, yRadius: 9).fill()
+        }
+
+        let appRect = NSRect(x: 72, y: 48, width: bounds.width - 190, height: 15)
+        result.appTitle.draw(
+            in: appRect,
+            withAttributes: [
+                .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                .foregroundColor: NSColor.secondaryLabelColor,
+                .paragraphStyle: truncatingParagraph()
+            ]
+        )
+
+        let titleRect = NSRect(x: 72, y: 27, width: bounds.width - 190, height: 18)
+        result.windowTitle.draw(
+            in: titleRect,
+            withAttributes: [
+                .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
+                .foregroundColor: NSColor.labelColor,
+                .paragraphStyle: truncatingParagraph()
+            ]
+        )
+
+        let detailRect = NSRect(x: 72, y: 10, width: bounds.width - 190, height: 14)
+        result.detailText.draw(
+            in: detailRect,
+            withAttributes: [
+                .font: NSFont.systemFont(ofSize: 10, weight: .medium),
+                .foregroundColor: NSColor.secondaryLabelColor,
+                .paragraphStyle: truncatingParagraph()
+            ]
+        )
+
+        let tag = result.browserURL == nil ? "Window" : "Active Tab"
+        let tagRect = NSRect(x: bounds.width - 102, y: bounds.midY - 12, width: 86, height: 24)
+        let tagPath = NSBezierPath(roundedRect: tagRect, xRadius: 12, yRadius: 12)
+        (isSelected ? NSColor.controlAccentColor.withAlphaComponent(0.14) : NSColor.white.withAlphaComponent(0.10)).setFill()
+        tagPath.fill()
+        tag.draw(
+            in: tagRect.insetBy(dx: 8, dy: 5),
+            withAttributes: [
+                .font: NSFont.systemFont(ofSize: 10, weight: .semibold),
+                .foregroundColor: isSelected ? NSColor.controlAccentColor : NSColor.tertiaryLabelColor,
+                .paragraphStyle: centeredParagraph()
+            ]
+        )
+    }
+
+    private func truncatingParagraph() -> NSMutableParagraphStyle {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .left
+        paragraph.lineBreakMode = .byTruncatingTail
+        return paragraph
+    }
+
+    private func centeredParagraph() -> NSMutableParagraphStyle {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        paragraph.lineBreakMode = .byTruncatingTail
+        return paragraph
     }
 }
 

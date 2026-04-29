@@ -125,14 +125,20 @@ final class DockPreviewResolver {
         guard !items.isEmpty else { return nil }
         guard let dockRegion = inferredDockRegion(containing: screenPoint) else { return nil }
 
-        let hits = items.compactMap { item -> (target: AppTarget, frame: CGRect, score: CGFloat)? in
-            guard let target = target(matching: item.titles, in: targets) else { return nil }
+        let hits = items.compactMap { item -> (target: AppTarget, frame: CGRect, frameScore: CGFloat, titleScore: Int)? in
+            guard let match = target(matching: item.titles, in: targets) else { return nil }
             guard let frame = bestHitFrame(at: screenPoint, frames: item.frames, dockRegion: dockRegion) else { return nil }
             let score = frameScore(frame, screenPoint: screenPoint, dockRegion: dockRegion)
-            return (target, frame, score)
+            return (match.target, frame, score, match.score)
         }
 
-        guard let hit = hits.min(by: { $0.score < $1.score }) else {
+        guard let hit = hits.min(by: { lhs, rhs in
+            if lhs.titleScore != rhs.titleScore {
+                // Prefer semantically stronger app-title matches first.
+                return lhs.titleScore > rhs.titleScore
+            }
+            return lhs.frameScore < rhs.frameScore
+        }) else {
             return nil
         }
 
@@ -310,28 +316,56 @@ final class DockPreviewResolver {
             .lowercased()
     }
 
-    private func target(matching rawStrings: [String], in targets: [AppTarget]) -> AppTarget? {
+    private func target(matching rawStrings: [String], in targets: [AppTarget]) -> (target: AppTarget, score: Int)? {
         let normalizedStrings = rawStrings
             .map(normalizedDockTitle)
             .filter { !$0.isEmpty }
         guard !normalizedStrings.isEmpty else { return nil }
 
-        for text in normalizedStrings {
-            if let exact = targets.first(where: { $0.aliases.contains(text) }) {
-                return exact
-            }
-        }
+        var best: (target: AppTarget, score: Int)?
 
         for text in normalizedStrings {
+            let tokens = Set(tokenize(text))
             for target in targets {
-                let strongAliases = target.aliases.filter { $0.count >= 3 && !$0.contains(".") }
-                if strongAliases.contains(where: { text.contains($0) || $0.contains(text) }) {
-                    return target
+                for alias in target.aliases where !alias.isEmpty {
+                    let score = aliasMatchScore(text: text, tokens: tokens, alias: alias)
+                    guard score > 0 else { continue }
+                    if best == nil || score > best!.score {
+                        best = (target, score)
+                    }
                 }
             }
         }
 
-        return nil
+        return best
+    }
+
+    private func aliasMatchScore(text: String, tokens: Set<String>, alias: String) -> Int {
+        if alias == text {
+            return 120
+        }
+
+        if tokens.contains(alias) {
+            return 95
+        }
+
+        if alias.count >= 4, text.contains(alias) {
+            return 70
+        }
+
+        if alias.count >= 5, alias.contains(text) {
+            return 40
+        }
+
+        return 0
+    }
+
+    private func tokenize(_ value: String) -> [String] {
+        value
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .map(String.init)
+            .map(normalized)
+            .filter { !$0.isEmpty }
     }
 
     private func bestHitFrame(at screenPoint: CGPoint, frames: [CGRect], dockRegion: DockRegion) -> CGRect? {
