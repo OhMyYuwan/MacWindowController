@@ -3599,6 +3599,9 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         panel.hasShadow = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
+        panel.standardWindowButton(.closeButton)?.isHidden = true
+        panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        panel.standardWindowButton(.zoomButton)?.isHidden = true
         return panel
     }
 
@@ -3625,6 +3628,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
 
         let stack = NSStackView()
         stack.orientation = .vertical
+        stack.alignment = .width
         stack.spacing = 12
         stack.edgeInsets = NSEdgeInsets(top: 16, left: 18, bottom: 16, right: 18)
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -3672,6 +3676,8 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             searchField.heightAnchor.constraint(equalToConstant: 46)
         ])
         stack.addArrangedSubview(searchGlass)
+        searchGlass.leadingAnchor.constraint(equalTo: stack.leadingAnchor).isActive = true
+        searchGlass.trailingAnchor.constraint(equalTo: stack.trailingAnchor).isActive = true
 
         let resultsStack = NSStackView()
         resultsStack.orientation = .vertical
@@ -3692,8 +3698,10 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
 
         let scrollView = WindowSwitcherRollerScrollView()
         scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
+        scrollView.contentView.drawsBackground = false
         scrollView.documentView = documentContainer
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.heightAnchor.constraint(equalToConstant: 440).isActive = true
@@ -3706,6 +3714,8 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             self?.moveWindowSwitcherSelection(delta)
         }
         windowSwitcherScrollView = scrollView
+        documentContainer.wantsLayer = true
+        documentContainer.layer?.backgroundColor = NSColor.clear.cgColor
         documentContainer.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor).isActive = true
 
         let resultsContainer = NSVisualEffectView()
@@ -3716,8 +3726,8 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         resultsContainer.layer?.cornerRadius = 22
         resultsContainer.layer?.cornerCurve = .continuous
         resultsContainer.layer?.masksToBounds = true
-        resultsContainer.layer?.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor
-        resultsContainer.layer?.borderWidth = 0.8
+        resultsContainer.layer?.borderColor = NSColor.clear.cgColor
+        resultsContainer.layer?.borderWidth = 0
         resultsContainer.translatesAutoresizingMaskIntoConstraints = false
         resultsContainer.addSubview(scrollView)
         let topFade = WindowSwitcherEdgeFadeView(edge: .top)
@@ -3741,6 +3751,8 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             bottomFade.heightAnchor.constraint(equalToConstant: 34)
         ])
         stack.addArrangedSubview(resultsContainer)
+        resultsContainer.leadingAnchor.constraint(equalTo: stack.leadingAnchor).isActive = true
+        resultsContainer.trailingAnchor.constraint(equalTo: stack.trailingAnchor).isActive = true
 
         return root
     }
@@ -3770,11 +3782,14 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         row.spacing = 10
         row.alignment = .centerY
         row.edgeInsets = NSEdgeInsets(top: 18, left: 18, bottom: 18, right: 18)
+        row.translatesAutoresizingMaskIntoConstraints = false
         row.wantsLayer = true
         row.layer?.cornerRadius = 14
         row.layer?.cornerCurve = .continuous
         row.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.08).cgColor
         stack.addArrangedSubview(row)
+        row.leadingAnchor.constraint(equalTo: stack.leadingAnchor).isActive = true
+        row.trailingAnchor.constraint(equalTo: stack.trailingAnchor).isActive = true
     }
 
     func controlTextDidChange(_ obj: Notification) {
@@ -7205,7 +7220,7 @@ private final class WindowSwitcherEdgeFadeView: NSView {
 
     private func updateGradient() {
         guard let gradient = layer as? CAGradientLayer else { return }
-        let panelBase = NSColor.windowBackgroundColor.withAlphaComponent(0.56).cgColor
+        let panelBase = NSColor.windowBackgroundColor.withAlphaComponent(0.22).cgColor
         let transparent = NSColor.windowBackgroundColor.withAlphaComponent(0.0).cgColor
         if edge == .top {
             gradient.colors = [panelBase, transparent]
