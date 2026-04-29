@@ -3,6 +3,9 @@ import ApplicationServices
 import CoreGraphics
 import Foundation
 
+@_silgen_name("_AXUIElementGetWindow")
+private func _AXUIElementGetWindow(_ element: AXUIElement, _ windowID: UnsafeMutablePointer<CGWindowID>) -> AXError
+
 enum WindowControllerError: LocalizedError {
     case appNotRunning(String)
     case appNotInstalled(String)
@@ -31,11 +34,16 @@ enum WindowControllerError: LocalizedError {
 
 final class WindowController {
     private let layoutEngine = LayoutEngine()
+    nonisolated(unsafe) private static var raiseGeneration: UInt64 = 0
 
     @discardableResult
     func ensureAccessibilityPermission(prompt: Bool = true) -> Bool {
         let options: CFDictionary = ["AXTrustedCheckOptionPrompt": prompt] as CFDictionary
         return AXIsProcessTrustedWithOptions(options)
+    }
+
+    func hasAccessibilityPermission() -> Bool {
+        ensureAccessibilityPermission(prompt: false)
     }
 
     func listWindows(onScreenOnly: Bool = true) -> [WindowInfo] {
@@ -119,22 +127,22 @@ final class WindowController {
 
     func raiseWindow(bundleId: String, windowIndex: Int = 0) throws {
         let targetWindow = try resolveAXWindow(bundleId: bundleId, windowIndex: windowIndex)
-        let result = AXUIElementPerformAction(targetWindow, kAXRaiseAction as CFString)
-        guard result == .success else {
-            throw WindowControllerError.axFailure("raise window", result)
-        }
-        let app = try runningApplication(bundleId: bundleId)
-        _ = app.activate(options: [.activateIgnoringOtherApps])
+        try raiseResolvedWindow(targetWindow, bundleId: bundleId)
     }
 
     func raiseWindow(bundleId: String, windowNumber: Int) throws {
         let targetWindow = try resolveAXWindow(bundleId: bundleId, windowNumber: windowNumber)
-        let result = AXUIElementPerformAction(targetWindow, kAXRaiseAction as CFString)
-        guard result == .success else {
-            throw WindowControllerError.axFailure("raise window", result)
-        }
-        let app = try runningApplication(bundleId: bundleId)
-        _ = app.activate(options: [.activateIgnoringOtherApps])
+        try raiseResolvedWindow(targetWindow, bundleId: bundleId)
+    }
+
+    func raiseWindowOnly(bundleId: String, windowIndex: Int = 0) throws {
+        let targetWindow = try resolveAXWindow(bundleId: bundleId, windowIndex: windowIndex)
+        try raiseResolvedWindowOnly(targetWindow, bundleId: bundleId)
+    }
+
+    func raiseWindowOnly(bundleId: String, windowNumber: Int) throws {
+        let targetWindow = try resolveAXWindow(bundleId: bundleId, windowNumber: windowNumber)
+        try raiseResolvedWindowOnly(targetWindow, bundleId: bundleId)
     }
 
     func setWindowMinimized(bundleId: String, windowIndex: Int = 0, minimized: Bool) throws {
@@ -228,7 +236,21 @@ final class WindowController {
         let focused = focusedWindow as! AXUIElement
         let focusedTitle = title(for: focused)
         let number = windowNumber(for: focused, bundleId: bundleId, pid: app.processIdentifier, expectedTitle: focusedTitle)
-        return WindowIdentity(bundleId: bundleId, title: focusedTitle, windowNumber: number)
+        let focusedFrame = frame(for: focused)
+        let hint: Int? = {
+            if let number {
+                return try? findWindowIndex(bundleId: bundleId, windowNumber: number)
+            }
+            return try? findWindowIndex(bundleId: bundleId, exactTitle: focusedTitle)
+        }()
+        return WindowIdentity(
+            bundleId: bundleId,
+            title: focusedTitle,
+            windowNumber: number,
+            appName: app.localizedName,
+            windowIndexHint: hint,
+            frameHint: focusedFrame.map(RectData.init)
+        )
     }
 
     func windowIdentity(bundleId: String, windowIndex: Int = 0) throws -> WindowIdentity {
@@ -241,7 +263,15 @@ final class WindowController {
             pid: app.processIdentifier,
             expectedTitle: currentTitle
         )
-        return WindowIdentity(bundleId: bundleId, title: currentTitle, windowNumber: number)
+        let hint: Int? = number.flatMap { try? findWindowIndex(bundleId: bundleId, windowNumber: $0) } ?? windowIndex
+        return WindowIdentity(
+            bundleId: bundleId,
+            title: currentTitle,
+            windowNumber: number,
+            appName: app.localizedName,
+            windowIndexHint: hint,
+            frameHint: frame(for: targetWindow).map(RectData.init)
+        )
     }
 
     func findWindowIndex(bundleId: String, titleContains query: String) throws -> Int? {
@@ -258,6 +288,47 @@ final class WindowController {
         return nil
     }
 
+    func findWindowIndex(bundleId: String, exactTitle title: String) throws -> Int? {
+        try findWindowIndex(bundleId: bundleId, exactTitle: title, windowIndexHint: nil, nearFrame: nil)
+    }
+
+    func findWindowIndex(
+        bundleId: String,
+        exactTitle title: String,
+        windowIndexHint: Int?,
+        nearFrame: CGRect?
+    ) throws -> Int? {
+        let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedTitle.isEmpty else { return nil }
+
+        let windows = try axWindows(bundleId: bundleId)
+
+        if let hint = windowIndexHint, hint >= 0, hint < windows.count {
+            let hintedTitle = self.title(for: windows[hint]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if hintedTitle == normalizedTitle {
+                return hint
+            }
+        }
+
+        var candidates: [(index: Int, frame: CGRect?)] = []
+        for (index, window) in windows.enumerated() {
+            let current = self.title(for: window).trimmingCharacters(in: .whitespacesAndNewlines)
+            if current == normalizedTitle {
+                candidates.append((index, frame(for: window)))
+            }
+        }
+        guard !candidates.isEmpty else { return nil }
+
+        if let nearFrame {
+            let sorted = candidates.sorted { lhs, rhs in
+                frameDistance(lhs.frame, nearFrame) < frameDistance(rhs.frame, nearFrame)
+            }
+            return sorted.first?.index
+        }
+
+        return candidates.first?.index
+    }
+
     func findWindowIndex(bundleId: String, windowNumber: Int) throws -> Int? {
         let all = listWindows(onScreenOnly: false).filter { $0.bundleId == bundleId }
         guard let target = all.first(where: { $0.windowNumber == windowNumber }) else {
@@ -267,6 +338,19 @@ final class WindowController {
         let targetFrame = target.frame.cgRect
         let targetTitle = target.title
         let ax = try axWindows(bundleId: bundleId)
+
+        for (index, window) in ax.enumerated() {
+            if cgWindowID(for: window) == windowNumber {
+                return index
+            }
+        }
+
+        for (index, window) in ax.enumerated() {
+            if windowNumberAttribute(for: window) == windowNumber {
+                return index
+            }
+        }
+
         var best: (index: Int, score: Double)?
 
         for (index, window) in ax.enumerated() {
@@ -341,10 +425,92 @@ final class WindowController {
     }
 
     private func resolveAXWindow(bundleId: String, windowNumber: Int) throws -> AXUIElement {
+        let windows = try axWindows(bundleId: bundleId)
+        for window in windows {
+            if cgWindowID(for: window) == windowNumber {
+                return window
+            }
+        }
         guard let index = try findWindowIndex(bundleId: bundleId, windowNumber: windowNumber) else {
             throw WindowControllerError.noWindows(bundleId)
         }
-        return try resolveAXWindow(bundleId: bundleId, windowIndex: index)
+        guard index >= 0, index < windows.count else {
+            throw WindowControllerError.windowIndexOutOfRange(index)
+        }
+        return windows[index]
+    }
+
+    private func raiseResolvedWindow(_ targetWindow: AXUIElement, bundleId: String) throws {
+        let app = try runningApplication(bundleId: bundleId)
+        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        let targetWindowNumber = cgWindowID(for: targetWindow)
+
+        let myGeneration: UInt64 = {
+            Self.raiseGeneration &+= 1
+            return Self.raiseGeneration
+        }()
+
+        raiseWindowElement(targetWindow, appElement: appElement)
+
+        _ = app.unhide()
+        _ = app.activate(options: [.activateIgnoringOtherApps])
+
+        raiseWindowElement(targetWindow, appElement: appElement)
+
+        if let targetWindowNumber {
+            for delay in [0.05, 0.15] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [bundleId] in
+                    let current = Self.raiseGeneration
+                    guard current == myGeneration else { return }
+                    guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).first else { return }
+                    let appElement = AXUIElementCreateApplication(app.processIdentifier)
+                    guard let windows = Self.copyAXWindows(for: appElement) else { return }
+                    guard let targetWindow = windows.first(where: { Self.cgWindowIDStatic(for: $0) == targetWindowNumber }) else { return }
+                    Self.reassertWindow(targetWindow, appElement: appElement)
+                }
+            }
+        }
+    }
+
+    private static func reassertWindow(_ window: AXUIElement, appElement: AXUIElement) {
+        _ = AXUIElementSetAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, window)
+        _ = AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+        _ = AXUIElementSetAttributeValue(window, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+        _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+    }
+
+    private static func copyAXWindows(for appElement: AXUIElement) -> [AXUIElement]? {
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value)
+        guard result == .success, let windows = value as? [AXUIElement], !windows.isEmpty else {
+            return nil
+        }
+        return windows
+    }
+
+    private static func cgWindowIDStatic(for window: AXUIElement) -> Int? {
+        var windowID: CGWindowID = 0
+        guard _AXUIElementGetWindow(window, &windowID) == .success else { return nil }
+        return Int(windowID)
+    }
+
+    private func raiseResolvedWindowOnly(_ targetWindow: AXUIElement, bundleId: String) throws {
+        let app = try runningApplication(bundleId: bundleId)
+        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        raiseWindowElement(targetWindow, appElement: appElement)
+
+        let finalRaise = AXUIElementPerformAction(targetWindow, kAXRaiseAction as CFString)
+        guard finalRaise == .success else {
+            throw WindowControllerError.axFailure("raise window only", finalRaise)
+        }
+    }
+
+    private func raiseWindowElement(_ targetWindow: AXUIElement, appElement: AXUIElement) {
+        _ = AXUIElementSetAttributeValue(targetWindow, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+        _ = AXUIElementSetAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, targetWindow)
+        _ = AXUIElementSetAttributeValue(targetWindow, kAXMainAttribute as CFString, kCFBooleanTrue)
+        _ = AXUIElementSetAttributeValue(targetWindow, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+        _ = AXUIElementPerformAction(targetWindow, kAXRaiseAction as CFString)
     }
 
     private func setPosition(window: AXUIElement, point: CGPoint) throws {
@@ -426,6 +592,33 @@ final class WindowController {
         return CGRect(origin: position, size: size)
     }
 
+    private func cgWindowID(for window: AXUIElement) -> Int? {
+        var windowID: CGWindowID = 0
+        guard _AXUIElementGetWindow(window, &windowID) == .success else { return nil }
+        return Int(windowID)
+    }
+
+    private func windowNumberAttribute(for window: AXUIElement) -> Int? {
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(window, "AXWindowNumber" as CFString, &value)
+        guard result == .success, let value else { return nil }
+        if let number = value as? Int {
+            return number
+        }
+        if let number = value as? NSNumber {
+            return number.intValue
+        }
+        return nil
+    }
+
+    private func frameDistance(_ lhs: CGRect?, _ rhs: CGRect) -> CGFloat {
+        guard let lhs else { return .greatestFiniteMagnitude }
+        return abs(lhs.origin.x - rhs.origin.x)
+            + abs(lhs.origin.y - rhs.origin.y)
+            + abs(lhs.size.width - rhs.size.width)
+            + abs(lhs.size.height - rhs.size.height)
+    }
+
     private func pointAttribute(_ element: AXUIElement, attribute: CFString) -> CGPoint? {
         var value: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(element, attribute, &value)
@@ -468,6 +661,16 @@ final class WindowController {
             info.bundleId == bundleId && info.pid == pid
         }
         guard !candidates.isEmpty else { return nil }
+
+        if let number = cgWindowID(for: window),
+           candidates.contains(where: { $0.windowNumber == number }) {
+            return number
+        }
+
+        if let number = windowNumberAttribute(for: window),
+           candidates.contains(where: { $0.windowNumber == number }) {
+            return number
+        }
 
         let axFrame = frame(for: window)
         var best: (number: Int, score: Double)?
