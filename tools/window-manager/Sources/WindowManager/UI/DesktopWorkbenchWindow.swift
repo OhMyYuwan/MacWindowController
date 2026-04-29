@@ -1,6 +1,7 @@
 import AppKit
 import Carbon
 import Foundation
+import ServiceManagement
 
 @MainActor
 enum DesktopMergeMode: Int, CaseIterable {
@@ -274,6 +275,8 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     private var titleRuleListStackView: NSStackView?
     private var temporaryMatchListStackView: NSStackView?
     private var recordingShortcutAction: WorkbenchShortcutAction?
+    private var accessibilityPermissionStatusLabel: NSTextField?
+    private var launchAtLoginStatusLabel: NSTextField?
     private var statusItem: NSStatusItem?
     private var isQuitting = false
 
@@ -421,6 +424,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         if let focusedLayoutName {
             selectedLayoutName = focusedLayoutName
         }
+        refreshPermissionStatus()
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -2821,6 +2825,60 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         let root = makePanelRoot()
         addFullWidthArrangedSubview(makeSectionTitle("设置", subtitle: "外观、快捷键和高级工具。"), to: root)
 
+        let permissionStatus = NSTextField(labelWithString: accessibilityPermissionStatusText())
+        permissionStatus.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        permissionStatus.textColor = accessibilityPermissionStatusColor()
+        permissionStatus.alignment = .left
+        permissionStatus.lineBreakMode = .byWordWrapping
+        permissionStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        accessibilityPermissionStatusLabel = permissionStatus
+
+        addFullWidthArrangedSubview(makeSectionGroup(
+            title: "权限健康",
+            subtitle: "窗口管理依赖 macOS 辅助功能权限；屏幕录制权限会在预览管线阶段启用。",
+            views: [
+                makeActionRow(
+                    title: "辅助功能权限",
+                    detail: "允许 WinCtlManager 读取并控制窗口位置和大小。",
+                    controls: [
+                        permissionStatus,
+                        makeButton("重新检测", action: #selector(refreshPermissionStatusAction)),
+                        makeButton("打开系统设置", action: #selector(openAccessibilitySettings))
+                    ]
+                ),
+                makeActionRow(
+                    title: "屏幕录制权限",
+                    detail: "为后续窗口缩略图和 Dock Preview 预留；当前版本暂不需要。",
+                    controls: [NSTextField(labelWithString: "稍后启用")]
+                )
+            ]
+        ), to: root)
+
+        let loginStatus = NSTextField(labelWithString: launchAtLoginStatusText())
+        loginStatus.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        loginStatus.textColor = launchAtLoginStatusColor()
+        loginStatus.alignment = .left
+        loginStatus.lineBreakMode = .byWordWrapping
+        loginStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        launchAtLoginStatusLabel = loginStatus
+
+        addFullWidthArrangedSubview(makeSectionGroup(
+            title: "常驻启动",
+            subtitle: "让 WinCtlManager 登录后自动进入菜单栏，适合日常窗口编排。",
+            views: [
+                makeActionRow(
+                    title: "开机启动",
+                    detail: "需要以 .app bundle 方式运行；开发期裸 swift run 可能无法注册。",
+                    controls: [
+                        loginStatus,
+                        makeButton("启用", action: #selector(enableLaunchAtLogin)),
+                        makeButton("关闭", action: #selector(disableLaunchAtLogin)),
+                        makeButton("刷新", action: #selector(refreshLaunchAtLoginStatusAction))
+                    ]
+                )
+            ]
+        ), to: root)
+
         let appearancePopup = NSPopUpButton(frame: .zero, pullsDown: false)
         appearancePopup.addItems(withTitles: DesktopConfig.WorkbenchAppearance.allCases.map(\.title))
         if let idx = DesktopConfig.WorkbenchAppearance.allCases.firstIndex(of: appConfig.workbenchAppearance) {
@@ -2852,6 +2910,105 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         ), to: root)
 
         return root
+    }
+
+    private func accessibilityPermissionStatusText() -> String {
+        windowController.hasAccessibilityPermission() ? "已授权" : "未授权"
+    }
+
+    private func accessibilityPermissionStatusColor() -> NSColor {
+        windowController.hasAccessibilityPermission() ? .systemGreen : .systemOrange
+    }
+
+    @objc
+    private func refreshPermissionStatusAction() {
+        refreshPermissionStatus()
+    }
+
+    private func refreshPermissionStatus() {
+        let hasPermission = windowController.hasAccessibilityPermission()
+        accessibilityPermissionStatusLabel?.stringValue = hasPermission ? "已授权" : "未授权"
+        accessibilityPermissionStatusLabel?.textColor = hasPermission ? .systemGreen : .systemOrange
+        let message = hasPermission
+            ? "辅助功能权限正常"
+            : "辅助功能权限未授权，请在系统设置中允许 WinCtlManager"
+        setStatus(message, error: !hasPermission)
+    }
+
+    @objc
+    private func openAccessibilitySettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+        _ = windowController.ensureAccessibilityPermission(prompt: true)
+        refreshPermissionStatus()
+    }
+
+    private func launchAtLoginStatusText() -> String {
+        switch SMAppService.mainApp.status {
+        case .enabled:
+            return "已启用"
+        case .notRegistered:
+            return "未启用"
+        case .requiresApproval:
+            return "需要系统批准"
+        case .notFound:
+            return "未找到 App Bundle"
+        @unknown default:
+            return "未知状态"
+        }
+    }
+
+    private func launchAtLoginStatusColor() -> NSColor {
+        switch SMAppService.mainApp.status {
+        case .enabled:
+            return .systemGreen
+        case .requiresApproval:
+            return .systemOrange
+        case .notRegistered, .notFound:
+            return .secondaryLabelColor
+        @unknown default:
+            return .secondaryLabelColor
+        }
+    }
+
+    @objc
+    private func enableLaunchAtLogin() {
+        do {
+            if SMAppService.mainApp.status != .enabled {
+                try SMAppService.mainApp.register()
+            }
+            refreshLaunchAtLoginStatus()
+            setStatus("已启用开机启动", error: false)
+        } catch {
+            refreshLaunchAtLoginStatus()
+            setStatus("启用开机启动失败：\(error.localizedDescription)", error: true)
+        }
+    }
+
+    @objc
+    private func disableLaunchAtLogin() {
+        do {
+            if SMAppService.mainApp.status == .enabled || SMAppService.mainApp.status == .requiresApproval {
+                try SMAppService.mainApp.unregister()
+            }
+            refreshLaunchAtLoginStatus()
+            setStatus("已关闭开机启动", error: false)
+        } catch {
+            refreshLaunchAtLoginStatus()
+            setStatus("关闭开机启动失败：\(error.localizedDescription)", error: true)
+        }
+    }
+
+    @objc
+    private func refreshLaunchAtLoginStatusAction() {
+        refreshLaunchAtLoginStatus()
+        setStatus("已刷新开机启动状态：\(launchAtLoginStatusText())", error: false)
+    }
+
+    private func refreshLaunchAtLoginStatus() {
+        launchAtLoginStatusLabel?.stringValue = launchAtLoginStatusText()
+        launchAtLoginStatusLabel?.textColor = launchAtLoginStatusColor()
     }
 
     private func makeButton(_ title: String, action: Selector) -> NSButton {

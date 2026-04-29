@@ -74,7 +74,7 @@ desktop snapshot persistence, and a visual desktop layout editor.
 
 ## Active Direction
 
-- Last completed request: `REQ-0048`
-- Last completed plan: `PLN-0047`
-- Last completed change: `CHG-0047`
+- Last completed request: `REQ-0050`
+- Last completed plan: `PLN-0049`
+- Last completed change: `CHG-0049`
 - Immediate objective: await next user-directed ACP request.

@@ -38,6 +38,10 @@ final class WindowController {
         return AXIsProcessTrustedWithOptions(options)
     }
 
+    func hasAccessibilityPermission() -> Bool {
+        ensureAccessibilityPermission(prompt: false)
+    }
+
     func listWindows(onScreenOnly: Bool = true) -> [WindowInfo] {
         var options: CGWindowListOption = [.excludeDesktopElements]
         if onScreenOnly {
