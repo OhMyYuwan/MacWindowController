@@ -164,6 +164,14 @@ private struct AppRoutingItem {
     let isRoutingLocked: Bool
 }
 
+private struct PreviewAppToggleItem {
+    let bundleId: String
+    let appName: String
+    let icon: NSImage?
+    let windowCount: Int
+    let enabled: Bool
+}
+
 private struct WindowSwitcherResult {
     let window: WindowInfo
     let browserURL: String?
@@ -197,20 +205,49 @@ private struct WindowSwitcherResult {
         return parts.joined(separator: " · ")
     }
 
-    func matches(_ query: String) -> Bool {
-        let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !normalized.isEmpty else { return true }
-        return [
+    var searchableFields: [String] {
+        [
+            window.title,
             window.appName,
             window.bundleId,
-            window.title,
             String(window.windowNumber),
             "#\(window.windowNumber)",
             browserURL ?? "",
             browserKind ?? ""
         ]
-        .map { $0.lowercased() }
-        .contains { $0.contains(normalized) }
+    }
+
+    func matches(_ query: String) -> Bool {
+        let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return true }
+        return searchableFields
+            .map { $0.lowercased() }
+            .contains { $0.contains(normalized) }
+    }
+
+    /// Higher score means more relevant.
+    func matchScore(for query: String) -> Int {
+        let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return 1 }
+
+        let title = window.title.lowercased()
+        let app = window.appName.lowercased()
+        let bundle = window.bundleId.lowercased()
+        let host = (browserURL.flatMap { URL(string: $0)?.host } ?? "").lowercased()
+        let number = String(window.windowNumber)
+
+        if title == normalized { return 1200 }
+        if title.hasPrefix(normalized) { return 980 }
+        if title.contains(normalized) { return 860 }
+        if app == normalized { return 780 }
+        if app.hasPrefix(normalized) { return 700 }
+        if app.contains(normalized) { return 620 }
+        if host == normalized { return 560 }
+        if host.contains(normalized) { return 520 }
+        if bundle.contains(normalized) { return 460 }
+        if number == normalized || "#\(number)" == normalized { return 420 }
+        if searchableFields.map({ $0.lowercased() }).contains(where: { $0.contains(normalized) }) { return 300 }
+        return 0
     }
 }
 
@@ -347,6 +384,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     private var dockPreviewCurrentBundleId: String?
     private var dockPreviewCurrentItemFrame: CGRect?
     private var dockPreviewLastRefresh = Date.distantPast
+    private var dockPreviewRenderGeneration = 0
     private var dockPreviewCachedWindows: [WindowInfo] = []
     private var dockPreviewLastWindowScan = Date.distantPast
     private var dockPreviewLastHoverCheck = Date.distantPast
@@ -360,9 +398,11 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     private var windowSwitcherVisibleResults: [WindowSwitcherResult] = []
     private var windowSwitcherSelectedIndex = 0
     private var windowSwitcherVirtualSelectedIndex = 0
-    private let windowSwitcherVirtualRepetition = 9
+    private let windowSwitcherVirtualRepetition = 7
     private var windowSwitcherLoadGeneration = 0
     private var windowSwitcherRootView: WindowSwitcherRootView?
+    private var windowSwitcherCachedResults: [WindowSwitcherResult] = []
+    private var windowSwitcherIconCache: [String: NSImage] = [:]
     private var isQuitting = false
 
     init(
@@ -923,7 +963,25 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         dockPreviewCurrentItemFrame = match.itemFrame
 
         let matchingWindows = windows
-            .filter { $0.bundleId == match.bundleId }
+            .filter { window in
+                guard window.bundleId == match.bundleId else { return false }
+                if let pid = match.pid {
+                    return window.pid == pid
+                }
+                return true
+            }
+            .reduce(into: [Int: WindowInfo]()) { partial, window in
+                if let existing = partial[window.windowNumber] {
+                    let existingHasTitle = !existing.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    let currentHasTitle = !window.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    if !existingHasTitle && currentHasTitle {
+                        partial[window.windowNumber] = window
+                    }
+                } else {
+                    partial[window.windowNumber] = window
+                }
+            }
+            .map(\.value)
             .sorted { lhs, rhs in
                 let leftTitle = lhs.title.isEmpty ? lhs.appName : lhs.title
                 let rightTitle = rhs.title.isEmpty ? rhs.appName : rhs.title
@@ -953,7 +1011,10 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             return dockPreviewCachedWindows
         }
         dockPreviewLastWindowScan = now
-        dockPreviewCachedWindows = windowController.listWindows(onScreenOnly: true).filter(\.isControllable)
+        dockPreviewCachedWindows = windowController
+            .listWindows(onScreenOnly: true)
+            .filter(\.isControllable)
+            .filter { isPreviewAppEnabled(bundleId: $0.bundleId) }
         return dockPreviewCachedWindows
     }
 
@@ -961,8 +1022,11 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         dockPreviewHideWorkItem?.cancel()
         dockPreviewCurrentBundleId = match.bundleId
         dockPreviewLastRefresh = Date()
+        dockPreviewRenderGeneration += 1
+        let renderGeneration = dockPreviewRenderGeneration
+        let previewWindows = Array(windows.prefix(6))
 
-        let snapshots = previewProvider.snapshots(for: Array(windows.prefix(6)))
+        let snapshots = previewProvider.cachedSnapshots(for: previewWindows)
         guard !snapshots.isEmpty else {
             hideDockPreviewPanel()
             return
@@ -975,6 +1039,26 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         dockPreviewPanel = panel
         positionDockPreviewPanel(for: match)
         panel.orderFrontRegardless()
+
+        let previewProvider = self.previewProvider
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let hydrated = previewProvider.hydratedSnapshots(for: previewWindows)
+            guard hydrated.contains(where: \.hasImage) else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                guard self.dockPreviewRenderGeneration == renderGeneration,
+                      self.dockPreviewCurrentBundleId == match.bundleId,
+                      let panel = self.dockPreviewPanel,
+                      panel.isVisible
+                else {
+                    return
+                }
+                let refreshed = self.makeDockPreviewContent(match: match, snapshots: hydrated, totalWindowCount: windows.count)
+                panel.contentView = refreshed
+                panel.setContentSize(refreshed.fittingSize)
+                self.positionDockPreviewPanel(for: match)
+            }
+        }
     }
 
     private func makeDockPreviewPanel() -> NSPanel {
@@ -1096,6 +1180,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
 
     private func hideDockPreviewPanel() {
         dockPreviewHideWorkItem?.cancel()
+        dockPreviewRenderGeneration += 1
         dockPreviewPanel?.orderOut(nil)
         dockPreviewCurrentBundleId = nil
         dockPreviewCurrentItemFrame = nil
@@ -3113,8 +3198,28 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             )]
         ), to: root)
 
+        let allPreviewCandidates = windowController.listWindows(onScreenOnly: false)
+            .filter(\.isControllable)
+        let previewAppItems = previewAppToggleItems(from: allPreviewCandidates)
+        let appToggleStack = NSStackView()
+        appToggleStack.orientation = .vertical
+        appToggleStack.spacing = 8
+        appToggleStack.alignment = .width
+        applyFullWidthAlignment(to: appToggleStack)
+        if previewAppItems.isEmpty {
+            addFullWidthArrangedSubview(makeEmptyStateLabel("没有可配置的预览应用。"), to: appToggleStack)
+        } else {
+            previewAppItems.forEach { addFullWidthArrangedSubview(makePreviewAppToggleRow($0), to: appToggleStack) }
+        }
+        addFullWidthArrangedSubview(makeSectionGroup(
+            title: "预览 App 开关",
+            subtitle: "关闭后将从 Switcher 与 Dock Preview 中隐藏该 App；最小化窗口检索同样遵循这里的开关。",
+            views: [makeBoundedScrollView(containing: appToggleStack, height: 260)]
+        ), to: root)
+
         let windows = windowController.listWindows(onScreenOnly: true)
             .filter(\.isControllable)
+            .filter { isPreviewAppEnabled(bundleId: $0.bundleId) }
             .sorted { lhs, rhs in
                 if lhs.appName == rhs.appName {
                     return lhs.windowNumber < rhs.windowNumber
@@ -3551,21 +3656,32 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
 
         let panel = windowSwitcherPanel ?? makeWindowSwitcherPanel()
         windowSwitcherPanel = panel
-        panel.contentView = makeWindowSwitcherContent()
+        prepareWindowSwitcherPanelIfNeeded(panel)
         panel.setContentSize(NSSize(width: 720, height: 560))
         centerWindowSwitcherPanel(panel)
 
         NSApp.activate(ignoringOtherApps: true)
+        panel.alphaValue = 0
         panel.makeKeyAndOrderFront(nil)
         panel.level = .floating
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.10
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            panel.animator().alphaValue = 1
+        }
         if let field = windowSwitcherSearchField {
             field.stringValue = ""
             panel.makeFirstResponder(field)
         }
 
-        windowSwitcherAllResults = []
-        windowSwitcherVisibleResults = []
-        showWindowSwitcherLoadingState()
+        if windowSwitcherCachedResults.isEmpty {
+            windowSwitcherAllResults = []
+            windowSwitcherVisibleResults = []
+            showWindowSwitcherLoadingState()
+        } else {
+            windowSwitcherAllResults = windowSwitcherCachedResults
+            applyWindowSwitcherFilter()
+        }
 
         windowSwitcherLoadGeneration += 1
         let loadGeneration = windowSwitcherLoadGeneration
@@ -3576,10 +3692,39 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
                   loadGeneration == self.windowSwitcherLoadGeneration else {
                 return
             }
-            self.windowSwitcherAllResults = self.buildWindowSwitcherResults()
+            let loadedResults = self.buildWindowSwitcherResults()
+            self.windowSwitcherCachedResults = loadedResults
+            self.windowSwitcherAllResults = loadedResults
             self.applyWindowSwitcherFilter()
         }
         setStatus("窗口搜索已打开：输入 App、标题、URL 或窗口编号", error: false)
+    }
+
+    private func prepareWindowSwitcherPanelIfNeeded(_ panel: NSPanel) {
+        if panel.contentView is WindowSwitcherRootView, windowSwitcherSearchField != nil {
+            return
+        }
+        panel.contentView = makeWindowSwitcherContent()
+    }
+
+    private func dismissWindowSwitcher(animated: Bool = true) {
+        guard let panel = windowSwitcherPanel, panel.isVisible else { return }
+        windowSwitcherLoadGeneration += 1
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.08
+                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                panel.animator().alphaValue = 0
+            } completionHandler: {
+                Task { @MainActor in
+                    panel.orderOut(nil)
+                    panel.alphaValue = 1
+                }
+            }
+        } else {
+            panel.orderOut(nil)
+            panel.alphaValue = 1
+        }
     }
 
     private func makeWindowSwitcherPanel() -> NSPanel {
@@ -3622,7 +3767,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         root.translatesAutoresizingMaskIntoConstraints = true
         root.autoresizingMask = [.width, .height]
         root.onBackgroundClick = { [weak self] in
-            self?.windowSwitcherPanel?.orderOut(nil)
+            self?.dismissWindowSwitcher()
         }
         windowSwitcherRootView = root
 
@@ -3652,7 +3797,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             self?.focusSelectedWindowSwitcherResult()
         }
         searchField.onCancel = { [weak self] in
-            self?.windowSwitcherPanel?.orderOut(nil)
+            self?.dismissWindowSwitcher()
         }
         windowSwitcherSearchField = searchField
         let searchGlass = NSVisualEffectView()
@@ -3812,15 +3957,101 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             return true
         }
         if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
-            windowSwitcherPanel?.orderOut(nil)
+            dismissWindowSwitcher()
             return true
         }
         return false
     }
 
     private func buildWindowSwitcherResults() -> [WindowSwitcherResult] {
-        windowController.listWindows(onScreenOnly: true)
+        let onScreen = windowController.listWindows(onScreenOnly: true)
             .filter(\.isControllable)
+            .filter { isPreviewAppEnabled(bundleId: $0.bundleId) }
+        let all = windowController.listWindows(onScreenOnly: false)
+            .filter(\.isControllable)
+            .filter { isPreviewAppEnabled(bundleId: $0.bundleId) }
+
+        var bestByKey: [String: WindowInfo] = [:]
+        for window in onScreen + all {
+            let key = "\(window.bundleId)#\(window.windowNumber)"
+            if let existing = bestByKey[key] {
+                if shouldPrefer(window, over: existing) {
+                    bestByKey[key] = window
+                }
+            } else {
+                bestByKey[key] = window
+            }
+        }
+
+        let mergedWindows = Array(bestByKey.values)
+        let groupedByBundle = Dictionary(grouping: mergedWindows, by: \.bundleId)
+        var expectedCountCache: [String: Int] = [:]
+        var normalizedWindows: [WindowInfo] = []
+
+        for (bundleId, bundleWindows) in groupedByBundle {
+            let titled = bundleWindows.filter { !$0.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            let untitled = bundleWindows.filter { $0.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+
+            let expectedCount: Int = {
+                if untitled.isEmpty {
+                    return max(1, titled.count)
+                }
+                if let cached = expectedCountCache[bundleId] {
+                    return cached
+                }
+                let fallback = max(1, titled.count)
+                let count = (try? windowController.windowCount(bundleId: bundleId)).map { max(1, $0) } ?? fallback
+                expectedCountCache[bundleId] = count
+                return count
+            }()
+
+            let sortedTitled = titled.sorted { lhs, rhs in
+                let leftTitle = lhs.title.trimmingCharacters(in: .whitespacesAndNewlines)
+                let rightTitle = rhs.title.trimmingCharacters(in: .whitespacesAndNewlines)
+                if lhs.appName != rhs.appName {
+                    return lhs.appName.localizedCaseInsensitiveCompare(rhs.appName) == .orderedAscending
+                }
+                if leftTitle != rightTitle {
+                    return leftTitle.localizedCaseInsensitiveCompare(rightTitle) == .orderedAscending
+                }
+                return lhs.windowNumber < rhs.windowNumber
+            }
+
+            let sortedUntitled = untitled.sorted { lhs, rhs in
+                let leftArea = lhs.frame.width * lhs.frame.height
+                let rightArea = rhs.frame.width * rhs.frame.height
+                if leftArea != rightArea {
+                    return leftArea > rightArea
+                }
+                return lhs.windowNumber < rhs.windowNumber
+            }
+
+            if sortedTitled.isEmpty {
+                normalizedWindows.append(contentsOf: sortedUntitled.prefix(expectedCount))
+            } else {
+                normalizedWindows.append(contentsOf: sortedTitled)
+                let remaining = max(0, expectedCount - sortedTitled.count)
+                if remaining > 0 {
+                    normalizedWindows.append(contentsOf: sortedUntitled.prefix(remaining))
+                }
+            }
+        }
+
+        return normalizedWindows
+            .sorted { lhs, rhs in
+                let leftTitle = lhs.title.trimmingCharacters(in: .whitespacesAndNewlines)
+                let rightTitle = rhs.title.trimmingCharacters(in: .whitespacesAndNewlines)
+                if leftTitle.isEmpty != rightTitle.isEmpty {
+                    return !leftTitle.isEmpty
+                }
+                if lhs.appName != rhs.appName {
+                    return lhs.appName.localizedCaseInsensitiveCompare(rhs.appName) == .orderedAscending
+                }
+                if leftTitle != rightTitle {
+                    return leftTitle.localizedCaseInsensitiveCompare(rightTitle) == .orderedAscending
+                }
+                return lhs.windowNumber < rhs.windowNumber
+            }
             .map { window in
                 let page = browserRestorer.browserKind(for: window.bundleId).flatMap { _ in
                     browserRestorer.capturedPage(for: window.bundleId, windowTitle: window.title)
@@ -3834,18 +4065,115 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             }
     }
 
+    private func shouldPrefer(_ candidate: WindowInfo, over existing: WindowInfo) -> Bool {
+        let existingTitle = existing.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let candidateTitle = candidate.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if existingTitle.isEmpty != candidateTitle.isEmpty {
+            return !candidateTitle.isEmpty
+        }
+
+        // Keep the larger frame if both have/lose title equally; this usually maps to the
+        // actual top-level window entry instead of tiny utility duplicates.
+        let existingArea = existing.frame.width * existing.frame.height
+        let candidateArea = candidate.frame.width * candidate.frame.height
+        return candidateArea > existingArea
+    }
+
+    private func isPreviewAppEnabled(bundleId: String) -> Bool {
+        !appConfig.previewDisabledBundleIds.contains(bundleId)
+    }
+
+    private func previewAppToggleItems(from windows: [WindowInfo]) -> [PreviewAppToggleItem] {
+        let grouped = Dictionary(grouping: windows, by: \.bundleId)
+        return grouped
+            .map { bundleId, appWindows in
+                let appName = appWindows
+                    .map(\.appName)
+                    .first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) ?? bundleId
+                return PreviewAppToggleItem(
+                    bundleId: bundleId,
+                    appName: appName,
+                    icon: iconForBundleId(bundleId),
+                    windowCount: appWindows.count,
+                    enabled: isPreviewAppEnabled(bundleId: bundleId)
+                )
+            }
+            .sorted {
+                if $0.enabled != $1.enabled {
+                    return $0.enabled && !$1.enabled
+                }
+                if $0.appName != $1.appName {
+                    return $0.appName.localizedCaseInsensitiveCompare($1.appName) == .orderedAscending
+                }
+                return $0.bundleId < $1.bundleId
+            }
+    }
+
+    @objc
+    private func togglePreviewAppEnabled(_ sender: PreviewAppToggleButton) {
+        let bundleId = sender.bundleId
+        guard !bundleId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+
+        let enabledAfterToggle: Bool
+        if appConfig.previewDisabledBundleIds.contains(bundleId) {
+            appConfig.previewDisabledBundleIds.remove(bundleId)
+            enabledAfterToggle = true
+        } else {
+            appConfig.previewDisabledBundleIds.insert(bundleId)
+            enabledAfterToggle = false
+        }
+
+        do {
+            try appConfig.save()
+            windowSwitcherCachedResults.removeAll()
+            windowSwitcherAllResults.removeAll()
+            windowSwitcherVisibleResults.removeAll()
+            dockPreviewCachedWindows.removeAll()
+            dockPreviewLastWindowScan = .distantPast
+            if dockPreviewCurrentBundleId == bundleId {
+                hideDockPreviewPanel()
+            }
+            switchSection(.previews, animated: false)
+            setStatus("已\(enabledAfterToggle ? "开启" : "关闭") \(sender.appName) 的预览显示", error: false)
+        } catch {
+            setStatus("保存预览 App 开关失败：\(error.localizedDescription)", error: true)
+        }
+    }
+
     private func iconForBundleId(_ bundleId: String) -> NSImage? {
+        if let cached = windowSwitcherIconCache[bundleId] {
+            return cached
+        }
         guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) else {
             return nil
         }
         let icon = NSWorkspace.shared.icon(forFile: appURL.path)
         icon.size = NSSize(width: 34, height: 34)
+        windowSwitcherIconCache[bundleId] = icon
         return icon
     }
 
     private func applyWindowSwitcherFilter() {
         let query = windowSwitcherSearchField?.stringValue ?? ""
-        windowSwitcherVisibleResults = windowSwitcherAllResults.filter { $0.matches(query) }
+        let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalized.isEmpty {
+            windowSwitcherVisibleResults = windowSwitcherAllResults
+        } else {
+            windowSwitcherVisibleResults = windowSwitcherAllResults
+                .compactMap { result -> (WindowSwitcherResult, Int)? in
+                    let score = result.matchScore(for: normalized)
+                    guard score > 0 else { return nil }
+                    return (result, score)
+                }
+                .sorted { lhs, rhs in
+                    if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
+                    if lhs.0.appTitle != rhs.0.appTitle {
+                        return lhs.0.appTitle.localizedCaseInsensitiveCompare(rhs.0.appTitle) == .orderedAscending
+                    }
+                    return lhs.0.windowTitle.localizedCaseInsensitiveCompare(rhs.0.windowTitle) == .orderedAscending
+                }
+                .map(\.0)
+        }
         if windowSwitcherSelectedIndex >= windowSwitcherVisibleResults.count {
             windowSwitcherSelectedIndex = max(0, windowSwitcherVisibleResults.count - 1)
         }
@@ -3877,16 +4205,18 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         let virtualCount = logicalCount * repetition
         let centerBlockIndex = repetition / 2
         windowSwitcherVirtualSelectedIndex = centerBlockIndex * logicalCount + windowSwitcherSelectedIndex
+        let activeQuery = windowSwitcherSearchField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
         for virtualIndex in 0..<virtualCount {
             let result = windowSwitcherVisibleResults[virtualIndex % logicalCount]
             let row = WindowSwitcherResultRowView(result: result)
+            row.searchQuery = activeQuery
             row.isSelected = virtualIndex == windowSwitcherVirtualSelectedIndex
             row.onSelect = { [weak self] in
                 guard let self else { return }
                 self.windowSwitcherVirtualSelectedIndex = virtualIndex
                 self.windowSwitcherSelectedIndex = virtualIndex % logicalCount
-                self.updateWindowSwitcherRollerAppearance(animated: false)
+                self.updateWindowSwitcherRollerAppearance(animated: true)
                 self.focusSelectedWindowSwitcherResult()
             }
             windowSwitcherResultRows.append(row)
@@ -3902,7 +4232,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         windowSwitcherSelectedIndex = (windowSwitcherSelectedIndex + delta + logicalCount) % logicalCount
         windowSwitcherVirtualSelectedIndex += delta
         normalizeWindowSwitcherVirtualSelection()
-        updateWindowSwitcherRollerAppearance(animated: false)
+        updateWindowSwitcherRollerAppearance(animated: true)
     }
 
     private func updateWindowSwitcherRollerAppearance(animated: Bool) {
@@ -3915,7 +4245,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             row.isSelected = index == windowSwitcherVirtualSelectedIndex
             row.rollDistance = distance
             row.alphaValue = max(0.14, 1.0 - CGFloat(distance) * 0.14)
-            row.applyRollerTransform(signedDistance: signedDistance)
+            row.applyRollerTransform(signedDistance: signedDistance, animated: animated)
         }
 
         centerSelectedWindowSwitcherRow(animated: animated)
@@ -3941,7 +4271,8 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
 
         if animated {
             NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.12
+                context.duration = 0.055
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
                 scrollView.contentView.animator().setBoundsOrigin(targetOrigin)
             }
         } else {
@@ -3990,7 +4321,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             return
         }
         let result = windowSwitcherVisibleResults[windowSwitcherSelectedIndex]
-        windowSwitcherPanel?.orderOut(nil)
+        dismissWindowSwitcher()
         focusPreviewWindow(result.window)
     }
 
@@ -4250,6 +4581,71 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         noteLabel.alignment = .left
         noteLabel.setContentHuggingPriority(.required, for: .horizontal)
         row.addArrangedSubview(noteLabel)
+
+        return row
+    }
+
+    private func makePreviewAppToggleRow(_ item: PreviewAppToggleItem) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.spacing = 12
+        row.alignment = .centerY
+        applyFullWidthAlignment(to: row)
+        row.alphaValue = item.enabled ? 1.0 : 0.62
+
+        let iconView = NSImageView()
+        iconView.image = item.icon
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        iconView.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        iconView.heightAnchor.constraint(equalToConstant: 24).isActive = true
+
+        let labels = NSStackView()
+        labels.orientation = .vertical
+        labels.spacing = 2
+        labels.alignment = .leading
+        labels.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let titleLabel = NSTextField(labelWithString: item.appName)
+        titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        titleLabel.textColor = item.enabled ? .labelColor : .tertiaryLabelColor
+        titleLabel.alignment = .left
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.toolTip = item.bundleId
+        labels.addArrangedSubview(titleLabel)
+
+        let bundleLabel = NSTextField(labelWithString: item.bundleId)
+        bundleLabel.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+        bundleLabel.textColor = .tertiaryLabelColor
+        bundleLabel.alignment = .left
+        bundleLabel.lineBreakMode = .byTruncatingMiddle
+        labels.addArrangedSubview(bundleLabel)
+
+        row.addArrangedSubview(iconView)
+        row.addArrangedSubview(labels)
+
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(spacer)
+
+        let noteLabel = NSTextField(labelWithString: "窗口 \(item.windowCount)")
+        noteLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        noteLabel.textColor = item.enabled ? .secondaryLabelColor : .tertiaryLabelColor
+        noteLabel.alignment = .left
+        noteLabel.setContentHuggingPriority(.required, for: .horizontal)
+        row.addArrangedSubview(noteLabel)
+
+        let toggleButton = PreviewAppToggleButton(
+            bundleId: item.bundleId,
+            appName: item.appName,
+            title: item.enabled ? "关闭" : "开启",
+            target: self,
+            action: #selector(togglePreviewAppEnabled(_:))
+        )
+        toggleButton.controlSize = .small
+        toggleButton.bezelStyle = .rounded
+        row.addArrangedSubview(toggleButton)
 
         return row
     }
@@ -4703,25 +5099,36 @@ private final class WindowPreviewCardView: NSView {
 
 @MainActor
 private final class DockWindowPreviewCardView: NSView {
-    static let cardHeight: CGFloat = 142
-    private static let minCardWidth: CGFloat = 160
-    private static let maxCardWidth: CGFloat = 260
+    static let cardHeight: CGFloat = 154
+    private static let minCardWidth: CGFloat = 170
+    private static let maxCardWidth: CGFloat = 280
 
     let snapshot: WindowPreviewSnapshot
     var onFocus: ((WindowInfo) -> Void)?
     private var isHovered = false
     private let cardWidth: CGFloat
+    private let appIcon: NSImage?
 
     init(snapshot: WindowPreviewSnapshot) {
         self.snapshot = snapshot
         let imageSize = snapshot.image?.size ?? snapshot.window.frame.cgRect.size
         let imageRatio = imageSize.height > 0 ? imageSize.width / imageSize.height : 16 / 10
-        self.cardWidth = Swift.min(Self.maxCardWidth, Swift.max(Self.minCardWidth, imageRatio * 96 + 20))
+        self.cardWidth = Swift.min(Self.maxCardWidth, Swift.max(Self.minCardWidth, imageRatio * 100 + 24))
+        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: snapshot.window.bundleId) {
+            self.appIcon = NSWorkspace.shared.icon(forFile: appURL.path)
+        } else {
+            self.appIcon = nil
+        }
         super.init(frame: NSRect(x: 0, y: 0, width: cardWidth, height: Self.cardHeight))
         translatesAutoresizingMaskIntoConstraints = false
         widthAnchor.constraint(equalToConstant: cardWidth).isActive = true
         heightAnchor.constraint(equalToConstant: Self.cardHeight).isActive = true
         wantsLayer = true
+        layer?.masksToBounds = false
+        layer?.shadowColor = NSColor.black.cgColor
+        layer?.shadowOffset = NSSize(width: 0, height: -2)
+        layer?.shadowRadius = 7
+        layer?.shadowOpacity = 0.14
         toolTip = snapshot.window.title.isEmpty
             ? snapshot.window.appName
             : "\(snapshot.window.title) - \(snapshot.window.appName)"
@@ -4745,11 +5152,13 @@ private final class DockWindowPreviewCardView: NSView {
 
     override func mouseEntered(with event: NSEvent) {
         isHovered = true
+        updateHoverAnimation()
         needsDisplay = true
     }
 
     override func mouseExited(with event: NSEvent) {
         isHovered = false
+        updateHoverAnimation()
         needsDisplay = true
     }
 
@@ -4761,16 +5170,16 @@ private final class DockWindowPreviewCardView: NSView {
         super.draw(dirtyRect)
 
         let card = bounds.insetBy(dx: 1, dy: 1)
-        let path = NSBezierPath(roundedRect: card, xRadius: 10, yRadius: 10)
-        (isHovered ? NSColor.controlAccentColor.withAlphaComponent(0.16) : NSColor.labelColor.withAlphaComponent(0.08)).setFill()
+        let path = NSBezierPath(roundedRect: card, xRadius: 12, yRadius: 12)
+        (isHovered ? NSColor.controlAccentColor.withAlphaComponent(0.13) : NSColor.labelColor.withAlphaComponent(0.06)).setFill()
         path.fill()
-        (isHovered ? NSColor.controlAccentColor.withAlphaComponent(0.50) : NSColor.separatorColor.withAlphaComponent(0.32)).setStroke()
+        (isHovered ? NSColor.controlAccentColor.withAlphaComponent(0.48) : NSColor.separatorColor.withAlphaComponent(0.28)).setStroke()
         path.lineWidth = isHovered ? 1.4 : 1
         path.stroke()
 
-        let imageRect = NSRect(x: 10, y: 34, width: bounds.width - 20, height: 96)
-        let imagePath = NSBezierPath(roundedRect: imageRect, xRadius: 7, yRadius: 7)
-        NSColor.black.withAlphaComponent(0.14).setFill()
+        let imageRect = NSRect(x: 11, y: 40, width: bounds.width - 22, height: 100)
+        let imagePath = NSBezierPath(roundedRect: imageRect, xRadius: 8, yRadius: 8)
+        NSColor.black.withAlphaComponent(0.10).setFill()
         imagePath.fill()
 
         if let image = snapshot.image {
@@ -4786,21 +5195,28 @@ private final class DockWindowPreviewCardView: NSView {
             )
         }
 
+        let badgeRect = NSRect(x: 16, y: bounds.height - 30, width: 22, height: 22)
+        NSColor.white.withAlphaComponent(0.20).setFill()
+        NSBezierPath(roundedRect: badgeRect, xRadius: 7, yRadius: 7).fill()
+        if let appIcon {
+            appIcon.draw(in: badgeRect.insetBy(dx: 2, dy: 2))
+        }
+
         let title = snapshot.window.title.trimmingCharacters(in: .whitespacesAndNewlines)
         let displayTitle = title.isEmpty ? snapshot.window.appName : title
         displayTitle.draw(
-            in: NSRect(x: 12, y: 17, width: bounds.width - 24, height: 14),
+            in: NSRect(x: 12, y: 21, width: bounds.width - 24, height: 16),
             withAttributes: [
-                .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
                 .foregroundColor: NSColor.labelColor,
                 .paragraphStyle: truncatingParagraph()
             ]
         )
 
-        snapshot.window.appName.draw(
-            in: NSRect(x: 12, y: 5, width: bounds.width - 24, height: 12),
+        "\(snapshot.window.appName) · #\(snapshot.window.windowNumber)".draw(
+            in: NSRect(x: 12, y: 7, width: bounds.width - 24, height: 13),
             withAttributes: [
-                .font: NSFont.systemFont(ofSize: 9, weight: .medium),
+                .font: NSFont.systemFont(ofSize: 10, weight: .medium),
                 .foregroundColor: NSColor.secondaryLabelColor,
                 .paragraphStyle: truncatingParagraph()
             ]
@@ -4819,6 +5235,23 @@ private final class DockWindowPreviewCardView: NSView {
         paragraph.alignment = .left
         paragraph.lineBreakMode = .byTruncatingTail
         return paragraph
+    }
+
+    private func updateHoverAnimation() {
+        guard let layer else { return }
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.14)
+        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeInEaseOut))
+        if isHovered {
+            layer.transform = CATransform3DMakeScale(1.016, 1.016, 1)
+            layer.shadowOpacity = 0.24
+            layer.shadowRadius = 12
+        } else {
+            layer.transform = CATransform3DIdentity
+            layer.shadowOpacity = 0.14
+            layer.shadowRadius = 7
+        }
+        CATransaction.commit()
     }
 }
 
@@ -6267,6 +6700,25 @@ private final class RoutingRuleRemoveButton: NSButton {
     var ruleId: UUID?
 }
 
+private final class PreviewAppToggleButton: NSButton {
+    let bundleId: String
+    let appName: String
+
+    init(bundleId: String, appName: String, title: String, target: AnyObject?, action: Selector?) {
+        self.bundleId = bundleId
+        self.appName = appName
+        super.init(frame: .zero)
+        self.title = title
+        self.target = target
+        self.action = action
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+}
+
 private extension Array {
     subscript(safe index: Int) -> Element? {
         guard indices.contains(index) else { return nil }
@@ -6985,7 +7437,7 @@ private final class WindowSwitcherRollerScrollView: NSScrollView {
     private var lastStepTimestamp: TimeInterval = 0
     private let preciseStepThreshold: CGFloat = 14
     private let coarseStepThreshold: CGFloat = 0.9
-    private let minStepInterval: TimeInterval = 0.06
+    private let minStepInterval: TimeInterval = 0.035
 
     override func scrollWheel(with event: NSEvent) {
         guard let onStepSelection else {
@@ -7024,6 +7476,9 @@ private final class WindowSwitcherRollerScrollView: NSScrollView {
 @MainActor
 private final class WindowSwitcherResultRowView: NSView {
     let result: WindowSwitcherResult
+    var searchQuery: String = "" {
+        didSet { needsDisplay = true }
+    }
     var onSelect: (() -> Void)?
     var isSelected = false {
         didSet { needsDisplay = true }
@@ -7069,7 +7524,7 @@ private final class WindowSwitcherResultRowView: NSView {
         true
     }
 
-    func applyRollerTransform(signedDistance: Int) {
+    func applyRollerTransform(signedDistance: Int, animated: Bool) {
         let clamped = CGFloat(max(-6, min(6, signedDistance)))
         let distance = abs(clamped)
         let scale = max(0.82, 1.0 - distance * 0.045)
@@ -7081,8 +7536,17 @@ private final class WindowSwitcherResultRowView: NSView {
         transform = CATransform3DTranslate(transform, 0, yShift, 0)
         transform = CATransform3DRotate(transform, tilt, 1, 0, 0)
         transform = CATransform3DScale(transform, scale, scale, 1)
-        layer?.transform = transform
-        layer?.zPosition = isSelected ? 10 : -distance
+        if animated {
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(0.05)
+            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
+            layer?.transform = transform
+            layer?.zPosition = isSelected ? 10 : -distance
+            CATransaction.commit()
+        } else {
+            layer?.transform = transform
+            layer?.zPosition = isSelected ? 10 : -distance
+        }
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -7127,33 +7591,42 @@ private final class WindowSwitcherResultRowView: NSView {
         }
 
         let appRect = NSRect(x: 72, y: 48, width: bounds.width - 190, height: 15)
-        result.appTitle.draw(
+        drawHighlightedText(
+            result.appTitle,
             in: appRect,
-            withAttributes: [
+            baseAttributes: [
                 .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
                 .foregroundColor: NSColor.secondaryLabelColor,
                 .paragraphStyle: truncatingParagraph()
-            ]
+            ],
+            highlightColor: NSColor.controlAccentColor,
+            query: searchQuery
         )
 
         let titleRect = NSRect(x: 72, y: 27, width: bounds.width - 190, height: 18)
-        result.windowTitle.draw(
+        drawHighlightedText(
+            result.windowTitle,
             in: titleRect,
-            withAttributes: [
+            baseAttributes: [
                 .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
                 .foregroundColor: NSColor.labelColor,
                 .paragraphStyle: truncatingParagraph()
-            ]
+            ],
+            highlightColor: isSelected ? NSColor.controlAccentColor : NSColor.systemBlue,
+            query: searchQuery
         )
 
         let detailRect = NSRect(x: 72, y: 10, width: bounds.width - 190, height: 14)
-        result.detailText.draw(
+        drawHighlightedText(
+            result.detailText,
             in: detailRect,
-            withAttributes: [
+            baseAttributes: [
                 .font: NSFont.systemFont(ofSize: 10, weight: .medium),
                 .foregroundColor: NSColor.secondaryLabelColor,
                 .paragraphStyle: truncatingParagraph()
-            ]
+            ],
+            highlightColor: NSColor.controlAccentColor,
+            query: searchQuery
         )
 
         let tag = result.browserURL == nil ? "Window" : "Active Tab"
@@ -7186,6 +7659,30 @@ private final class WindowSwitcherResultRowView: NSView {
         paragraph.alignment = .center
         paragraph.lineBreakMode = .byTruncatingTail
         return paragraph
+    }
+
+    private func drawHighlightedText(
+        _ text: String,
+        in rect: NSRect,
+        baseAttributes: [NSAttributedString.Key: Any],
+        highlightColor: NSColor,
+        query: String
+    ) {
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedQuery.isEmpty else {
+            text.draw(in: rect, withAttributes: baseAttributes)
+            return
+        }
+
+        let attributed = NSMutableAttributedString(string: text, attributes: baseAttributes)
+        if let range = text.range(of: normalizedQuery, options: [.caseInsensitive, .diacriticInsensitive]) {
+            let nsRange = NSRange(range, in: text)
+            attributed.addAttribute(.foregroundColor, value: highlightColor, range: nsRange)
+            if let baseFont = baseAttributes[.font] as? NSFont {
+                attributed.addAttribute(.font, value: NSFont.systemFont(ofSize: baseFont.pointSize, weight: .bold), range: nsRange)
+            }
+        }
+        attributed.draw(in: rect)
     }
 }
 

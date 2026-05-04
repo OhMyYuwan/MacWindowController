@@ -42,6 +42,34 @@ cd tools/window-manager
 swift test
 ```
 
+## 打包发布
+
+`scripts/release-macos.sh` 采用和 TimeDiary 一致的打包策略：
+- 直接使用现成的 `dist/WinCtlManager.app`
+- 在临时目录放入 `WinCtlManager.app` + `Applications` 链接
+- 用 `hdiutil` 生成 DMG（不重建 app bundle）
+- 默认会对 app 做一次 ad-hoc 签名（`codesign -s -`），避免旧签名残留导致“App 已损坏”
+
+执行：
+
+```bash
+cd /Volumes/DevLayer/WinCtlManager
+scripts/release-macos.sh 0.0.2
+```
+
+可选：
+
+```bash
+# 打 tag
+scripts/release-macos.sh v0.0.2 --tag
+
+# 指定 app 来源
+APP_SOURCE=/absolute/path/WinCtlManager.app scripts/release-macos.sh 0.0.2
+
+# 可选签名
+CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" scripts/release-macos.sh 0.0.2
+```
+
 ## 打开 Workbench
 
 ```bash
