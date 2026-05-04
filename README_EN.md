@@ -42,6 +42,34 @@ cd tools/window-manager
 swift test
 ```
 
+## Packaging Release
+
+`scripts/release-macos.sh` now follows the same packaging pattern as TimeDiary:
+- Reuse existing `dist/WinCtlManager.app`
+- Build DMG from a temp folder containing `WinCtlManager.app` + `Applications` symlink
+- Do not rebuild the app bundle during packaging
+- Apply ad-hoc signing (`codesign -s -`) by default to prevent stale-signature “App is damaged” issues
+
+Run:
+
+```bash
+cd /Volumes/DevLayer/WinCtlManager
+scripts/release-macos.sh 0.0.2
+```
+
+Optional:
+
+```bash
+# Create git tag
+scripts/release-macos.sh v0.0.2 --tag
+
+# Use a custom app source
+APP_SOURCE=/absolute/path/WinCtlManager.app scripts/release-macos.sh 0.0.2
+
+# Optional signing
+CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" scripts/release-macos.sh 0.0.2
+```
+
 ## Open Workbench
 
 ```bash

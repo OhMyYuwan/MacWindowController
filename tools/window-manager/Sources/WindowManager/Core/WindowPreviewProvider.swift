@@ -17,7 +17,9 @@ final class WindowPreviewProvider {
     }
 
     private var previewCache: [Int: CachedPreview] = [:]
-    private let previewCacheTTL: TimeInterval = 1.5
+    private let previewCacheLock = NSLock()
+    private let previewCacheTTL: TimeInterval = 4.0
+    private let previewStaleTTL: TimeInterval = 20.0
 
     func hasScreenRecordingPermission() -> Bool {
         CGPreflightScreenCaptureAccess()
@@ -30,13 +32,12 @@ final class WindowPreviewProvider {
 
     func snapshot(for window: WindowInfo) -> WindowPreviewSnapshot {
         let now = Date()
-        if let cached = previewCache[window.windowNumber], now.timeIntervalSince(cached.capturedAt) < previewCacheTTL {
+        if let cached = cachedPreview(for: window.windowNumber, at: now) {
             return WindowPreviewSnapshot(window: window, image: cached.image)
         }
 
         let image = previewImage(for: window)
-        previewCache[window.windowNumber] = CachedPreview(image: image, capturedAt: now)
-        trimPreviewCache(keeping: [window.windowNumber])
+        updateCachedPreview(windowNumber: window.windowNumber, image: image, at: now, keeping: [window.windowNumber])
         return WindowPreviewSnapshot(window: window, image: image)
     }
 
@@ -50,10 +51,87 @@ final class WindowPreviewProvider {
             .map(snapshot(for:))
     }
 
+    /// Cache-first snapshots: never blocks on image capture.
+    func cachedSnapshots(for windows: [WindowInfo]) -> [WindowPreviewSnapshot] {
+        let now = Date()
+        return windows
+            .filter { $0.isControllable && $0.windowNumber >= 0 }
+            .map { window in
+                let cachedImage = cachedPreview(for: window.windowNumber, at: now)?.image
+                    ?? staleCachedPreview(for: window.windowNumber, at: now)?.image
+                return WindowPreviewSnapshot(window: window, image: cachedImage)
+            }
+    }
+
+    /// Performs capture for uncached windows and refreshes cache; intended for background execution.
+    func hydratedSnapshots(for windows: [WindowInfo]) -> [WindowPreviewSnapshot] {
+        let targets = windows.filter { $0.isControllable && $0.windowNumber >= 0 }
+        guard !targets.isEmpty else { return [] }
+
+        final class SnapshotStore: @unchecked Sendable {
+            private let lock = NSLock()
+            private var storage: [Int: WindowPreviewSnapshot] = [:]
+
+            func set(_ snapshot: WindowPreviewSnapshot, at index: Int) {
+                lock.lock()
+                storage[index] = snapshot
+                lock.unlock()
+            }
+
+            func snapshot(at index: Int) -> WindowPreviewSnapshot? {
+                lock.lock()
+                let value = storage[index]
+                lock.unlock()
+                return value
+            }
+        }
+
+        // Capture in parallel to reduce first-render latency for multi-window apps.
+        let store = SnapshotStore()
+        let group = DispatchGroup()
+
+        for (index, window) in targets.enumerated() {
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                defer { group.leave() }
+                guard let self else { return }
+                let snapshot = self.snapshot(for: window)
+                store.set(snapshot, at: index)
+            }
+        }
+        group.wait()
+        return (0..<targets.count).compactMap { store.snapshot(at: $0) }
+    }
+
     private func trimPreviewCache(keeping currentWindowNumbers: [Int]) {
         guard previewCache.count > 40 else { return }
         let keep = Set(currentWindowNumbers)
         previewCache = previewCache.filter { keep.contains($0.key) || Date().timeIntervalSince($0.value.capturedAt) < previewCacheTTL }
+    }
+
+    private func cachedPreview(for windowNumber: Int, at now: Date) -> CachedPreview? {
+        previewCacheLock.lock()
+        defer { previewCacheLock.unlock() }
+        guard let cached = previewCache[windowNumber], now.timeIntervalSince(cached.capturedAt) < previewCacheTTL else {
+            return nil
+        }
+        return cached
+    }
+
+    private func staleCachedPreview(for windowNumber: Int, at now: Date) -> CachedPreview? {
+        previewCacheLock.lock()
+        defer { previewCacheLock.unlock() }
+        guard let cached = previewCache[windowNumber], now.timeIntervalSince(cached.capturedAt) < previewStaleTTL else {
+            return nil
+        }
+        return cached
+    }
+
+    private func updateCachedPreview(windowNumber: Int, image: NSImage?, at now: Date, keeping windowNumbers: [Int]) {
+        previewCacheLock.lock()
+        previewCache[windowNumber] = CachedPreview(image: image, capturedAt: now)
+        trimPreviewCache(keeping: windowNumbers)
+        previewCacheLock.unlock()
     }
 
     private func previewImage(for window: WindowInfo) -> NSImage? {
@@ -74,6 +152,8 @@ final class WindowPreviewProvider {
     }
 }
 
+extension WindowPreviewProvider: @unchecked Sendable {}
+
 enum DockPreviewEdge {
     case bottom
     case left
@@ -83,6 +163,7 @@ enum DockPreviewEdge {
 struct DockHoverMatch {
     let bundleId: String
     let appName: String
+    let pid: Int32?
     let itemFrame: CGRect
     let dockFrame: CGRect
     let edge: DockPreviewEdge
@@ -103,6 +184,9 @@ final class DockPreviewResolver {
     private struct DockItemRegion {
         let titles: [String]
         let frames: [CGRect]
+        let bundleId: String?
+        let appName: String?
+        let element: AXUIElement
     }
 
     private var cachedAXItems: [DockItemRegion] = []
@@ -113,6 +197,10 @@ final class DockPreviewResolver {
         let targets = appTargets(from: visibleWindows)
         guard !targets.isEmpty else { return nil }
 
+        if let selectedMatch = selectedDockItemMatch(at: screenPoint, targets: targets) {
+            return selectedMatch
+        }
+
         if let axMatch = accessibilityDockMatch(at: screenPoint, targets: targets) {
             return axMatch
         }
@@ -120,10 +208,64 @@ final class DockPreviewResolver {
         return nil
     }
 
+    private func selectedDockItemMatch(at screenPoint: CGPoint, targets: [AppTarget]) -> DockHoverMatch? {
+        guard let dockRegion = inferredDockRegion(containing: screenPoint),
+              let selected = selectedDockApplicationItem()
+        else {
+            return nil
+        }
+
+        guard let bundleId = selected.bundleId,
+              let target = targets.first(where: { $0.bundleId == bundleId })
+        else {
+            return nil
+        }
+
+        guard let frame = preferredFrame(
+            for: selected,
+            screenPoint: screenPoint,
+            dockRegion: dockRegion
+        ) else {
+            return nil
+        }
+
+        let pid = selectedProcessIdentifier(for: selected)
+        return DockHoverMatch(
+            bundleId: target.bundleId,
+            appName: target.appName,
+            pid: pid,
+            itemFrame: frame,
+            dockFrame: dockRegion.frame,
+            edge: edge(for: frame)
+        )
+    }
+
     private func accessibilityDockMatch(at screenPoint: CGPoint, targets: [AppTarget]) -> DockHoverMatch? {
         let items = dockAccessibilityItems()
         guard !items.isEmpty else { return nil }
         guard let dockRegion = inferredDockRegion(containing: screenPoint) else { return nil }
+        let targetByBundleId = Dictionary(uniqueKeysWithValues: targets.map { ($0.bundleId, $0) })
+
+        let directBundleHits = items.compactMap { item -> (target: AppTarget, frame: CGRect, frameScore: CGFloat)? in
+            guard let bundleId = item.bundleId,
+                  let target = targetByBundleId[bundleId],
+                  let frame = bestHitFrame(at: screenPoint, frames: item.frames, dockRegion: dockRegion)
+            else {
+                return nil
+            }
+            return (target, frame, frameScore(frame, screenPoint: screenPoint, dockRegion: dockRegion))
+        }
+
+        if let exactHit = directBundleHits.min(by: { $0.frameScore < $1.frameScore }) {
+            return DockHoverMatch(
+                bundleId: exactHit.target.bundleId,
+                appName: exactHit.target.appName,
+                pid: nil,
+                itemFrame: exactHit.frame,
+                dockFrame: dockRegion.frame,
+                edge: edge(for: exactHit.frame)
+            )
+        }
 
         let hits = items.compactMap { item -> (target: AppTarget, frame: CGRect, score: CGFloat)? in
             guard let target = target(matching: item.titles, in: targets) else { return nil }
@@ -139,6 +281,7 @@ final class DockPreviewResolver {
         return DockHoverMatch(
             bundleId: hit.target.bundleId,
             appName: hit.target.appName,
+            pid: nil,
             itemFrame: hit.frame,
             dockFrame: dockRegion.frame,
             edge: edge(for: hit.frame)
@@ -184,7 +327,13 @@ final class DockPreviewResolver {
            size.width > 8,
            size.height > 8
         {
-            items.append(DockItemRegion(titles: titles, frames: screenFrameCandidates(position: position, size: size)))
+            items.append(DockItemRegion(
+                titles: titles,
+                frames: screenFrameCandidates(position: position, size: size),
+                bundleId: bundleIdentifier(from: element),
+                appName: appName(from: element),
+                element: element
+            ))
         }
 
         guard let children = childrenAttribute(element) else { return }
@@ -276,6 +425,77 @@ final class DockPreviewResolver {
             return .right
         }
         return .bottom
+    }
+
+    private func selectedDockApplicationItem() -> DockItemRegion? {
+        guard let dockList = dockListElement(),
+              let selectedChildren = selectedChildrenAttribute(dockList)
+        else {
+            return nil
+        }
+
+        for child in selectedChildren {
+            if subrole(of: child) == "AXApplicationDockItem",
+               let item = makeDockItemRegion(from: child) {
+                return item
+            }
+        }
+        return nil
+    }
+
+    private func selectedProcessIdentifier(for selected: DockItemRegion) -> Int32? {
+        guard let bundleId = selected.bundleId else { return nil }
+        let runningApps = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
+        guard !runningApps.isEmpty else { return nil }
+        guard runningApps.count > 1 else { return runningApps.first?.processIdentifier }
+
+        let instanceIndex = dockItemInstanceIndex(for: selected.element, bundleId: bundleId)
+        if instanceIndex >= 0, instanceIndex < runningApps.count {
+            return runningApps[instanceIndex].processIdentifier
+        }
+        return runningApps.first?.processIdentifier
+    }
+
+    private func dockItemInstanceIndex(for selectedElement: AXUIElement, bundleId: String) -> Int {
+        guard let dockList = dockListElement(),
+              let children = childrenAttribute(dockList)
+        else {
+            return 0
+        }
+
+        var matchingItems: [AXUIElement] = []
+        for child in children {
+            guard subrole(of: child) == "AXApplicationDockItem",
+                  bundleIdentifier(from: child) == bundleId
+            else {
+                continue
+            }
+            matchingItems.append(child)
+        }
+
+        for (index, item) in matchingItems.enumerated() where CFEqual(item, selectedElement) {
+            return index
+        }
+        return 0
+    }
+
+    private func preferredFrame(for item: DockItemRegion, screenPoint: CGPoint, dockRegion: DockRegion) -> CGRect? {
+        if let exact = bestHitFrame(at: screenPoint, frames: item.frames, dockRegion: dockRegion) {
+            return exact
+        }
+
+        let validFrames = item.frames.filter { frame in
+            frame.width > 8
+                && frame.height > 8
+                && frame.width < 220
+                && frame.height < 220
+                && frame.intersects(dockRegion.frame.insetBy(dx: -14, dy: -14))
+        }
+        guard !validFrames.isEmpty else { return nil }
+        return validFrames.min { lhs, rhs in
+            frameScore(lhs, screenPoint: screenPoint, dockRegion: dockRegion)
+                < frameScore(rhs, screenPoint: screenPoint, dockRegion: dockRegion)
+        }
     }
 
     private func appTargets(from windows: [WindowInfo]) -> [AppTarget] {
@@ -393,6 +613,32 @@ final class DockPreviewResolver {
         return candidates
     }
 
+    private func makeDockItemRegion(from element: AXUIElement) -> DockItemRegion? {
+        guard let position = pointAttribute(element, attribute: kAXPositionAttribute as CFString),
+              let size = sizeAttribute(element, attribute: kAXSizeAttribute as CFString),
+              size.width > 8,
+              size.height > 8
+        else {
+            return nil
+        }
+        let titles = directStringCandidates(from: element)
+        return DockItemRegion(
+            titles: titles,
+            frames: screenFrameCandidates(position: position, size: size),
+            bundleId: bundleIdentifier(from: element),
+            appName: appName(from: element),
+            element: element
+        )
+    }
+
+    private func dockListElement() -> AXUIElement? {
+        guard let root = dockApplicationElement(),
+              let children = childrenAttribute(root) else {
+            return nil
+        }
+        return children.first(where: { role(of: $0) == kAXListRole as String })
+    }
+
     private func screenFrameCandidates(position: CGPoint, size: CGSize) -> [CGRect] {
         let rawFrame = CGRect(origin: position, size: size)
         var frames = [rawFrame]
@@ -428,11 +674,53 @@ final class DockPreviewResolver {
         return value as? String
     }
 
+    private func bundleIdentifier(from element: AXUIElement) -> String? {
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(element, kAXURLAttribute as CFString, &value)
+        guard result == .success else { return nil }
+        if let url = value as? URL {
+            return Bundle(url: url)?.bundleIdentifier
+        }
+        if let nsURL = value as? NSURL, let url = nsURL.absoluteURL {
+            return Bundle(url: url)?.bundleIdentifier
+        }
+        if let rawString = value as? String, let url = URL(string: rawString) {
+            return Bundle(url: url)?.bundleIdentifier
+        }
+        return nil
+    }
+
+    private func appName(from element: AXUIElement) -> String? {
+        guard let bundleId = bundleIdentifier(from: element),
+              let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId),
+              let bundle = Bundle(url: appURL)
+        else {
+            return nil
+        }
+        return bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
+            ?? bundle.object(forInfoDictionaryKey: "CFBundleName") as? String
+    }
+
     private func childrenAttribute(_ element: AXUIElement) -> [AXUIElement]? {
         var value: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &value)
         guard result == .success else { return nil }
         return value as? [AXUIElement]
+    }
+
+    private func selectedChildrenAttribute(_ element: AXUIElement) -> [AXUIElement]? {
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(element, kAXSelectedChildrenAttribute as CFString, &value)
+        guard result == .success else { return nil }
+        return value as? [AXUIElement]
+    }
+
+    private func role(of element: AXUIElement) -> String? {
+        stringAttribute(element, attribute: kAXRoleAttribute as CFString)
+    }
+
+    private func subrole(of element: AXUIElement) -> String? {
+        stringAttribute(element, attribute: kAXSubroleAttribute as CFString)
     }
 
     private func pointAttribute(_ element: AXUIElement, attribute: CFString) -> CGPoint? {
