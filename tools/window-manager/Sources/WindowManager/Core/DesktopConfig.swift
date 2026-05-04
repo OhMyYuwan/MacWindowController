@@ -66,6 +66,12 @@ struct DesktopConfig: Codable {
     /// Desktop stack tab bar Liquid Glass variant.
     var stackTabGlassStyle: StackTabGlassStyle = .softFrost
 
+    /// Show floating window previews when hovering over the macOS Dock.
+    var dockPreviewEnabled: Bool = true
+
+    /// Bundle identifiers explicitly disabled from preview/switcher surfaces.
+    var previewDisabledBundleIds: Set<String> = []
+
     /// User-recorded shortcuts keyed by Workbench shortcut action id.
     var shortcutBindings: [String: Shortcut] = [:]
 
@@ -83,6 +89,8 @@ struct DesktopConfig: Codable {
         case layoutHUDShortcut
         case workbenchAppearance
         case stackTabGlassStyle
+        case dockPreviewEnabled
+        case previewDisabledBundleIds
         case shortcutBindings
         case shortcutConflictOverrides
     }
@@ -95,6 +103,8 @@ struct DesktopConfig: Codable {
         layoutHUDShortcut = try values.decodeIfPresent(Shortcut.self, forKey: .layoutHUDShortcut) ?? .init()
         workbenchAppearance = try values.decodeIfPresent(WorkbenchAppearance.self, forKey: .workbenchAppearance) ?? .system
         stackTabGlassStyle = try values.decodeIfPresent(StackTabGlassStyle.self, forKey: .stackTabGlassStyle) ?? .softFrost
+        dockPreviewEnabled = try values.decodeIfPresent(Bool.self, forKey: .dockPreviewEnabled) ?? true
+        previewDisabledBundleIds = try values.decodeIfPresent(Set<String>.self, forKey: .previewDisabledBundleIds) ?? []
         shortcutBindings = try values.decodeIfPresent([String: Shortcut].self, forKey: .shortcutBindings) ?? [:]
         shortcutConflictOverrides = try values.decodeIfPresent([String: Bool].self, forKey: .shortcutConflictOverrides) ?? [:]
     }
@@ -107,6 +117,8 @@ struct DesktopConfig: Codable {
         try values.encode(layoutHUDShortcut, forKey: .layoutHUDShortcut)
         try values.encode(workbenchAppearance, forKey: .workbenchAppearance)
         try values.encode(stackTabGlassStyle, forKey: .stackTabGlassStyle)
+        try values.encode(dockPreviewEnabled, forKey: .dockPreviewEnabled)
+        try values.encode(previewDisabledBundleIds, forKey: .previewDisabledBundleIds)
         try values.encode(shortcutBindings, forKey: .shortcutBindings)
         try values.encode(shortcutConflictOverrides, forKey: .shortcutConflictOverrides)
     }

@@ -1,6 +1,7 @@
 import AppKit
 import Carbon
 import Foundation
+import ServiceManagement
 
 @MainActor
 enum DesktopMergeMode: Int, CaseIterable {
@@ -35,6 +36,7 @@ private enum WorkbenchSection: Int, CaseIterable {
     case stacks
     case quickDrop
     case unconstrained
+    case previews
     case liquidGlass
     case settings
 
@@ -44,6 +46,7 @@ private enum WorkbenchSection: Int, CaseIterable {
         case .stacks: return "堆叠"
         case .quickDrop: return "快捷键"
         case .unconstrained: return "临时窗口"
+        case .previews: return "预览"
         case .liquidGlass: return "液态玻璃"
         case .settings: return "设置"
         }
@@ -55,6 +58,7 @@ private enum WorkbenchSection: Int, CaseIterable {
         case .stacks: return "square.3.layers.3d.top.filled"
         case .quickDrop: return "keyboard.fill"
         case .unconstrained: return "sparkles.rectangle.stack.fill"
+        case .previews: return "rectangle.stack.fill"
         case .liquidGlass: return "circle.hexagongrid.fill"
         case .settings: return "gearshape.fill"
         }
@@ -63,6 +67,7 @@ private enum WorkbenchSection: Int, CaseIterable {
 
 private enum WorkbenchShortcutAction: String, CaseIterable {
     case layoutHUD
+    case windowSwitcher
     case quickDropLeftPrimary
     case quickDropRightPrimary
     case quickDropLeftSecondary
@@ -75,6 +80,7 @@ private enum WorkbenchShortcutAction: String, CaseIterable {
     var title: String {
         switch self {
         case .layoutHUD: return "布局九宫格 HUD"
+        case .windowSwitcher: return "窗口搜索 / Switcher"
         case .quickDropLeftPrimary: return "移到左侧主块"
         case .quickDropRightPrimary: return "移到右侧主块"
         case .quickDropLeftSecondary: return "移到左侧次块"
@@ -90,6 +96,8 @@ private enum WorkbenchShortcutAction: String, CaseIterable {
         switch self {
         case .layoutHUD:
             return "按住时显示九宫格，松开隐藏"
+        case .windowSwitcher:
+            return "打开全局窗口搜索，回车聚焦选中窗口"
         case .quickDropLeftPrimary, .quickDropRightPrimary:
             return "把当前聚焦窗口送入左右两侧最大候选块"
         case .quickDropLeftSecondary, .quickDropRightSecondary:
@@ -103,6 +111,8 @@ private enum WorkbenchShortcutAction: String, CaseIterable {
         switch self {
         case .layoutHUD:
             return .init(keyCode: 37, command: true, option: true, shift: false, control: false)
+        case .windowSwitcher:
+            return .init(keyCode: 49, command: true, option: true, shift: false, control: false)
         case .quickDropLeftPrimary:
             return .init(keyCode: 123, command: true, option: false, shift: false, control: true)
         case .quickDropRightPrimary:
@@ -154,6 +164,93 @@ private struct AppRoutingItem {
     let isRoutingLocked: Bool
 }
 
+private struct PreviewAppToggleItem {
+    let bundleId: String
+    let appName: String
+    let icon: NSImage?
+    let windowCount: Int
+    let enabled: Bool
+}
+
+private struct WindowSwitcherResult {
+    let window: WindowInfo
+    let browserURL: String?
+    let browserKind: String?
+    let icon: NSImage?
+
+    var primaryTitle: String {
+        let title = window.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return title.isEmpty ? window.appName : title
+    }
+
+    var windowTitle: String {
+        let title = window.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return title.isEmpty ? "Untitled Window" : title
+    }
+
+    var appTitle: String {
+        let app = window.appName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return app.isEmpty ? window.bundleId : app
+    }
+
+    var detailText: String {
+        var parts = ["\(appTitle) #\(window.windowNumber)"]
+        if let browserURL, !browserURL.isEmpty {
+            if let host = URL(string: browserURL)?.host {
+                parts.append(host)
+            } else {
+                parts.append(browserURL)
+            }
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    var searchableFields: [String] {
+        [
+            window.title,
+            window.appName,
+            window.bundleId,
+            String(window.windowNumber),
+            "#\(window.windowNumber)",
+            browserURL ?? "",
+            browserKind ?? ""
+        ]
+    }
+
+    func matches(_ query: String) -> Bool {
+        let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return true }
+        return searchableFields
+            .map { $0.lowercased() }
+            .contains { $0.contains(normalized) }
+    }
+
+    /// Higher score means more relevant.
+    func matchScore(for query: String) -> Int {
+        let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return 1 }
+
+        let title = window.title.lowercased()
+        let app = window.appName.lowercased()
+        let bundle = window.bundleId.lowercased()
+        let host = (browserURL.flatMap { URL(string: $0)?.host } ?? "").lowercased()
+        let number = String(window.windowNumber)
+
+        if title == normalized { return 1200 }
+        if title.hasPrefix(normalized) { return 980 }
+        if title.contains(normalized) { return 860 }
+        if app == normalized { return 780 }
+        if app.hasPrefix(normalized) { return 700 }
+        if app.contains(normalized) { return 620 }
+        if host == normalized { return 560 }
+        if host.contains(normalized) { return 520 }
+        if bundle.contains(normalized) { return 460 }
+        if number == normalized || "#\(number)" == normalized { return 420 }
+        if searchableFields.map({ $0.lowercased() }).contains(where: { $0.contains(normalized) }) { return 300 }
+        return 0
+    }
+}
+
 @MainActor
 enum DesktopWorkbenchLauncher {
     private static var runtimeHolder: DesktopWorkbenchRuntime?
@@ -175,7 +272,7 @@ enum DesktopWorkbenchLauncher {
         )
         runtimeHolder = runtime
 
-        app.setActivationPolicy(.regular)
+        app.setActivationPolicy(.accessory)
         app.delegate = runtime
         app.activate(ignoringOtherApps: true)
         app.run()
@@ -185,7 +282,7 @@ enum DesktopWorkbenchLauncher {
 }
 
 @MainActor
-private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NSWindowDelegate {
+private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSearchFieldDelegate {
     private let leftBucketName = "left"
     private struct ShortcutKeyOption {
         let title: String
@@ -199,6 +296,9 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     }
 
     private let windowController: WindowController
+    private let previewProvider = WindowPreviewProvider()
+    private let dockPreviewResolver = DockPreviewResolver()
+    private let browserRestorer = BrowserPageRestorer()
     private let stackManager: StackManager
     private let layoutCoordinator: DesktopLayoutCoordinator
     private let layoutStore: DesktopLayoutStore
@@ -274,6 +374,36 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     private var titleRuleListStackView: NSStackView?
     private var temporaryMatchListStackView: NSStackView?
     private var recordingShortcutAction: WorkbenchShortcutAction?
+    private var accessibilityPermissionStatusLabel: NSTextField?
+    private var screenRecordingPermissionStatusLabel: NSTextField?
+    private var dockPreviewStatusLabel: NSTextField?
+    private var dockPreviewMenuItem: NSMenuItem?
+    private var launchAtLoginStatusLabel: NSTextField?
+    private var statusItem: NSStatusItem?
+    private var dockPreviewPanel: NSPanel?
+    private var dockPreviewCurrentBundleId: String?
+    private var dockPreviewCurrentItemFrame: CGRect?
+    private var dockPreviewLastRefresh = Date.distantPast
+    private var dockPreviewRenderGeneration = 0
+    private var dockPreviewCachedWindows: [WindowInfo] = []
+    private var dockPreviewLastWindowScan = Date.distantPast
+    private var dockPreviewLastHoverCheck = Date.distantPast
+    private var dockPreviewHideWorkItem: DispatchWorkItem?
+    private var windowSwitcherPanel: NSPanel?
+    private var windowSwitcherSearchField: WindowSwitcherSearchField?
+    private var windowSwitcherScrollView: NSScrollView?
+    private var windowSwitcherResultsStackView: NSStackView?
+    private var windowSwitcherResultRows: [WindowSwitcherResultRowView] = []
+    private var windowSwitcherAllResults: [WindowSwitcherResult] = []
+    private var windowSwitcherVisibleResults: [WindowSwitcherResult] = []
+    private var windowSwitcherSelectedIndex = 0
+    private var windowSwitcherVirtualSelectedIndex = 0
+    private let windowSwitcherVirtualRepetition = 7
+    private var windowSwitcherLoadGeneration = 0
+    private var windowSwitcherRootView: WindowSwitcherRootView?
+    private var windowSwitcherCachedResults: [WindowSwitcherResult] = []
+    private var windowSwitcherIconCache: [String: NSImage] = [:]
+    private var isQuitting = false
 
     init(
         windowController: WindowController,
@@ -306,6 +436,8 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        installStatusItem()
+
         let window = NSWindow(
             contentRect: NSRect(x: 100, y: 80, width: 1320, height: 900),
             styleMask: [.titled, .resizable, .closable, .miniaturizable],
@@ -417,9 +549,23 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         if let focusedLayoutName {
             selectedLayoutName = focusedLayoutName
         }
+        refreshPermissionStatus()
+        refreshDockPreviewStatus()
     }
 
-    func windowWillClose(_ notification: Notification) {
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard isQuitting else {
+            hideAppPanel()
+            return false
+        }
+        return true
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        cleanupRuntimeResources()
+    }
+
+    private func cleanupRuntimeResources() {
         for monitor in keyboardMonitors {
             NSEvent.removeMonitor(monitor)
         }
@@ -430,11 +576,101 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         refreshTimer?.invalidate()
         mousePollingTimer?.invalidate()
         splitApplyWorkItem?.cancel()
+        dockPreviewHideWorkItem?.cancel()
         layoutOverlayPanel?.close()
         desktopPartitionPanel?.close()
         displayWakePanel?.close()
+        dockPreviewPanel?.close()
+        windowSwitcherPanel?.close()
         for panel in stackPanels.values { panel.close() }
         stackPanels.removeAll()
+        if let statusItem {
+            NSStatusBar.system.removeStatusItem(statusItem)
+        }
+        statusItem = nil
+    }
+
+    private func installStatusItem() {
+        let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        self.statusItem = statusItem
+
+        if let button = statusItem.button {
+            button.toolTip = "WinCtlManager"
+            if let image = NSImage(systemSymbolName: "rectangle.3.group", accessibilityDescription: "WinCtlManager") {
+                image.isTemplate = true
+                button.image = image
+            } else {
+                button.title = "WinCtl"
+            }
+        }
+
+        let menu = NSMenu(title: "WinCtlManager")
+        menu.autoenablesItems = false
+
+        let showItem = NSMenuItem(title: "显示 APP 面板", action: #selector(showAppPanel), keyEquivalent: "")
+        showItem.target = self
+        menu.addItem(showItem)
+
+        let switcherItem = NSMenuItem(title: "窗口搜索 / Switcher", action: #selector(showWindowSwitcher), keyEquivalent: "")
+        switcherItem.target = self
+        menu.addItem(switcherItem)
+
+        let hideItem = NSMenuItem(title: "隐藏 APP 面板", action: #selector(hideAppPanelFromMenu), keyEquivalent: "")
+        hideItem.target = self
+        menu.addItem(hideItem)
+
+        let dockPreviewItem = NSMenuItem(title: dockPreviewMenuTitle(), action: #selector(toggleDockPreviewFromMenu), keyEquivalent: "")
+        dockPreviewItem.target = self
+        dockPreviewMenuItem = dockPreviewItem
+        menu.addItem(dockPreviewItem)
+
+        menu.addItem(.separator())
+
+        let quitItem = NSMenuItem(title: "退出程序", action: #selector(quitApplication), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
+
+        statusItem.menu = menu
+    }
+
+    @objc
+    private func showAppPanel() {
+        guard let window else { return }
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        if desktopOverlayEditingEnabled {
+            desktopPartitionPanel?.orderFrontRegardless()
+        }
+        refreshWorkbench()
+    }
+
+    @objc
+    private func hideAppPanelFromMenu() {
+        hideAppPanel()
+    }
+
+    private func hideAppPanel() {
+        window?.orderOut(nil)
+        settingsWindow?.orderOut(nil)
+        layoutOverlayPanel?.orderOut(nil)
+        displayWakePanel?.orderOut(nil)
+        desktopPartitionPanel?.orderOut(nil)
+        setStatus("已隐藏 APP 面板，可从菜单栏重新打开", error: false)
+    }
+
+    private func dockPreviewMenuTitle() -> String {
+        appConfig.dockPreviewEnabled ? "关闭 Dock Preview" : "开启 Dock Preview"
+    }
+
+    @objc
+    private func toggleDockPreviewFromMenu() {
+        setDockPreviewEnabled(!appConfig.dockPreviewEnabled)
+    }
+
+    @objc
+    private func quitApplication() {
+        isQuitting = true
         NSApplication.shared.terminate(nil)
     }
 
@@ -501,6 +737,17 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             return nil
         }
 
+        let globalKeyDownMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return }
+            let flags = event.modifierFlags.intersection([.command, .option, .shift, .control])
+            guard let action = self.shortcutAction(matching: flags, keyCode: event.keyCode),
+                  action == .windowSwitcher
+            else {
+                return
+            }
+            self.performShortcutAction(action, event: event)
+        }
+
         let keyUpMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyUp) { [weak self] event in
             guard let self else { return event }
             if event.keyCode == self.shortcut(for: .layoutHUD).keyCode {
@@ -524,7 +771,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             self?.handleFlagsChanged(event.modifierFlags)
         }
 
-        keyboardMonitors = [keyDownMonitor, keyUpMonitor, flagsChangedMonitor, flagsChangedGlobalMonitor].compactMap { $0 }
+        keyboardMonitors = [keyDownMonitor, globalKeyDownMonitor, keyUpMonitor, flagsChangedMonitor, flagsChangedGlobalMonitor].compactMap { $0 }
     }
 
     private func handleFlagsChanged(_ modifierFlags: NSEvent.ModifierFlags) {
@@ -665,7 +912,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
 
     private func startMousePollingTimer() {
         mousePollingTimer?.invalidate()
-        mousePollingTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+        mousePollingTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.updatePanelEventMode()
             }
@@ -686,6 +933,272 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         if panel.ignoresMouseEvents == shouldReceiveEvents {
             panel.ignoresMouseEvents = !shouldReceiveEvents
         }
+
+        updateDockPreviewHover(at: screenPoint)
+    }
+
+    private func updateDockPreviewHover(at screenPoint: CGPoint) {
+        guard appConfig.dockPreviewEnabled else {
+            hideDockPreviewPanel()
+            return
+        }
+
+        let now = Date()
+        if now.timeIntervalSince(dockPreviewLastHoverCheck) < 0.08 {
+            return
+        }
+        dockPreviewLastHoverCheck = now
+
+        if isPointInsideDockPreviewPanel(screenPoint) {
+            dockPreviewHideWorkItem?.cancel()
+            return
+        }
+
+        let windows = dockPreviewVisibleWindows()
+        guard let match = dockPreviewResolver.matchHover(at: screenPoint, windows: windows) else {
+            scheduleDockPreviewHide()
+            return
+        }
+        dockPreviewHideWorkItem?.cancel()
+        dockPreviewCurrentItemFrame = match.itemFrame
+
+        let matchingWindows = windows
+            .filter { window in
+                guard window.bundleId == match.bundleId else { return false }
+                if let pid = match.pid {
+                    return window.pid == pid
+                }
+                return true
+            }
+            .reduce(into: [Int: WindowInfo]()) { partial, window in
+                if let existing = partial[window.windowNumber] {
+                    let existingHasTitle = !existing.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    let currentHasTitle = !window.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    if !existingHasTitle && currentHasTitle {
+                        partial[window.windowNumber] = window
+                    }
+                } else {
+                    partial[window.windowNumber] = window
+                }
+            }
+            .map(\.value)
+            .sorted { lhs, rhs in
+                let leftTitle = lhs.title.isEmpty ? lhs.appName : lhs.title
+                let rightTitle = rhs.title.isEmpty ? rhs.appName : rhs.title
+                if leftTitle == rightTitle {
+                    return lhs.windowNumber < rhs.windowNumber
+                }
+                return leftTitle.localizedCaseInsensitiveCompare(rightTitle) == .orderedAscending
+            }
+
+        guard !matchingWindows.isEmpty else {
+            scheduleDockPreviewHide()
+            return
+        }
+
+        let shouldRebuild = dockPreviewCurrentBundleId != match.bundleId
+            || Date().timeIntervalSince(dockPreviewLastRefresh) > 2.0
+        if shouldRebuild {
+            showDockPreviewPanel(for: match, windows: matchingWindows)
+        } else {
+            positionDockPreviewPanel(for: match)
+        }
+    }
+
+    private func dockPreviewVisibleWindows() -> [WindowInfo] {
+        let now = Date()
+        if now.timeIntervalSince(dockPreviewLastWindowScan) < 0.20 {
+            return dockPreviewCachedWindows
+        }
+        dockPreviewLastWindowScan = now
+        dockPreviewCachedWindows = windowController
+            .listWindows(onScreenOnly: true)
+            .filter(\.isControllable)
+            .filter { isPreviewAppEnabled(bundleId: $0.bundleId) }
+        return dockPreviewCachedWindows
+    }
+
+    private func showDockPreviewPanel(for match: DockHoverMatch, windows: [WindowInfo]) {
+        dockPreviewHideWorkItem?.cancel()
+        dockPreviewCurrentBundleId = match.bundleId
+        dockPreviewLastRefresh = Date()
+        dockPreviewRenderGeneration += 1
+        let renderGeneration = dockPreviewRenderGeneration
+        let previewWindows = Array(windows.prefix(6))
+
+        let snapshots = previewProvider.cachedSnapshots(for: previewWindows)
+        guard !snapshots.isEmpty else {
+            hideDockPreviewPanel()
+            return
+        }
+
+        let panel = dockPreviewPanel ?? makeDockPreviewPanel()
+        let content = makeDockPreviewContent(match: match, snapshots: snapshots, totalWindowCount: windows.count)
+        panel.contentView = content
+        panel.setContentSize(content.fittingSize)
+        dockPreviewPanel = panel
+        positionDockPreviewPanel(for: match)
+        panel.orderFrontRegardless()
+
+        let previewProvider = self.previewProvider
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let hydrated = previewProvider.hydratedSnapshots(for: previewWindows)
+            guard hydrated.contains(where: \.hasImage) else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                guard self.dockPreviewRenderGeneration == renderGeneration,
+                      self.dockPreviewCurrentBundleId == match.bundleId,
+                      let panel = self.dockPreviewPanel,
+                      panel.isVisible
+                else {
+                    return
+                }
+                let refreshed = self.makeDockPreviewContent(match: match, snapshots: hydrated, totalWindowCount: windows.count)
+                panel.contentView = refreshed
+                panel.setContentSize(refreshed.fittingSize)
+                self.positionDockPreviewPanel(for: match)
+            }
+        }
+    }
+
+    private func makeDockPreviewPanel() -> NSPanel {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 210),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.level = .statusBar
+        panel.isFloatingPanel = true
+        panel.hidesOnDeactivate = false
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        return panel
+    }
+
+    private func makeDockPreviewContent(match: DockHoverMatch, snapshots: [WindowPreviewSnapshot], totalWindowCount: Int) -> NSView {
+        let effect = NSVisualEffectView()
+        effect.material = .hudWindow
+        effect.blendingMode = .behindWindow
+        effect.state = .active
+        effect.wantsLayer = true
+        effect.layer?.cornerRadius = 16
+        effect.layer?.masksToBounds = true
+        effect.translatesAutoresizingMaskIntoConstraints = false
+
+        let root = NSStackView()
+        root.orientation = .vertical
+        root.spacing = 10
+        root.edgeInsets = NSEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
+        root.translatesAutoresizingMaskIntoConstraints = false
+        effect.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
+            root.topAnchor.constraint(equalTo: effect.topAnchor),
+            root.bottomAnchor.constraint(equalTo: effect.bottomAnchor)
+        ])
+
+        let title = NSTextField(labelWithString: totalWindowCount > snapshots.count ? "\(match.appName) · \(totalWindowCount) 个窗口" : match.appName)
+        title.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        title.textColor = .labelColor
+        title.lineBreakMode = .byTruncatingTail
+        root.addArrangedSubview(title)
+
+        let cards = NSStackView()
+        cards.orientation = .horizontal
+        cards.spacing = 10
+        cards.alignment = .centerY
+        for snapshot in snapshots {
+            let card = DockWindowPreviewCardView(snapshot: snapshot)
+            card.onFocus = { [weak self] window in
+                self?.hideDockPreviewPanel()
+                self?.focusPreviewWindow(window)
+            }
+            cards.addArrangedSubview(card)
+        }
+        root.addArrangedSubview(cards)
+
+        let width = cards.arrangedSubviews.reduce(CGFloat(0)) { $0 + $1.fittingSize.width }
+            + CGFloat(max(0, snapshots.count - 1)) * 10
+            + 24
+        let height = DockWindowPreviewCardView.cardHeight + 58
+        NSLayoutConstraint.activate([
+            effect.widthAnchor.constraint(equalToConstant: max(240, width)),
+            effect.heightAnchor.constraint(equalToConstant: height)
+        ])
+
+        return effect
+    }
+
+    private func positionDockPreviewPanel(for match: DockHoverMatch) {
+        guard let panel = dockPreviewPanel else { return }
+        let size = panel.frame.size
+        let screenFrame = (NSScreen.screens.first { $0.frame.intersects(match.dockFrame) } ?? NSScreen.main)?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let padding: CGFloat = 12
+        let origin: CGPoint
+
+        switch match.edge {
+        case .bottom:
+            let x = clamp(match.itemFrame.midX - size.width / 2, min: screenFrame.minX + padding, max: screenFrame.maxX - size.width - padding)
+            let y = clamp(match.itemFrame.maxY + padding, min: screenFrame.minY + padding, max: screenFrame.maxY - size.height - padding)
+            origin = CGPoint(x: x, y: y)
+        case .left:
+            let x = clamp(match.itemFrame.maxX + padding, min: screenFrame.minX + padding, max: screenFrame.maxX - size.width - padding)
+            let y = clamp(match.itemFrame.midY - size.height / 2, min: screenFrame.minY + padding, max: screenFrame.maxY - size.height - padding)
+            origin = CGPoint(x: x, y: y)
+        case .right:
+            let x = clamp(match.itemFrame.minX - size.width - padding, min: screenFrame.minX + padding, max: screenFrame.maxX - size.width - padding)
+            let y = clamp(match.itemFrame.midY - size.height / 2, min: screenFrame.minY + padding, max: screenFrame.maxY - size.height - padding)
+            origin = CGPoint(x: x, y: y)
+        }
+
+        panel.setFrameOrigin(origin)
+    }
+
+    private func scheduleDockPreviewHide() {
+        guard dockPreviewPanel?.isVisible == true else { return }
+        dockPreviewHideWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self,
+                      !self.isPointInsideDockPreviewPanel(NSEvent.mouseLocation),
+                      !self.isPointInsideCurrentDockTarget(NSEvent.mouseLocation)
+                else {
+                    return
+                }
+                self.hideDockPreviewPanel()
+            }
+        }
+        dockPreviewHideWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: workItem)
+    }
+
+    private func hideDockPreviewPanel() {
+        dockPreviewHideWorkItem?.cancel()
+        dockPreviewRenderGeneration += 1
+        dockPreviewPanel?.orderOut(nil)
+        dockPreviewCurrentBundleId = nil
+        dockPreviewCurrentItemFrame = nil
+    }
+
+    private func isPointInsideDockPreviewPanel(_ screenPoint: CGPoint) -> Bool {
+        guard let panel = dockPreviewPanel, panel.isVisible else { return false }
+        return panel.frame.insetBy(dx: -10, dy: -10).contains(screenPoint)
+    }
+
+    private func isPointInsideCurrentDockTarget(_ screenPoint: CGPoint) -> Bool {
+        guard let frame = dockPreviewCurrentItemFrame else { return false }
+        return frame.insetBy(dx: -8, dy: -8).contains(screenPoint)
+    }
+
+    private func clamp(_ value: CGFloat, min minValue: CGFloat, max maxValue: CGFloat) -> CGFloat {
+        guard maxValue >= minValue else { return minValue }
+        return Swift.min(Swift.max(value, minValue), maxValue)
     }
 
     private func updateDesktopOverlayPanelFrame() {
@@ -1650,6 +2163,8 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         switch action {
         case .layoutHUD:
             showLayoutModeOverlay()
+        case .windowSwitcher:
+            showWindowSwitcher()
         case .quickDropLeftPrimary:
             quickDropFrontmost(to: .leftPrimary)
         case .quickDropRightPrimary:
@@ -2367,6 +2882,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         case .stacks: newPanel = makeStacksPanel()
         case .quickDrop: newPanel = makeQuickDropPanel()
         case .unconstrained: newPanel = makeUnconstrainedWindowsPanel()
+        case .previews: newPanel = makeWindowPreviewsPanel()
         case .liquidGlass: newPanel = makeLiquidGlassPanel()
         case .settings: newPanel = makeSettingsPanel()
         }
@@ -2540,6 +3056,9 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         ), to: root)
 
         let groups: [(title: String, note: String, actions: [WorkbenchShortcutAction])] = [
+            ("窗口搜索", "打开全局 Switcher，搜索当前可控窗口并用 Return 聚焦。", [
+                .windowSwitcher
+            ]),
             ("窗口投放", "次块默认上半；按住 Shift 执行动作时会改投下半区。", [
                 .quickDropLeftPrimary,
                 .quickDropRightPrimary,
@@ -2653,6 +3172,111 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         return root
     }
 
+    private func makeWindowPreviewsPanel() -> NSView {
+        let root = makePanelRoot()
+        addFullWidthArrangedSubview(makeSectionTitle("窗口预览", subtitle: "Dock Preview 的底层预览管线：先在 Workbench 中检查当前窗口缩略图。"), to: root)
+
+        let screenStatus = NSTextField(labelWithString: screenRecordingPermissionStatusText())
+        screenStatus.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        screenStatus.textColor = screenRecordingPermissionStatusColor()
+        screenStatus.alignment = .left
+        screenStatus.lineBreakMode = .byWordWrapping
+        screenStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        screenRecordingPermissionStatusLabel = screenStatus
+
+        addFullWidthArrangedSubview(makeSectionGroup(
+            title: "预览权限",
+            subtitle: "窗口缩略图依赖屏幕录制权限；未授权时只能显示窗口标题和 App 名。",
+            views: [makeActionRow(
+                title: "屏幕录制权限",
+                detail: "用于生成窗口缩略图，不会保存截图到磁盘。",
+                controls: [
+                    screenStatus,
+                    makeButton("请求权限", action: #selector(requestScreenRecordingPermission)),
+                    makeButton("刷新预览", action: #selector(refreshWindowPreviews))
+                ]
+            )]
+        ), to: root)
+
+        let allPreviewCandidates = windowController.listWindows(onScreenOnly: false)
+            .filter(\.isControllable)
+        let previewAppItems = previewAppToggleItems(from: allPreviewCandidates)
+        let appToggleStack = NSStackView()
+        appToggleStack.orientation = .vertical
+        appToggleStack.spacing = 8
+        appToggleStack.alignment = .width
+        applyFullWidthAlignment(to: appToggleStack)
+        if previewAppItems.isEmpty {
+            addFullWidthArrangedSubview(makeEmptyStateLabel("没有可配置的预览应用。"), to: appToggleStack)
+        } else {
+            previewAppItems.forEach { addFullWidthArrangedSubview(makePreviewAppToggleRow($0), to: appToggleStack) }
+        }
+        addFullWidthArrangedSubview(makeSectionGroup(
+            title: "预览 App 开关",
+            subtitle: "关闭后将从 Switcher 与 Dock Preview 中隐藏该 App；最小化窗口检索同样遵循这里的开关。",
+            views: [makeBoundedScrollView(containing: appToggleStack, height: 260)]
+        ), to: root)
+
+        let windows = windowController.listWindows(onScreenOnly: true)
+            .filter(\.isControllable)
+            .filter { isPreviewAppEnabled(bundleId: $0.bundleId) }
+            .sorted { lhs, rhs in
+                if lhs.appName == rhs.appName {
+                    return lhs.windowNumber < rhs.windowNumber
+                }
+                return lhs.appName.localizedCaseInsensitiveCompare(rhs.appName) == .orderedAscending
+            }
+        let snapshots = previewProvider.snapshots(for: windows)
+
+        if snapshots.isEmpty {
+            addFullWidthArrangedSubview(makeSectionGroup(
+                title: "当前窗口",
+                views: [makeEmptyStateLabel("没有找到可预览的窗口。")]
+            ), to: root)
+            return root
+        }
+
+        let grid = NSGridView()
+        grid.translatesAutoresizingMaskIntoConstraints = false
+        grid.rowSpacing = 14
+        grid.columnSpacing = 14
+        grid.xPlacement = .fill
+        grid.yPlacement = .fill
+
+        for pairStart in stride(from: 0, to: snapshots.count, by: 2) {
+            let left = WindowPreviewCardView(snapshot: snapshots[pairStart])
+            left.onFocus = { [weak self] window in
+                self?.focusPreviewWindow(window)
+            }
+
+            let right: NSView
+            if pairStart + 1 < snapshots.count {
+                let card = WindowPreviewCardView(snapshot: snapshots[pairStart + 1])
+                card.onFocus = { [weak self] window in
+                    self?.focusPreviewWindow(window)
+                }
+                right = card
+            } else {
+                right = NSView()
+            }
+
+            let row = grid.addRow(with: [left, right])
+            row.height = 210
+        }
+
+        for columnIndex in 0..<grid.numberOfColumns {
+            grid.column(at: columnIndex).width = 360
+        }
+
+        addFullWidthArrangedSubview(makeSectionGroup(
+            title: "当前窗口",
+            subtitle: "点击预览卡片可聚焦对应窗口；这一步后续会接入 Switcher 和 Dock hover。",
+            views: [grid]
+        ), to: root)
+
+        return root
+    }
+
     private func makeLiquidGlassPanel() -> NSView {
         let root = makePanelRoot()
         addFullWidthArrangedSubview(makeSectionTitle(
@@ -2736,6 +3360,87 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         let root = makePanelRoot()
         addFullWidthArrangedSubview(makeSectionTitle("设置", subtitle: "外观、快捷键和高级工具。"), to: root)
 
+        let permissionStatus = NSTextField(labelWithString: accessibilityPermissionStatusText())
+        permissionStatus.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        permissionStatus.textColor = accessibilityPermissionStatusColor()
+        permissionStatus.alignment = .left
+        permissionStatus.lineBreakMode = .byWordWrapping
+        permissionStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        accessibilityPermissionStatusLabel = permissionStatus
+
+        let dockPreviewStatus = NSTextField(labelWithString: dockPreviewStatusText())
+        dockPreviewStatus.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        dockPreviewStatus.textColor = dockPreviewStatusColor()
+        dockPreviewStatus.alignment = .left
+        dockPreviewStatus.lineBreakMode = .byWordWrapping
+        dockPreviewStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        dockPreviewStatusLabel = dockPreviewStatus
+
+        let dockPreviewToggle = NSButton(
+            checkboxWithTitle: "启用 Dock Preview",
+            target: self,
+            action: #selector(toggleDockPreviewFromCheckbox(_:))
+        )
+        dockPreviewToggle.state = appConfig.dockPreviewEnabled ? .on : .off
+
+        addFullWidthArrangedSubview(makeSectionGroup(
+            title: "权限健康",
+            subtitle: "窗口管理依赖 macOS 辅助功能权限；屏幕录制权限会在预览管线阶段启用。",
+            views: [
+                makeActionRow(
+                    title: "辅助功能权限",
+                    detail: "允许 WinCtlManager 读取并控制窗口位置和大小。",
+                    controls: [
+                        permissionStatus,
+                        makeButton("重新检测", action: #selector(refreshPermissionStatusAction)),
+                        makeButton("打开系统设置", action: #selector(openAccessibilitySettings))
+                    ]
+                ),
+                makeActionRow(
+                    title: "屏幕录制权限",
+                    detail: "用于窗口缩略图、Switcher 和未来 Dock Preview。",
+                    controls: [
+                        NSTextField(labelWithString: screenRecordingPermissionStatusText()),
+                        makeButton("打开预览", action: #selector(showWindowPreviewsSection)),
+                        makeButton("请求权限", action: #selector(requestScreenRecordingPermission))
+                    ]
+                ),
+                makeActionRow(
+                    title: "Dock Preview",
+                    detail: "鼠标悬停在 macOS Dock 区域时，显示对应 App 的窗口缩略图。",
+                    controls: [
+                        dockPreviewStatus,
+                        dockPreviewToggle
+                    ]
+                )
+            ]
+        ), to: root)
+
+        let loginStatus = NSTextField(labelWithString: launchAtLoginStatusText())
+        loginStatus.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        loginStatus.textColor = launchAtLoginStatusColor()
+        loginStatus.alignment = .left
+        loginStatus.lineBreakMode = .byWordWrapping
+        loginStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        launchAtLoginStatusLabel = loginStatus
+
+        addFullWidthArrangedSubview(makeSectionGroup(
+            title: "常驻启动",
+            subtitle: "让 WinCtlManager 登录后自动进入菜单栏，适合日常窗口编排。",
+            views: [
+                makeActionRow(
+                    title: "开机启动",
+                    detail: "需要以 .app bundle 方式运行；开发期裸 swift run 可能无法注册。",
+                    controls: [
+                        loginStatus,
+                        makeButton("启用", action: #selector(enableLaunchAtLogin)),
+                        makeButton("关闭", action: #selector(disableLaunchAtLogin)),
+                        makeButton("刷新", action: #selector(refreshLaunchAtLoginStatusAction))
+                    ]
+                )
+            ]
+        ), to: root)
+
         let appearancePopup = NSPopUpButton(frame: .zero, pullsDown: false)
         appearancePopup.addItems(withTitles: DesktopConfig.WorkbenchAppearance.allCases.map(\.title))
         if let idx = DesktopConfig.WorkbenchAppearance.allCases.firstIndex(of: appConfig.workbenchAppearance) {
@@ -2769,12 +3474,872 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         return root
     }
 
+    private func accessibilityPermissionStatusText() -> String {
+        windowController.hasAccessibilityPermission() ? "已授权" : "未授权"
+    }
+
+    private func accessibilityPermissionStatusColor() -> NSColor {
+        windowController.hasAccessibilityPermission() ? .systemGreen : .systemOrange
+    }
+
+    @objc
+    private func refreshPermissionStatusAction() {
+        refreshPermissionStatus()
+    }
+
+    private func refreshPermissionStatus() {
+        let hasPermission = windowController.hasAccessibilityPermission()
+        accessibilityPermissionStatusLabel?.stringValue = hasPermission ? "已授权" : "未授权"
+        accessibilityPermissionStatusLabel?.textColor = hasPermission ? .systemGreen : .systemOrange
+        let message = hasPermission
+            ? "辅助功能权限正常"
+            : "辅助功能权限未授权，请在系统设置中允许 WinCtlManager"
+        setStatus(message, error: !hasPermission)
+    }
+
+    @objc
+    private func openAccessibilitySettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+        _ = windowController.ensureAccessibilityPermission(prompt: true)
+        refreshPermissionStatus()
+    }
+
+    private func launchAtLoginStatusText() -> String {
+        switch SMAppService.mainApp.status {
+        case .enabled:
+            return "已启用"
+        case .notRegistered:
+            return "未启用"
+        case .requiresApproval:
+            return "需要系统批准"
+        case .notFound:
+            return "未找到 App Bundle"
+        @unknown default:
+            return "未知状态"
+        }
+    }
+
+    private func launchAtLoginStatusColor() -> NSColor {
+        switch SMAppService.mainApp.status {
+        case .enabled:
+            return .systemGreen
+        case .requiresApproval:
+            return .systemOrange
+        case .notRegistered, .notFound:
+            return .secondaryLabelColor
+        @unknown default:
+            return .secondaryLabelColor
+        }
+    }
+
+    @objc
+    private func enableLaunchAtLogin() {
+        do {
+            if SMAppService.mainApp.status != .enabled {
+                try SMAppService.mainApp.register()
+            }
+            refreshLaunchAtLoginStatus()
+            setStatus("已启用开机启动", error: false)
+        } catch {
+            refreshLaunchAtLoginStatus()
+            setStatus("启用开机启动失败：\(error.localizedDescription)", error: true)
+        }
+    }
+
+    @objc
+    private func disableLaunchAtLogin() {
+        do {
+            if SMAppService.mainApp.status == .enabled || SMAppService.mainApp.status == .requiresApproval {
+                try SMAppService.mainApp.unregister()
+            }
+            refreshLaunchAtLoginStatus()
+            setStatus("已关闭开机启动", error: false)
+        } catch {
+            refreshLaunchAtLoginStatus()
+            setStatus("关闭开机启动失败：\(error.localizedDescription)", error: true)
+        }
+    }
+
+    @objc
+    private func refreshLaunchAtLoginStatusAction() {
+        refreshLaunchAtLoginStatus()
+        setStatus("已刷新开机启动状态：\(launchAtLoginStatusText())", error: false)
+    }
+
+    private func refreshLaunchAtLoginStatus() {
+        launchAtLoginStatusLabel?.stringValue = launchAtLoginStatusText()
+        launchAtLoginStatusLabel?.textColor = launchAtLoginStatusColor()
+    }
+
+    private func screenRecordingPermissionStatusText() -> String {
+        previewProvider.hasScreenRecordingPermission() ? "已授权" : "未授权"
+    }
+
+    private func screenRecordingPermissionStatusColor() -> NSColor {
+        previewProvider.hasScreenRecordingPermission() ? .systemGreen : .systemOrange
+    }
+
+    private func dockPreviewStatusText() -> String {
+        appConfig.dockPreviewEnabled ? "已开启" : "已关闭"
+    }
+
+    private func dockPreviewStatusColor() -> NSColor {
+        appConfig.dockPreviewEnabled ? .systemGreen : .secondaryLabelColor
+    }
+
+    @objc
+    private func toggleDockPreviewFromCheckbox(_ sender: NSButton) {
+        setDockPreviewEnabled(sender.state == .on)
+    }
+
+    private func setDockPreviewEnabled(_ enabled: Bool) {
+        appConfig.dockPreviewEnabled = enabled
+        do {
+            try appConfig.save()
+            refreshDockPreviewStatus()
+            if !enabled {
+                hideDockPreviewPanel()
+            }
+            setStatus(enabled ? "Dock Preview 已开启；移动到 Dock 上方即可预览窗口" : "Dock Preview 已关闭", error: false)
+        } catch {
+            setStatus("保存 Dock Preview 设置失败：\(error.localizedDescription)", error: true)
+        }
+    }
+
+    private func refreshDockPreviewStatus() {
+        dockPreviewStatusLabel?.stringValue = dockPreviewStatusText()
+        dockPreviewStatusLabel?.textColor = dockPreviewStatusColor()
+        dockPreviewMenuItem?.title = dockPreviewMenuTitle()
+    }
+
+    @objc
+    private func requestScreenRecordingPermission() {
+        _ = previewProvider.requestScreenRecordingPermission()
+        refreshScreenRecordingPermissionStatus()
+        setStatus("已请求屏幕录制权限；如刚授权，请重新打开 App 以刷新系统授权状态", error: !previewProvider.hasScreenRecordingPermission())
+    }
+
+    private func refreshScreenRecordingPermissionStatus() {
+        screenRecordingPermissionStatusLabel?.stringValue = screenRecordingPermissionStatusText()
+        screenRecordingPermissionStatusLabel?.textColor = screenRecordingPermissionStatusColor()
+    }
+
+    @objc
+    private func refreshWindowPreviews() {
+        refreshScreenRecordingPermissionStatus()
+        switchSection(.previews, animated: false)
+        setStatus("已刷新窗口预览", error: false)
+    }
+
+    @objc
+    private func showWindowPreviewsSection() {
+        switchSection(.previews, animated: true)
+    }
+
+    private func focusPreviewWindow(_ window: WindowInfo) {
+        do {
+            try windowController.raiseWindow(bundleId: window.bundleId, windowNumber: window.windowNumber)
+            try? stackManager.syncActiveStackWindow(windowNumber: window.windowNumber)
+            setStatus("已聚焦 \(window.title.isEmpty ? window.appName : window.title)", error: false)
+            refreshWorkbench()
+        } catch {
+            setStatus("聚焦预览窗口失败：\(error.localizedDescription)", error: true)
+        }
+    }
+
+    @objc
+    private func showWindowSwitcher() {
+        hideDockPreviewPanel()
+        windowSwitcherSelectedIndex = 0
+
+        let panel = windowSwitcherPanel ?? makeWindowSwitcherPanel()
+        windowSwitcherPanel = panel
+        prepareWindowSwitcherPanelIfNeeded(panel)
+        panel.setContentSize(NSSize(width: 720, height: 560))
+        centerWindowSwitcherPanel(panel)
+
+        NSApp.activate(ignoringOtherApps: true)
+        panel.alphaValue = 0
+        panel.makeKeyAndOrderFront(nil)
+        panel.level = .floating
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.10
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            panel.animator().alphaValue = 1
+        }
+        if let field = windowSwitcherSearchField {
+            field.stringValue = ""
+            panel.makeFirstResponder(field)
+        }
+
+        if windowSwitcherCachedResults.isEmpty {
+            windowSwitcherAllResults = []
+            windowSwitcherVisibleResults = []
+            showWindowSwitcherLoadingState()
+        } else {
+            windowSwitcherAllResults = windowSwitcherCachedResults
+            applyWindowSwitcherFilter()
+        }
+
+        windowSwitcherLoadGeneration += 1
+        let loadGeneration = windowSwitcherLoadGeneration
+        DispatchQueue.main.async { [weak self, weak panel] in
+            guard let self,
+                  let panel,
+                  panel.isVisible,
+                  loadGeneration == self.windowSwitcherLoadGeneration else {
+                return
+            }
+            let loadedResults = self.buildWindowSwitcherResults()
+            self.windowSwitcherCachedResults = loadedResults
+            self.windowSwitcherAllResults = loadedResults
+            self.applyWindowSwitcherFilter()
+        }
+        setStatus("窗口搜索已打开：输入 App、标题、URL 或窗口编号", error: false)
+    }
+
+    private func prepareWindowSwitcherPanelIfNeeded(_ panel: NSPanel) {
+        if panel.contentView is WindowSwitcherRootView, windowSwitcherSearchField != nil {
+            return
+        }
+        panel.contentView = makeWindowSwitcherContent()
+    }
+
+    private func dismissWindowSwitcher(animated: Bool = true) {
+        guard let panel = windowSwitcherPanel, panel.isVisible else { return }
+        windowSwitcherLoadGeneration += 1
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.08
+                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                panel.animator().alphaValue = 0
+            } completionHandler: {
+                Task { @MainActor in
+                    panel.orderOut(nil)
+                    panel.alphaValue = 1
+                }
+            }
+        } else {
+            panel.orderOut(nil)
+            panel.alphaValue = 1
+        }
+    }
+
+    private func makeWindowSwitcherPanel() -> NSPanel {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 560),
+            styleMask: [.titled, .closable, .fullSizeContentView, .utilityWindow],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "Window Switcher"
+        panel.titleVisibility = .hidden
+        panel.titlebarAppearsTransparent = true
+        panel.isFloatingPanel = true
+        panel.hidesOnDeactivate = true
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.isReleasedWhenClosed = false
+        panel.standardWindowButton(.closeButton)?.isHidden = true
+        panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        panel.standardWindowButton(.zoomButton)?.isHidden = true
+        return panel
+    }
+
+    private func centerWindowSwitcherPanel(_ panel: NSPanel) {
+        let screenFrame = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1200, height: 800)
+        let size = panel.frame.size
+        let origin = NSPoint(
+            x: screenFrame.midX - size.width / 2,
+            y: screenFrame.midY - size.height / 2
+        )
+        panel.setFrameOrigin(origin)
+    }
+
+    private func makeWindowSwitcherContent() -> NSView {
+        let root = WindowSwitcherRootView()
+        root.wantsLayer = true
+        root.layer?.backgroundColor = NSColor.clear.cgColor
+        root.translatesAutoresizingMaskIntoConstraints = true
+        root.autoresizingMask = [.width, .height]
+        root.onBackgroundClick = { [weak self] in
+            self?.dismissWindowSwitcher()
+        }
+        windowSwitcherRootView = root
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .width
+        stack.spacing = 12
+        stack.edgeInsets = NSEdgeInsets(top: 16, left: 18, bottom: 16, right: 18)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: root.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: root.bottomAnchor)
+        ])
+
+        let searchField = WindowSwitcherSearchField()
+        searchField.placeholderString = "搜索窗口、App、URL 或 #编号"
+        searchField.font = NSFont.systemFont(ofSize: 18, weight: .medium)
+        searchField.controlSize = .large
+        searchField.delegate = self
+        searchField.onMoveSelection = { [weak self] delta in
+            self?.moveWindowSwitcherSelection(delta)
+        }
+        searchField.onCommit = { [weak self] in
+            self?.focusSelectedWindowSwitcherResult()
+        }
+        searchField.onCancel = { [weak self] in
+            self?.dismissWindowSwitcher()
+        }
+        windowSwitcherSearchField = searchField
+        let searchGlass = NSVisualEffectView()
+        searchGlass.material = .hudWindow
+        searchGlass.blendingMode = .withinWindow
+        searchGlass.state = .active
+        searchGlass.wantsLayer = true
+        searchGlass.layer?.cornerRadius = 16
+        searchGlass.layer?.cornerCurve = .continuous
+        searchGlass.layer?.masksToBounds = true
+        searchGlass.layer?.borderColor = NSColor.white.withAlphaComponent(0.24).cgColor
+        searchGlass.layer?.borderWidth = 0.8
+        searchGlass.translatesAutoresizingMaskIntoConstraints = false
+        searchGlass.heightAnchor.constraint(equalToConstant: 52).isActive = true
+        searchGlass.addSubview(searchField)
+        searchField.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            searchField.leadingAnchor.constraint(equalTo: searchGlass.leadingAnchor, constant: 10),
+            searchField.trailingAnchor.constraint(equalTo: searchGlass.trailingAnchor, constant: -10),
+            searchField.centerYAnchor.constraint(equalTo: searchGlass.centerYAnchor),
+            searchField.heightAnchor.constraint(equalToConstant: 46)
+        ])
+        stack.addArrangedSubview(searchGlass)
+        searchGlass.leadingAnchor.constraint(equalTo: stack.leadingAnchor).isActive = true
+        searchGlass.trailingAnchor.constraint(equalTo: stack.trailingAnchor).isActive = true
+
+        let resultsStack = NSStackView()
+        resultsStack.orientation = .vertical
+        resultsStack.spacing = 6
+        resultsStack.edgeInsets = NSEdgeInsets(top: 2, left: 0, bottom: 2, right: 0)
+        resultsStack.translatesAutoresizingMaskIntoConstraints = false
+        windowSwitcherResultsStackView = resultsStack
+
+        let documentContainer = NSView()
+        documentContainer.translatesAutoresizingMaskIntoConstraints = false
+        documentContainer.addSubview(resultsStack)
+        NSLayoutConstraint.activate([
+            resultsStack.leadingAnchor.constraint(equalTo: documentContainer.leadingAnchor),
+            resultsStack.trailingAnchor.constraint(equalTo: documentContainer.trailingAnchor),
+            resultsStack.topAnchor.constraint(equalTo: documentContainer.topAnchor),
+            resultsStack.bottomAnchor.constraint(equalTo: documentContainer.bottomAnchor)
+        ])
+
+        let scrollView = WindowSwitcherRollerScrollView()
+        scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+        scrollView.contentView.drawsBackground = false
+        scrollView.documentView = documentContainer
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.heightAnchor.constraint(equalToConstant: 440).isActive = true
+        scrollView.wantsLayer = true
+        scrollView.layer?.cornerRadius = 22
+        scrollView.layer?.cornerCurve = .continuous
+        scrollView.layer?.masksToBounds = true
+        scrollView.layer?.backgroundColor = NSColor.clear.cgColor
+        scrollView.onStepSelection = { [weak self] delta in
+            self?.moveWindowSwitcherSelection(delta)
+        }
+        windowSwitcherScrollView = scrollView
+        documentContainer.wantsLayer = true
+        documentContainer.layer?.backgroundColor = NSColor.clear.cgColor
+        documentContainer.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor).isActive = true
+
+        let resultsContainer = NSVisualEffectView()
+        resultsContainer.material = .hudWindow
+        resultsContainer.blendingMode = .withinWindow
+        resultsContainer.state = .active
+        resultsContainer.wantsLayer = true
+        resultsContainer.layer?.cornerRadius = 22
+        resultsContainer.layer?.cornerCurve = .continuous
+        resultsContainer.layer?.masksToBounds = true
+        resultsContainer.layer?.borderColor = NSColor.clear.cgColor
+        resultsContainer.layer?.borderWidth = 0
+        resultsContainer.translatesAutoresizingMaskIntoConstraints = false
+        resultsContainer.addSubview(scrollView)
+        let topFade = WindowSwitcherEdgeFadeView(edge: .top)
+        let bottomFade = WindowSwitcherEdgeFadeView(edge: .bottom)
+        topFade.translatesAutoresizingMaskIntoConstraints = false
+        bottomFade.translatesAutoresizingMaskIntoConstraints = false
+        resultsContainer.addSubview(topFade)
+        resultsContainer.addSubview(bottomFade)
+        NSLayoutConstraint.activate([
+            scrollView.leadingAnchor.constraint(equalTo: resultsContainer.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: resultsContainer.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: resultsContainer.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: resultsContainer.bottomAnchor),
+            topFade.leadingAnchor.constraint(equalTo: resultsContainer.leadingAnchor),
+            topFade.trailingAnchor.constraint(equalTo: resultsContainer.trailingAnchor),
+            topFade.topAnchor.constraint(equalTo: resultsContainer.topAnchor),
+            topFade.heightAnchor.constraint(equalToConstant: 34),
+            bottomFade.leadingAnchor.constraint(equalTo: resultsContainer.leadingAnchor),
+            bottomFade.trailingAnchor.constraint(equalTo: resultsContainer.trailingAnchor),
+            bottomFade.bottomAnchor.constraint(equalTo: resultsContainer.bottomAnchor),
+            bottomFade.heightAnchor.constraint(equalToConstant: 34)
+        ])
+        stack.addArrangedSubview(resultsContainer)
+        resultsContainer.leadingAnchor.constraint(equalTo: stack.leadingAnchor).isActive = true
+        resultsContainer.trailingAnchor.constraint(equalTo: stack.trailingAnchor).isActive = true
+
+        return root
+    }
+
+    private func showWindowSwitcherLoadingState() {
+        guard let stack = windowSwitcherResultsStackView else { return }
+        windowSwitcherResultRows.removeAll()
+        stack.arrangedSubviews.forEach {
+            stack.removeArrangedSubview($0)
+            $0.removeFromSuperview()
+        }
+
+        let loading = NSProgressIndicator()
+        loading.style = .spinning
+        loading.controlSize = .regular
+        loading.startAnimation(nil)
+        loading.translatesAutoresizingMaskIntoConstraints = false
+        loading.widthAnchor.constraint(equalToConstant: 26).isActive = true
+        loading.heightAnchor.constraint(equalToConstant: 26).isActive = true
+
+        let loadingLabel = NSTextField(labelWithString: "正在加载窗口…")
+        loadingLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        loadingLabel.textColor = .secondaryLabelColor
+
+        let row = NSStackView(views: [loading, loadingLabel])
+        row.orientation = .horizontal
+        row.spacing = 10
+        row.alignment = .centerY
+        row.edgeInsets = NSEdgeInsets(top: 18, left: 18, bottom: 18, right: 18)
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.wantsLayer = true
+        row.layer?.cornerRadius = 14
+        row.layer?.cornerCurve = .continuous
+        row.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.08).cgColor
+        stack.addArrangedSubview(row)
+        row.leadingAnchor.constraint(equalTo: stack.leadingAnchor).isActive = true
+        row.trailingAnchor.constraint(equalTo: stack.trailingAnchor).isActive = true
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        guard let field = obj.object as? NSTextField, field === windowSwitcherSearchField else { return }
+        applyWindowSwitcherFilter()
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        guard control === windowSwitcherSearchField else { return false }
+        if commandSelector == #selector(NSResponder.moveUp(_:)) {
+            moveWindowSwitcherSelection(-1)
+            return true
+        }
+        if commandSelector == #selector(NSResponder.moveDown(_:)) {
+            moveWindowSwitcherSelection(1)
+            return true
+        }
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+            focusSelectedWindowSwitcherResult()
+            return true
+        }
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            dismissWindowSwitcher()
+            return true
+        }
+        return false
+    }
+
+    private func buildWindowSwitcherResults() -> [WindowSwitcherResult] {
+        let onScreen = windowController.listWindows(onScreenOnly: true)
+            .filter(\.isControllable)
+            .filter { isPreviewAppEnabled(bundleId: $0.bundleId) }
+        let all = windowController.listWindows(onScreenOnly: false)
+            .filter(\.isControllable)
+            .filter { isPreviewAppEnabled(bundleId: $0.bundleId) }
+
+        var bestByKey: [String: WindowInfo] = [:]
+        for window in onScreen + all {
+            let key = "\(window.bundleId)#\(window.windowNumber)"
+            if let existing = bestByKey[key] {
+                if shouldPrefer(window, over: existing) {
+                    bestByKey[key] = window
+                }
+            } else {
+                bestByKey[key] = window
+            }
+        }
+
+        let mergedWindows = Array(bestByKey.values)
+        let groupedByBundle = Dictionary(grouping: mergedWindows, by: \.bundleId)
+        var expectedCountCache: [String: Int] = [:]
+        var normalizedWindows: [WindowInfo] = []
+
+        for (bundleId, bundleWindows) in groupedByBundle {
+            let titled = bundleWindows.filter { !$0.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            let untitled = bundleWindows.filter { $0.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+
+            let expectedCount: Int = {
+                if untitled.isEmpty {
+                    return max(1, titled.count)
+                }
+                if let cached = expectedCountCache[bundleId] {
+                    return cached
+                }
+                let fallback = max(1, titled.count)
+                let count = (try? windowController.windowCount(bundleId: bundleId)).map { max(1, $0) } ?? fallback
+                expectedCountCache[bundleId] = count
+                return count
+            }()
+
+            let sortedTitled = titled.sorted { lhs, rhs in
+                let leftTitle = lhs.title.trimmingCharacters(in: .whitespacesAndNewlines)
+                let rightTitle = rhs.title.trimmingCharacters(in: .whitespacesAndNewlines)
+                if lhs.appName != rhs.appName {
+                    return lhs.appName.localizedCaseInsensitiveCompare(rhs.appName) == .orderedAscending
+                }
+                if leftTitle != rightTitle {
+                    return leftTitle.localizedCaseInsensitiveCompare(rightTitle) == .orderedAscending
+                }
+                return lhs.windowNumber < rhs.windowNumber
+            }
+
+            let sortedUntitled = untitled.sorted { lhs, rhs in
+                let leftArea = lhs.frame.width * lhs.frame.height
+                let rightArea = rhs.frame.width * rhs.frame.height
+                if leftArea != rightArea {
+                    return leftArea > rightArea
+                }
+                return lhs.windowNumber < rhs.windowNumber
+            }
+
+            if sortedTitled.isEmpty {
+                normalizedWindows.append(contentsOf: sortedUntitled.prefix(expectedCount))
+            } else {
+                normalizedWindows.append(contentsOf: sortedTitled)
+                let remaining = max(0, expectedCount - sortedTitled.count)
+                if remaining > 0 {
+                    normalizedWindows.append(contentsOf: sortedUntitled.prefix(remaining))
+                }
+            }
+        }
+
+        return normalizedWindows
+            .sorted { lhs, rhs in
+                let leftTitle = lhs.title.trimmingCharacters(in: .whitespacesAndNewlines)
+                let rightTitle = rhs.title.trimmingCharacters(in: .whitespacesAndNewlines)
+                if leftTitle.isEmpty != rightTitle.isEmpty {
+                    return !leftTitle.isEmpty
+                }
+                if lhs.appName != rhs.appName {
+                    return lhs.appName.localizedCaseInsensitiveCompare(rhs.appName) == .orderedAscending
+                }
+                if leftTitle != rightTitle {
+                    return leftTitle.localizedCaseInsensitiveCompare(rightTitle) == .orderedAscending
+                }
+                return lhs.windowNumber < rhs.windowNumber
+            }
+            .map { window in
+                let page = browserRestorer.browserKind(for: window.bundleId).flatMap { _ in
+                    browserRestorer.capturedPage(for: window.bundleId, windowTitle: window.title)
+                }
+                return WindowSwitcherResult(
+                    window: window,
+                    browserURL: page?.url,
+                    browserKind: page?.kind,
+                    icon: iconForBundleId(window.bundleId)
+                )
+            }
+    }
+
+    private func shouldPrefer(_ candidate: WindowInfo, over existing: WindowInfo) -> Bool {
+        let existingTitle = existing.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let candidateTitle = candidate.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if existingTitle.isEmpty != candidateTitle.isEmpty {
+            return !candidateTitle.isEmpty
+        }
+
+        // Keep the larger frame if both have/lose title equally; this usually maps to the
+        // actual top-level window entry instead of tiny utility duplicates.
+        let existingArea = existing.frame.width * existing.frame.height
+        let candidateArea = candidate.frame.width * candidate.frame.height
+        return candidateArea > existingArea
+    }
+
+    private func isPreviewAppEnabled(bundleId: String) -> Bool {
+        !appConfig.previewDisabledBundleIds.contains(bundleId)
+    }
+
+    private func previewAppToggleItems(from windows: [WindowInfo]) -> [PreviewAppToggleItem] {
+        let grouped = Dictionary(grouping: windows, by: \.bundleId)
+        return grouped
+            .map { bundleId, appWindows in
+                let appName = appWindows
+                    .map(\.appName)
+                    .first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) ?? bundleId
+                return PreviewAppToggleItem(
+                    bundleId: bundleId,
+                    appName: appName,
+                    icon: iconForBundleId(bundleId),
+                    windowCount: appWindows.count,
+                    enabled: isPreviewAppEnabled(bundleId: bundleId)
+                )
+            }
+            .sorted {
+                if $0.enabled != $1.enabled {
+                    return $0.enabled && !$1.enabled
+                }
+                if $0.appName != $1.appName {
+                    return $0.appName.localizedCaseInsensitiveCompare($1.appName) == .orderedAscending
+                }
+                return $0.bundleId < $1.bundleId
+            }
+    }
+
+    @objc
+    private func togglePreviewAppEnabled(_ sender: PreviewAppToggleButton) {
+        let bundleId = sender.bundleId
+        guard !bundleId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+
+        let enabledAfterToggle: Bool
+        if appConfig.previewDisabledBundleIds.contains(bundleId) {
+            appConfig.previewDisabledBundleIds.remove(bundleId)
+            enabledAfterToggle = true
+        } else {
+            appConfig.previewDisabledBundleIds.insert(bundleId)
+            enabledAfterToggle = false
+        }
+
+        do {
+            try appConfig.save()
+            windowSwitcherCachedResults.removeAll()
+            windowSwitcherAllResults.removeAll()
+            windowSwitcherVisibleResults.removeAll()
+            dockPreviewCachedWindows.removeAll()
+            dockPreviewLastWindowScan = .distantPast
+            if dockPreviewCurrentBundleId == bundleId {
+                hideDockPreviewPanel()
+            }
+            switchSection(.previews, animated: false)
+            setStatus("已\(enabledAfterToggle ? "开启" : "关闭") \(sender.appName) 的预览显示", error: false)
+        } catch {
+            setStatus("保存预览 App 开关失败：\(error.localizedDescription)", error: true)
+        }
+    }
+
+    private func iconForBundleId(_ bundleId: String) -> NSImage? {
+        if let cached = windowSwitcherIconCache[bundleId] {
+            return cached
+        }
+        guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) else {
+            return nil
+        }
+        let icon = NSWorkspace.shared.icon(forFile: appURL.path)
+        icon.size = NSSize(width: 34, height: 34)
+        windowSwitcherIconCache[bundleId] = icon
+        return icon
+    }
+
+    private func applyWindowSwitcherFilter() {
+        let query = windowSwitcherSearchField?.stringValue ?? ""
+        let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalized.isEmpty {
+            windowSwitcherVisibleResults = windowSwitcherAllResults
+        } else {
+            windowSwitcherVisibleResults = windowSwitcherAllResults
+                .compactMap { result -> (WindowSwitcherResult, Int)? in
+                    let score = result.matchScore(for: normalized)
+                    guard score > 0 else { return nil }
+                    return (result, score)
+                }
+                .sorted { lhs, rhs in
+                    if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
+                    if lhs.0.appTitle != rhs.0.appTitle {
+                        return lhs.0.appTitle.localizedCaseInsensitiveCompare(rhs.0.appTitle) == .orderedAscending
+                    }
+                    return lhs.0.windowTitle.localizedCaseInsensitiveCompare(rhs.0.windowTitle) == .orderedAscending
+                }
+                .map(\.0)
+        }
+        if windowSwitcherSelectedIndex >= windowSwitcherVisibleResults.count {
+            windowSwitcherSelectedIndex = max(0, windowSwitcherVisibleResults.count - 1)
+        }
+        reloadWindowSwitcherRows()
+    }
+
+    private func reloadWindowSwitcherRows() {
+        guard let stack = windowSwitcherResultsStackView else { return }
+        windowSwitcherResultRows.removeAll()
+        stack.arrangedSubviews.forEach {
+            stack.removeArrangedSubview($0)
+            $0.removeFromSuperview()
+        }
+
+        guard !windowSwitcherVisibleResults.isEmpty else {
+            windowSwitcherVirtualSelectedIndex = 0
+            let empty = NSTextField(labelWithString: "没有匹配的窗口。")
+            empty.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+            empty.textColor = .secondaryLabelColor
+            empty.alignment = .center
+            empty.translatesAutoresizingMaskIntoConstraints = false
+            empty.heightAnchor.constraint(equalToConstant: 84).isActive = true
+            stack.addArrangedSubview(empty)
+            return
+        }
+
+        let logicalCount = windowSwitcherVisibleResults.count
+        let repetition = max(windowSwitcherVirtualRepetition, 5)
+        let virtualCount = logicalCount * repetition
+        let centerBlockIndex = repetition / 2
+        windowSwitcherVirtualSelectedIndex = centerBlockIndex * logicalCount + windowSwitcherSelectedIndex
+        let activeQuery = windowSwitcherSearchField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        for virtualIndex in 0..<virtualCount {
+            let result = windowSwitcherVisibleResults[virtualIndex % logicalCount]
+            let row = WindowSwitcherResultRowView(result: result)
+            row.searchQuery = activeQuery
+            row.isSelected = virtualIndex == windowSwitcherVirtualSelectedIndex
+            row.onSelect = { [weak self] in
+                guard let self else { return }
+                self.windowSwitcherVirtualSelectedIndex = virtualIndex
+                self.windowSwitcherSelectedIndex = virtualIndex % logicalCount
+                self.updateWindowSwitcherRollerAppearance(animated: true)
+                self.focusSelectedWindowSwitcherResult()
+            }
+            windowSwitcherResultRows.append(row)
+            stack.addArrangedSubview(row)
+        }
+
+        updateWindowSwitcherRollerAppearance(animated: false)
+    }
+
+    private func moveWindowSwitcherSelection(_ delta: Int) {
+        guard !windowSwitcherVisibleResults.isEmpty else { return }
+        let logicalCount = windowSwitcherVisibleResults.count
+        windowSwitcherSelectedIndex = (windowSwitcherSelectedIndex + delta + logicalCount) % logicalCount
+        windowSwitcherVirtualSelectedIndex += delta
+        normalizeWindowSwitcherVirtualSelection()
+        updateWindowSwitcherRollerAppearance(animated: true)
+    }
+
+    private func updateWindowSwitcherRollerAppearance(animated: Bool) {
+        guard !windowSwitcherResultRows.isEmpty else { return }
+        normalizeWindowSwitcherVirtualSelection()
+
+        for (index, row) in windowSwitcherResultRows.enumerated() {
+            let signedDistance = index - windowSwitcherVirtualSelectedIndex
+            let distance = abs(signedDistance)
+            row.isSelected = index == windowSwitcherVirtualSelectedIndex
+            row.rollDistance = distance
+            row.alphaValue = max(0.14, 1.0 - CGFloat(distance) * 0.14)
+            row.applyRollerTransform(signedDistance: signedDistance, animated: animated)
+        }
+
+        centerSelectedWindowSwitcherRow(animated: animated)
+    }
+
+    private func centerSelectedWindowSwitcherRow(animated: Bool) {
+        guard let scrollView = windowSwitcherScrollView,
+              let documentView = scrollView.documentView,
+              windowSwitcherVirtualSelectedIndex >= 0,
+              windowSwitcherVirtualSelectedIndex < windowSwitcherResultRows.count
+        else {
+            return
+        }
+
+        // Ensure row frames are up to date before calculating target offset.
+        documentView.layoutSubtreeIfNeeded()
+        let selectedRow = windowSwitcherResultRows[windowSwitcherVirtualSelectedIndex]
+        let viewportHeight = scrollView.contentView.bounds.height
+        let documentHeight = documentView.bounds.height
+        let maxY = max(0, documentHeight - viewportHeight)
+        let targetY = min(max(0, selectedRow.frame.midY - viewportHeight / 2), maxY)
+        let targetOrigin = NSPoint(x: 0, y: targetY)
+
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.055
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                scrollView.contentView.animator().setBoundsOrigin(targetOrigin)
+            }
+        } else {
+            scrollView.contentView.setBoundsOrigin(targetOrigin)
+        }
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+    }
+
+    private func normalizeWindowSwitcherVirtualSelection() {
+        guard !windowSwitcherResultRows.isEmpty,
+              !windowSwitcherVisibleResults.isEmpty else {
+            windowSwitcherVirtualSelectedIndex = 0
+            return
+        }
+
+        let logicalCount = windowSwitcherVisibleResults.count
+        let total = windowSwitcherResultRows.count
+        if total <= logicalCount {
+            windowSwitcherVirtualSelectedIndex = windowSwitcherSelectedIndex % logicalCount
+            return
+        }
+
+        while windowSwitcherVirtualSelectedIndex < 0 {
+            windowSwitcherVirtualSelectedIndex += total
+        }
+        while windowSwitcherVirtualSelectedIndex >= total {
+            windowSwitcherVirtualSelectedIndex -= total
+        }
+
+        // Keep selection in center blocks to avoid visible top/bottom boundaries.
+        let lowerBound = logicalCount * 2
+        let upperBound = total - logicalCount * 3
+        let recenterStride = logicalCount * 3
+
+        if windowSwitcherVirtualSelectedIndex < lowerBound {
+            windowSwitcherVirtualSelectedIndex += recenterStride
+        } else if windowSwitcherVirtualSelectedIndex > upperBound {
+            windowSwitcherVirtualSelectedIndex -= recenterStride
+        }
+    }
+
+    private func focusSelectedWindowSwitcherResult() {
+        guard windowSwitcherSelectedIndex >= 0,
+              windowSwitcherSelectedIndex < windowSwitcherVisibleResults.count
+        else {
+            return
+        }
+        let result = windowSwitcherVisibleResults[windowSwitcherSelectedIndex]
+        dismissWindowSwitcher()
+        focusPreviewWindow(result.window)
+    }
+
     private func makeButton(_ title: String, action: Selector) -> NSButton {
         let button = NSButton(title: title, target: self, action: action)
         button.bezelStyle = .rounded
         button.controlSize = .regular
         button.font = NSFont.systemFont(ofSize: 12, weight: .medium)
         return button
+    }
+
+    private func makeEmptyStateLabel(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        label.textColor = .secondaryLabelColor
+        label.alignment = .left
+        label.lineBreakMode = .byWordWrapping
+        return label
     }
 
     private func makeShortcutActionRow(for action: WorkbenchShortcutAction) -> NSView {
@@ -3020,6 +4585,71 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         return row
     }
 
+    private func makePreviewAppToggleRow(_ item: PreviewAppToggleItem) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.spacing = 12
+        row.alignment = .centerY
+        applyFullWidthAlignment(to: row)
+        row.alphaValue = item.enabled ? 1.0 : 0.62
+
+        let iconView = NSImageView()
+        iconView.image = item.icon
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        iconView.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        iconView.heightAnchor.constraint(equalToConstant: 24).isActive = true
+
+        let labels = NSStackView()
+        labels.orientation = .vertical
+        labels.spacing = 2
+        labels.alignment = .leading
+        labels.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let titleLabel = NSTextField(labelWithString: item.appName)
+        titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        titleLabel.textColor = item.enabled ? .labelColor : .tertiaryLabelColor
+        titleLabel.alignment = .left
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.toolTip = item.bundleId
+        labels.addArrangedSubview(titleLabel)
+
+        let bundleLabel = NSTextField(labelWithString: item.bundleId)
+        bundleLabel.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+        bundleLabel.textColor = .tertiaryLabelColor
+        bundleLabel.alignment = .left
+        bundleLabel.lineBreakMode = .byTruncatingMiddle
+        labels.addArrangedSubview(bundleLabel)
+
+        row.addArrangedSubview(iconView)
+        row.addArrangedSubview(labels)
+
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(spacer)
+
+        let noteLabel = NSTextField(labelWithString: "窗口 \(item.windowCount)")
+        noteLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        noteLabel.textColor = item.enabled ? .secondaryLabelColor : .tertiaryLabelColor
+        noteLabel.alignment = .left
+        noteLabel.setContentHuggingPriority(.required, for: .horizontal)
+        row.addArrangedSubview(noteLabel)
+
+        let toggleButton = PreviewAppToggleButton(
+            bundleId: item.bundleId,
+            appName: item.appName,
+            title: item.enabled ? "关闭" : "开启",
+            target: self,
+            action: #selector(togglePreviewAppEnabled(_:))
+        )
+        toggleButton.controlSize = .small
+        toggleButton.bezelStyle = .rounded
+        row.addArrangedSubview(toggleButton)
+
+        return row
+    }
+
     private func makeActionRow(
         title: String,
         detail: String? = nil,
@@ -3247,7 +4877,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         }
 
         for (index, identity) in stack.windows.prefix(8).enumerated() {
-            let label = "\(index + 1). \(identity.title.isEmpty ? identity.bundleId : identity.title)"
+            let label = identity.tabDisplayTitle()
             let btn = StackTabButton(title: label, target: self, action: #selector(selectStackTab(_:)))
             btn.stackName = stack.name
             btn.tabIndex = index
@@ -3256,6 +4886,7 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
             btn.isBordered = false
             btn.controlSize = .small
             btn.font = NSFont.systemFont(ofSize: 11, weight: index == stack.activeIndex ? .semibold : .regular)
+            btn.toolTip = identity.fullDisplayTitle
             tabsStack.addArrangedSubview(btn)
         }
         // Z-order is managed exclusively by updateAllPanelZOrder; don't touch it here.
@@ -3349,6 +4980,278 @@ private final class DesktopWorkbenchRuntime: NSObject, NSApplicationDelegate, NS
         let formatter = DateFormatter()
         formatter.dateFormat = "MMdd_HHmm"
         return formatter.string(from: Date())
+    }
+}
+
+@MainActor
+private final class WindowPreviewCardView: NSView {
+    let snapshot: WindowPreviewSnapshot
+    var onFocus: ((WindowInfo) -> Void)?
+    private var isHovered = false
+
+    init(snapshot: WindowPreviewSnapshot) {
+        self.snapshot = snapshot
+        super.init(frame: NSRect(x: 0, y: 0, width: 360, height: 210))
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: 360).isActive = true
+        heightAnchor.constraint(equalToConstant: 210).isActive = true
+        wantsLayer = true
+        toolTip = snapshot.window.title.isEmpty
+            ? snapshot.window.appName
+            : "\(snapshot.window.title) - \(snapshot.window.appName)"
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        ))
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+        needsDisplay = true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onFocus?(snapshot.window)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        let card = bounds.insetBy(dx: 1, dy: 1)
+        let path = NSBezierPath(roundedRect: card, xRadius: 12, yRadius: 12)
+        (isHovered ? NSColor.controlAccentColor.withAlphaComponent(0.10) : NSColor.labelColor.withAlphaComponent(0.045)).setFill()
+        path.fill()
+        (isHovered ? NSColor.controlAccentColor.withAlphaComponent(0.42) : NSColor.separatorColor.withAlphaComponent(0.22)).setStroke()
+        path.lineWidth = isHovered ? 1.4 : 1
+        path.stroke()
+
+        let imageRect = NSRect(x: 12, y: 48, width: bounds.width - 24, height: bounds.height - 64)
+        let imagePath = NSBezierPath(roundedRect: imageRect, xRadius: 8, yRadius: 8)
+        NSColor.black.withAlphaComponent(0.08).setFill()
+        imagePath.fill()
+
+        if let image = snapshot.image {
+            image.draw(in: imageRect.insetBy(dx: 1, dy: 1), from: .zero, operation: .sourceOver, fraction: 1.0, respectFlipped: true, hints: nil)
+        } else {
+            let placeholder = "需要屏幕录制权限"
+            placeholder.draw(
+                in: imageRect.insetBy(dx: 16, dy: imageRect.height / 2 - 10),
+                withAttributes: [
+                    .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                    .paragraphStyle: centeredParagraph()
+                ]
+            )
+        }
+
+        let title = snapshot.window.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayTitle = title.isEmpty ? snapshot.window.appName : title
+        displayTitle.draw(
+            in: NSRect(x: 14, y: 26, width: bounds.width - 28, height: 16),
+            withAttributes: [
+                .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+                .foregroundColor: NSColor.labelColor,
+                .paragraphStyle: truncatingParagraph()
+            ]
+        )
+
+        "\(snapshot.window.appName) · #\(snapshot.window.windowNumber)".draw(
+            in: NSRect(x: 14, y: 10, width: bounds.width - 28, height: 13),
+            withAttributes: [
+                .font: NSFont.systemFont(ofSize: 10, weight: .medium),
+                .foregroundColor: NSColor.secondaryLabelColor,
+                .paragraphStyle: truncatingParagraph()
+            ]
+        )
+    }
+
+    private func centeredParagraph() -> NSMutableParagraphStyle {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        paragraph.lineBreakMode = .byTruncatingTail
+        return paragraph
+    }
+
+    private func truncatingParagraph() -> NSMutableParagraphStyle {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .left
+        paragraph.lineBreakMode = .byTruncatingTail
+        return paragraph
+    }
+}
+
+@MainActor
+private final class DockWindowPreviewCardView: NSView {
+    static let cardHeight: CGFloat = 154
+    private static let minCardWidth: CGFloat = 170
+    private static let maxCardWidth: CGFloat = 280
+
+    let snapshot: WindowPreviewSnapshot
+    var onFocus: ((WindowInfo) -> Void)?
+    private var isHovered = false
+    private let cardWidth: CGFloat
+    private let appIcon: NSImage?
+
+    init(snapshot: WindowPreviewSnapshot) {
+        self.snapshot = snapshot
+        let imageSize = snapshot.image?.size ?? snapshot.window.frame.cgRect.size
+        let imageRatio = imageSize.height > 0 ? imageSize.width / imageSize.height : 16 / 10
+        self.cardWidth = Swift.min(Self.maxCardWidth, Swift.max(Self.minCardWidth, imageRatio * 100 + 24))
+        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: snapshot.window.bundleId) {
+            self.appIcon = NSWorkspace.shared.icon(forFile: appURL.path)
+        } else {
+            self.appIcon = nil
+        }
+        super.init(frame: NSRect(x: 0, y: 0, width: cardWidth, height: Self.cardHeight))
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: cardWidth).isActive = true
+        heightAnchor.constraint(equalToConstant: Self.cardHeight).isActive = true
+        wantsLayer = true
+        layer?.masksToBounds = false
+        layer?.shadowColor = NSColor.black.cgColor
+        layer?.shadowOffset = NSSize(width: 0, height: -2)
+        layer?.shadowRadius = 7
+        layer?.shadowOpacity = 0.14
+        toolTip = snapshot.window.title.isEmpty
+            ? snapshot.window.appName
+            : "\(snapshot.window.title) - \(snapshot.window.appName)"
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        ))
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+        updateHoverAnimation()
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+        updateHoverAnimation()
+        needsDisplay = true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onFocus?(snapshot.window)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        let card = bounds.insetBy(dx: 1, dy: 1)
+        let path = NSBezierPath(roundedRect: card, xRadius: 12, yRadius: 12)
+        (isHovered ? NSColor.controlAccentColor.withAlphaComponent(0.13) : NSColor.labelColor.withAlphaComponent(0.06)).setFill()
+        path.fill()
+        (isHovered ? NSColor.controlAccentColor.withAlphaComponent(0.48) : NSColor.separatorColor.withAlphaComponent(0.28)).setStroke()
+        path.lineWidth = isHovered ? 1.4 : 1
+        path.stroke()
+
+        let imageRect = NSRect(x: 11, y: 40, width: bounds.width - 22, height: 100)
+        let imagePath = NSBezierPath(roundedRect: imageRect, xRadius: 8, yRadius: 8)
+        NSColor.black.withAlphaComponent(0.10).setFill()
+        imagePath.fill()
+
+        if let image = snapshot.image {
+            image.draw(in: imageRect.insetBy(dx: 1, dy: 1), from: .zero, operation: .sourceOver, fraction: 1.0, respectFlipped: true, hints: nil)
+        } else {
+            "需要屏幕录制权限".draw(
+                in: imageRect.insetBy(dx: 12, dy: imageRect.height / 2 - 9),
+                withAttributes: [
+                    .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                    .paragraphStyle: centeredParagraph()
+                ]
+            )
+        }
+
+        let badgeRect = NSRect(x: 16, y: bounds.height - 30, width: 22, height: 22)
+        NSColor.white.withAlphaComponent(0.20).setFill()
+        NSBezierPath(roundedRect: badgeRect, xRadius: 7, yRadius: 7).fill()
+        if let appIcon {
+            appIcon.draw(in: badgeRect.insetBy(dx: 2, dy: 2))
+        }
+
+        let title = snapshot.window.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayTitle = title.isEmpty ? snapshot.window.appName : title
+        displayTitle.draw(
+            in: NSRect(x: 12, y: 21, width: bounds.width - 24, height: 16),
+            withAttributes: [
+                .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+                .foregroundColor: NSColor.labelColor,
+                .paragraphStyle: truncatingParagraph()
+            ]
+        )
+
+        "\(snapshot.window.appName) · #\(snapshot.window.windowNumber)".draw(
+            in: NSRect(x: 12, y: 7, width: bounds.width - 24, height: 13),
+            withAttributes: [
+                .font: NSFont.systemFont(ofSize: 10, weight: .medium),
+                .foregroundColor: NSColor.secondaryLabelColor,
+                .paragraphStyle: truncatingParagraph()
+            ]
+        )
+    }
+
+    private func centeredParagraph() -> NSMutableParagraphStyle {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        paragraph.lineBreakMode = .byTruncatingTail
+        return paragraph
+    }
+
+    private func truncatingParagraph() -> NSMutableParagraphStyle {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .left
+        paragraph.lineBreakMode = .byTruncatingTail
+        return paragraph
+    }
+
+    private func updateHoverAnimation() {
+        guard let layer else { return }
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.14)
+        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeInEaseOut))
+        if isHovered {
+            layer.transform = CATransform3DMakeScale(1.016, 1.016, 1)
+            layer.shadowOpacity = 0.24
+            layer.shadowRadius = 12
+        } else {
+            layer.transform = CATransform3DIdentity
+            layer.shadowOpacity = 0.14
+            layer.shadowRadius = 7
+        }
+        CATransaction.commit()
     }
 }
 
@@ -3897,7 +5800,7 @@ private final class DesktopContainerView: NSView {
 
     private func drawDraggedWindowGhost() {
         guard let draggingWindow, let dragLocation else { return }
-        let label = draggingWindow.title.isEmpty ? draggingWindow.appName : "\(draggingWindow.appName) - \(draggingWindow.title)"
+        let label = draggingWindow.title.isEmpty ? draggingWindow.appName : "\(draggingWindow.title) - \(draggingWindow.appName)"
         let width = min(max(CGFloat(label.count) * 6.8 + 24, 140), 260)
         let rect = NSRect(x: dragLocation.x + 12, y: dragLocation.y - 12, width: width, height: 24)
         guard let safe = safeRect(rect, minWidth: 80, minHeight: 16) else { return }
@@ -4163,7 +6066,7 @@ private final class DesktopContainerView: NSView {
         ]
         var y = safeArea.maxY - 22
         for window in windows.prefix(8) {
-            let title = window.title.isEmpty ? window.appName : "\(window.appName) - \(window.title)"
+            let title = window.title.isEmpty ? window.appName : "\(window.title) - \(window.appName)"
             let rect = NSRect(x: safeArea.minX, y: y, width: safeArea.width - 4, height: 20)
             if let safeRect = safeRect(rect, minWidth: 40, minHeight: 12) {
                 let pill = NSBezierPath(roundedRect: safeRect, xRadius: 5, yRadius: 5)
@@ -4795,6 +6698,25 @@ private final class TitleRuleRoutingTypePopupButton: NSPopUpButton {
 
 private final class RoutingRuleRemoveButton: NSButton {
     var ruleId: UUID?
+}
+
+private final class PreviewAppToggleButton: NSButton {
+    let bundleId: String
+    let appName: String
+
+    init(bundleId: String, appName: String, title: String, target: AnyObject?, action: Selector?) {
+        self.bundleId = bundleId
+        self.appName = appName
+        super.init(frame: .zero)
+        self.title = title
+        self.target = target
+        self.action = action
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
 }
 
 private extension Array {
@@ -5451,6 +7373,362 @@ private final class DesktopHandleOverlayView: NSView {
             return nil
         }
         return standardized
+    }
+}
+
+private final class WindowSwitcherRootView: NSView {
+    var onBackgroundClick: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        guard let hitView = hitTest(point) else {
+            onBackgroundClick?()
+            return
+        }
+
+        if hitView is NSButton ||
+            hitView is WindowSwitcherSearchField ||
+            hitView.ancestor(matching: { $0 is WindowSwitcherResultRowView }) != nil {
+            super.mouseDown(with: event)
+            return
+        }
+
+        onBackgroundClick?()
+    }
+}
+
+private final class WindowSwitcherSearchField: NSSearchField {
+    var onMoveSelection: ((Int) -> Void)?
+    var onCommit: (() -> Void)?
+    var onCancel: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        switch event.keyCode {
+        case 125:
+            onMoveSelection?(1)
+        case 126:
+            onMoveSelection?(-1)
+        case 36, 76:
+            onCommit?()
+        case 53:
+            onCancel?()
+        default:
+            super.keyDown(with: event)
+        }
+    }
+}
+
+private extension NSView {
+    func ancestor(matching predicate: (NSView) -> Bool) -> NSView? {
+        var current: NSView? = self
+        while let view = current {
+            if predicate(view) {
+                return view
+            }
+            current = view.superview
+        }
+        return nil
+    }
+}
+
+private final class WindowSwitcherRollerScrollView: NSScrollView {
+    var onStepSelection: ((Int) -> Void)?
+    private var accumulatedDeltaY: CGFloat = 0
+    private var lastStepTimestamp: TimeInterval = 0
+    private let preciseStepThreshold: CGFloat = 14
+    private let coarseStepThreshold: CGFloat = 0.9
+    private let minStepInterval: TimeInterval = 0.035
+
+    override func scrollWheel(with event: NSEvent) {
+        guard let onStepSelection else {
+            super.scrollWheel(with: event)
+            return
+        }
+
+        // Ignore inertial momentum so one physical wheel action maps to bounded selection steps.
+        if event.momentumPhase != [] {
+            return
+        }
+
+        let deltaY = event.scrollingDeltaY
+        guard deltaY != 0 else { return }
+
+        if event.phase == .began {
+            accumulatedDeltaY = 0
+        }
+
+        accumulatedDeltaY += deltaY
+        let threshold = event.hasPreciseScrollingDeltas ? preciseStepThreshold : coarseStepThreshold
+        guard abs(accumulatedDeltaY) >= threshold else { return }
+
+        let now = event.timestamp
+        guard now - lastStepTimestamp >= minStepInterval else {
+            return
+        }
+
+        let direction = accumulatedDeltaY > 0 ? -1 : 1
+        accumulatedDeltaY = 0
+        lastStepTimestamp = now
+        onStepSelection(direction)
+    }
+}
+
+@MainActor
+private final class WindowSwitcherResultRowView: NSView {
+    let result: WindowSwitcherResult
+    var searchQuery: String = "" {
+        didSet { needsDisplay = true }
+    }
+    var onSelect: (() -> Void)?
+    var isSelected = false {
+        didSet { needsDisplay = true }
+    }
+    var rollDistance: Int = 0 {
+        didSet { needsDisplay = true }
+    }
+    private var isHovered = false
+
+    init(result: WindowSwitcherResult) {
+        self.result = result
+        super.init(frame: NSRect(x: 0, y: 0, width: 660, height: 76))
+        translatesAutoresizingMaskIntoConstraints = false
+        heightAnchor.constraint(equalToConstant: 76).isActive = true
+        wantsLayer = true
+        toolTip = result.browserURL ?? result.window.title
+        addTrackingArea(NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        ))
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { nil }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+        needsDisplay = true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onSelect?()
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
+    func applyRollerTransform(signedDistance: Int, animated: Bool) {
+        let clamped = CGFloat(max(-6, min(6, signedDistance)))
+        let distance = abs(clamped)
+        let scale = max(0.82, 1.0 - distance * 0.045)
+        let yShift = clamped * 6.0
+        let tilt = clamped * 0.055
+
+        var transform = CATransform3DIdentity
+        transform.m34 = -1.0 / 950.0
+        transform = CATransform3DTranslate(transform, 0, yShift, 0)
+        transform = CATransform3DRotate(transform, tilt, 1, 0, 0)
+        transform = CATransform3DScale(transform, scale, scale, 1)
+        if animated {
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(0.05)
+            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
+            layer?.transform = transform
+            layer?.zPosition = isSelected ? 10 : -distance
+            CATransaction.commit()
+        } else {
+            layer?.transform = transform
+            layer?.zPosition = isSelected ? 10 : -distance
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        let rowRect = bounds.insetBy(dx: 1, dy: 2)
+        let path = NSBezierPath(roundedRect: rowRect, xRadius: 16, yRadius: 16)
+        let clampedDistance = min(max(rollDistance, 0), 6)
+        let distanceFalloff = CGFloat(clampedDistance) * 0.06
+        let fill: NSColor
+        if isSelected {
+            fill = NSColor.controlAccentColor.withAlphaComponent(0.20)
+        } else if isHovered {
+            fill = NSColor.white.withAlphaComponent(max(0.09, 0.14 - distanceFalloff * 0.5))
+        } else {
+            fill = NSColor.white.withAlphaComponent(max(0.04, 0.10 - distanceFalloff))
+        }
+        fill.setFill()
+        path.fill()
+
+        let highlight = NSBezierPath(roundedRect: rowRect.insetBy(dx: 1, dy: 1), xRadius: 15, yRadius: 15)
+        NSColor.white.withAlphaComponent(isSelected ? 0.24 : max(0.06, 0.12 - distanceFalloff)).setStroke()
+        highlight.lineWidth = 0.6
+        highlight.stroke()
+
+        if isSelected {
+            NSColor.controlAccentColor.withAlphaComponent(0.55).setStroke()
+            path.lineWidth = 1.4
+            path.stroke()
+        }
+
+        let iconBackRect = NSRect(x: 14, y: bounds.midY - 22, width: 44, height: 44)
+        NSColor.white.withAlphaComponent(0.16).setFill()
+        NSBezierPath(roundedRect: iconBackRect, xRadius: 12, yRadius: 12).fill()
+
+        let iconRect = iconBackRect.insetBy(dx: 5, dy: 5)
+        if let icon = result.icon {
+            icon.draw(in: iconRect)
+        } else {
+            NSColor.secondaryLabelColor.withAlphaComponent(0.20).setFill()
+            NSBezierPath(roundedRect: iconRect, xRadius: 9, yRadius: 9).fill()
+        }
+
+        let appRect = NSRect(x: 72, y: 48, width: bounds.width - 190, height: 15)
+        drawHighlightedText(
+            result.appTitle,
+            in: appRect,
+            baseAttributes: [
+                .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                .foregroundColor: NSColor.secondaryLabelColor,
+                .paragraphStyle: truncatingParagraph()
+            ],
+            highlightColor: NSColor.controlAccentColor,
+            query: searchQuery
+        )
+
+        let titleRect = NSRect(x: 72, y: 27, width: bounds.width - 190, height: 18)
+        drawHighlightedText(
+            result.windowTitle,
+            in: titleRect,
+            baseAttributes: [
+                .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
+                .foregroundColor: NSColor.labelColor,
+                .paragraphStyle: truncatingParagraph()
+            ],
+            highlightColor: isSelected ? NSColor.controlAccentColor : NSColor.systemBlue,
+            query: searchQuery
+        )
+
+        let detailRect = NSRect(x: 72, y: 10, width: bounds.width - 190, height: 14)
+        drawHighlightedText(
+            result.detailText,
+            in: detailRect,
+            baseAttributes: [
+                .font: NSFont.systemFont(ofSize: 10, weight: .medium),
+                .foregroundColor: NSColor.secondaryLabelColor,
+                .paragraphStyle: truncatingParagraph()
+            ],
+            highlightColor: NSColor.controlAccentColor,
+            query: searchQuery
+        )
+
+        let tag = result.browserURL == nil ? "Window" : "Active Tab"
+        let tagRect = NSRect(x: bounds.width - 102, y: bounds.midY - 12, width: 86, height: 24)
+        let tagPath = NSBezierPath(roundedRect: tagRect, xRadius: 12, yRadius: 12)
+        (isSelected
+            ? NSColor.controlAccentColor.withAlphaComponent(0.16)
+            : NSColor.white.withAlphaComponent(max(0.04, 0.10 - distanceFalloff))
+        ).setFill()
+        tagPath.fill()
+        tag.draw(
+            in: tagRect.insetBy(dx: 8, dy: 5),
+            withAttributes: [
+                .font: NSFont.systemFont(ofSize: 10, weight: .semibold),
+                .foregroundColor: isSelected ? NSColor.controlAccentColor : NSColor.tertiaryLabelColor,
+                .paragraphStyle: centeredParagraph()
+            ]
+        )
+    }
+
+    private func truncatingParagraph() -> NSMutableParagraphStyle {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .left
+        paragraph.lineBreakMode = .byTruncatingTail
+        return paragraph
+    }
+
+    private func centeredParagraph() -> NSMutableParagraphStyle {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        paragraph.lineBreakMode = .byTruncatingTail
+        return paragraph
+    }
+
+    private func drawHighlightedText(
+        _ text: String,
+        in rect: NSRect,
+        baseAttributes: [NSAttributedString.Key: Any],
+        highlightColor: NSColor,
+        query: String
+    ) {
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedQuery.isEmpty else {
+            text.draw(in: rect, withAttributes: baseAttributes)
+            return
+        }
+
+        let attributed = NSMutableAttributedString(string: text, attributes: baseAttributes)
+        if let range = text.range(of: normalizedQuery, options: [.caseInsensitive, .diacriticInsensitive]) {
+            let nsRange = NSRange(range, in: text)
+            attributed.addAttribute(.foregroundColor, value: highlightColor, range: nsRange)
+            if let baseFont = baseAttributes[.font] as? NSFont {
+                attributed.addAttribute(.font, value: NSFont.systemFont(ofSize: baseFont.pointSize, weight: .bold), range: nsRange)
+            }
+        }
+        attributed.draw(in: rect)
+    }
+}
+
+private final class WindowSwitcherEdgeFadeView: NSView {
+    enum Edge {
+        case top
+        case bottom
+    }
+
+    private let edge: Edge
+
+    init(edge: Edge) {
+        self.edge = edge
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer = CAGradientLayer()
+        layer?.masksToBounds = false
+        updateGradient()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { nil }
+
+    override func layout() {
+        super.layout()
+        layer?.frame = bounds
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    private func updateGradient() {
+        guard let gradient = layer as? CAGradientLayer else { return }
+        let panelBase = NSColor.windowBackgroundColor.withAlphaComponent(0.22).cgColor
+        let transparent = NSColor.windowBackgroundColor.withAlphaComponent(0.0).cgColor
+        if edge == .top {
+            gradient.colors = [panelBase, transparent]
+            gradient.startPoint = CGPoint(x: 0.5, y: 1.0)
+            gradient.endPoint = CGPoint(x: 0.5, y: 0.0)
+        } else {
+            gradient.colors = [transparent, panelBase]
+            gradient.startPoint = CGPoint(x: 0.5, y: 1.0)
+            gradient.endPoint = CGPoint(x: 0.5, y: 0.0)
+        }
+        gradient.locations = [0.0, 1.0]
     }
 }
 

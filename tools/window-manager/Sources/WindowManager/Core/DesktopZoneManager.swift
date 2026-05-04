@@ -81,7 +81,7 @@ final class DesktopZoneManager {
     func scan(mergeMode: DesktopMergeMode) -> DesktopZoneScanResult {
         let screenFrame = screenManager.mainVisibleFrameInScreenCoordinates()
         let zoneDefinitions = defineZones(for: mergeMode, in: screenFrame)
-        let windows = windowController.listWindows(onScreenOnly: true)
+        let windows = windowController.listWindows(onScreenOnly: true).filter(\.isControllable)
 
         var zones = zoneDefinitions.map { def in
             var zone = def
@@ -309,7 +309,9 @@ final class DesktopZoneManager {
         behavior: ZoneApplyBehavior = .normalApply
     ) throws {
         let zoneDefs = zoneDefinitions(mergeMode: mergeMode)
-        let eligibleWindows = windows.filter { !excludedWindowNumbers.contains($0.windowNumber) }
+        let eligibleWindows = windows.filter {
+            $0.isControllable && !excludedWindowNumbers.contains($0.windowNumber)
+        }
         let assignments = currentZoneAssignments(
             windows: eligibleWindows,
             mergeMode: mergeMode,
@@ -347,7 +349,8 @@ final class DesktopZoneManager {
                     let identity = WindowIdentity(
                         bundleId: window.bundleId,
                         title: window.title,
-                        windowNumber: window.windowNumber
+                        windowNumber: window.windowNumber,
+                        appName: window.appName
                     )
                     _ = try? stackManager.putWindowInStack(name: zone.name, frame: zone.frame, window: identity)
                 }
@@ -385,7 +388,8 @@ final class DesktopZoneManager {
             let identity = WindowIdentity(
                 bundleId: window.bundleId,
                 title: window.title,
-                windowNumber: window.windowNumber
+                windowNumber: window.windowNumber,
+                appName: window.appName
             )
             do {
                 _ = try stackManager.putWindowInStack(
